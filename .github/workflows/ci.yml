@@ -10,8 +10,56 @@ on:
   workflow_dispatch:
 
 jobs:
+  docs:
+    # 单独放 Linux 且做「逐级精确名字比对」：Windows 文件系统大小写不敏感，
+    # docs/config.md 这种错链在本地 Test-Path 会通过、到 GitHub 却是 404。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 文档相对链接检查（大小写敏感）
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, urllib.parse
+
+          def resolve(base, rel):
+              cur = base
+              for part in rel.split('/'):
+                  if part in ('', '.'):
+                      continue
+                  if part == '..':
+                      cur = os.path.dirname(cur)
+                      continue
+                  if not os.path.isdir(cur) or part not in os.listdir(cur):
+                      return None
+                  cur = os.path.join(cur, part)
+              return cur
+
+          files, bad = [], []
+          for root, dirs, names in os.walk('.'):
+              dirs[:] = [d for d in dirs if d != '.git']
+              files += [os.path.join(root, n) for n in names
+                        if n.endswith(('.md', '.yml', '.yaml'))]
+
+          for f in files:
+              text = open(f, encoding='utf-8').read()
+              for m in re.finditer(r'\]\(([^)\s]+)', text):
+                  link = m.group(1)
+                  if re.match(r'^(https?:|mailto:|#)', link):
+                      continue
+                  path = urllib.parse.unquote(link.split('#')[0])
+                  if path and resolve(os.path.dirname(f) or '.', path) is None:
+                      bad.append(f'{f} -> {link}')
+
+          if bad:
+              print('BROKEN 相对链接：')
+              print('\n'.join(bad))
+              sys.exit(1)
+          print(f'OK：{len(files)} 个文件，0 条失效相对链接')
+          PY
+
   windows:
-    # 本项目只支持 Windows，所以 CI 也只在 Windows 上跑
+    # 本项目只支持 Windows，跑的是门控本体与回归
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
