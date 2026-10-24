@@ -14,9 +14,9 @@ jobs:
     # 本项目只支持 Windows，所以 CI 也只在 Windows 上跑
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
 

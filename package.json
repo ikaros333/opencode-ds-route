@@ -11,6 +11,7 @@
     "dsh",
     "deepseek-harness"
   ],
+  "private": true,
   "license": "MIT",
   "author": "ikaros333",
   "repository": {
