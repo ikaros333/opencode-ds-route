@@ -2,6 +2,8 @@
 
 [![ci](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml/badge.svg)](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml)
 
+> **如果你也是 opencode go 套餐的订阅者，而且还是 deepseek 模型的深度使用者，同时不想让 opencode 给你路由到第三方的、自部署的掺水 deepseek 模型的话，请看看这个项目！**
+
 `v0.1.0` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
