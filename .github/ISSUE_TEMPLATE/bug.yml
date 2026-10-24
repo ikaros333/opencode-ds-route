@@ -52,5 +52,5 @@ body:
       options:
         - label: 已确认删掉 provider 后能直连 opencode.ai/zen/go（说明是门控问题，不是上游不可用）
           required: true
-        - label: 已阅读 docs/OPERATIONS-zh.md 第五节「处置手册」
+        - label: 已阅读 docs/CONFIG.md 的「503 怎么查」
           required: true

@@ -30,7 +30,7 @@ node bin\ocg.mjs doctor
 | `gate_bad_host` | Host 头不是 `127.0.0.1` / `localhost` | 用 `http://127.0.0.1:8787`，别用映射域名 |
 
 **急用先退回直连**：删掉客户端里指向 `127.0.0.1:8787` 的 provider，改回
-`https://opencode.ai/zen/go`。详细归因见 [OPERATIONS-zh.md](OPERATIONS-zh.md) 第五节。
+`https://opencode.ai/zen/go`。详细归因见 [CONFIG.md](CONFIG.md#三503-怎么查)。
 
 ## 401 gate_unauthorized
 

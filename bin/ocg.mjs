@@ -195,7 +195,7 @@ async function cmdDoctor() {
     if (typeof h.judgeAgeMs === 'number') {
       const age = `${(h.judgeAgeMs / 1000).toFixed(1)}s 前`;
       if (h.lastJudgeOk) line('ok', '判据', `最近一次通过：${age}（基线 ${h.baselineObservedAt}）`);
-      else { bad++; line('bad', '判据', `最近一次未通过（${age}）→ 看 /gate/alerts 或 docs/OPERATIONS-zh.md 第五节`); }
+      else { bad++; line('bad', '判据', `最近一次未通过（${age}）→ 看 /gate/alerts 或 docs/CONFIG.md「503 怎么查」`); }
     } else {
       // 连上的是旧版本门控（没有 judgeAgeMs 字段）：不能当成"未通过"，否则会误导排查方向
       line('warn', '判据', '该门控未暴露判据字段（旧版本）→ 把它升级到本版本后重启，或直接看 /gate/proof');
@@ -471,7 +471,7 @@ async function cmdHelp() {
     '  ocg health [--json]  读取 /gate/health',
     '',
     '环境变量：OPENCODE_GO_API_KEY（必填）、GATE_PORT（默认 8787）、GATE_TOKEN（可选本地鉴权）',
-    '完整清单：docs/OPERATIONS-zh.md',
+    '完整清单：docs/CONFIG.md',
   ].join('\n'));
 }
 
