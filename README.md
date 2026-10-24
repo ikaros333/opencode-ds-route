@@ -19,7 +19,17 @@
 
 **第 1 步 · 下载**
 
-去 Releases 页下载 `opencode-ds-route-v0.1.0.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.0](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.0) 下载
+`opencode-ds-route-v0.1.0.zip`；或用 `git clone` 拉取仓库。
+
+> **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
+
+下载后先校验，一致再解压：
+
+```powershell
+Get-FileHash .\opencode-ds-route-v0.1.0.zip -Algorithm SHA256
+# 与 Release 附件里的 SHA256SUMS.txt 对照，必须完全一致
+```
 
 **第 2 步 · 解压到固定目录**
 
@@ -234,6 +244,7 @@ set GATE_TRACE=1; node bin\ocg.mjs start   # 每次出网目标打到屏幕
 ## 已验证环境
 
 Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 273 + 53 条断言全绿，真实上游 9 套（含 60s soak）全绿。
+最后一次验证：**2026-10-24**（`v0.1.0` 发布，对应 CI `success`）。
 Linux / macOS 未验证，也不提供安装脚本。
 
 ## 免责声明
