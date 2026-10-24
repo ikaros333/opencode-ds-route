@@ -1,0 +1,52 @@
+{
+  "name": "opencode-ds-route",
+  "version": "0.1.0",
+  "description": "Fail-closed local gate in front of OpenCode Go: only delivers a response when it can be proven to come from the official DeepSeek backend. Zero dependencies.",
+  "keywords": [
+    "deepseek",
+    "opencode",
+    "gateway",
+    "proxy",
+    "llm",
+    "dsh",
+    "deepseek-harness"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "ocg": "bin/ocg.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "bin/*.mjs",
+    "gate/*.mjs",
+    "probe/*.mjs",
+    "scripts/*.ps1",
+    "docs/*.md",
+    "examples/*.yml",
+    "install.ps1",
+    "uninstall.ps1",
+    "start.cmd",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node bin/ocg.mjs start",
+    "supervise": "node bin/ocg-supervise.mjs",
+    "probe": "node bin/ocg.mjs probe",
+    "check": "node gate/verify-patch.mjs",
+    "test": "node gate/test-coverage.mjs",
+    "doctor": "node bin/ocg.mjs doctor",
+    "audit": "node bin/ocg.mjs audit",
+    "diag": "node bin/ocg.mjs diag",
+    "health": "node bin/ocg.mjs health",
+    "test:live": "node gate/test-suite.mjs http://127.0.0.1:8787",
+    "test:live:observability": "node gate/test-observability.mjs 8799 8899",
+    "test:live:all": "powershell -ExecutionPolicy Bypass -File scripts/regress.ps1"
+  }
+}

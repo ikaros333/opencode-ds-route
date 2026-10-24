@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+# Windows 脚本按 CRLF 保留，避免别人 clone 后行尾混在一起
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+
+# 运行时产物不参与 diff
+*.jsonl -text
+*.log -text

@@ -1,0 +1,67 @@
+name: ci
+
+# 只读权限：PR（含 fork）跑的是仓库自己的代码，不需要写权限；本项目也从不使用仓库 secret
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    # 本项目只支持 Windows，所以 CI 也只在 Windows 上跑
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 语法检查
+        shell: pwsh
+        run: |
+          Get-ChildItem gate\*.mjs, probe\*.mjs, bin\*.mjs | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: 源码自检（273 条断言，离线）
+        run: node gate/verify-patch.mjs
+
+      - name: 自包含回归（53 条，自带 mock 上游，不需要 key）
+        run: node gate/test-coverage.mjs
+
+      - name: 冒烟：起服务并读 health
+        shell: pwsh
+        run: |
+          $env:OPENCODE_GO_API_KEY = 'dummy-for-smoke'
+          $env:GATE_HOST = '127.0.0.1'
+          $env:GATE_HOST_PORT = '1'
+          $env:GATE_HOST_SCHEME = 'http'
+          $env:GATE_PORT = '8790'
+          $env:GATE_REFRESH_MS = '0'
+          $proc = Start-Process node -ArgumentList 'bin/ocg.mjs','start' -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $h = Invoke-RestMethod 'http://127.0.0.1:8790/gate/health' -TimeoutSec 2
+                if ($h.ok) { $ok = $true; break }
+              } catch {}
+            }
+            if (-not $ok) { Write-Error 'health 未就绪'; exit 1 }
+            Write-Host "health ok, egress=$($h.egressHost)"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: 审计自检（依赖必须为 0）
+        shell: pwsh
+        run: |
+          $out = node bin/ocg.mjs audit
+          $out | Out-String | Write-Host
+          if ($out -notmatch '第三方依赖\s+0 个') { Write-Error '发现第三方依赖'; exit 1 }

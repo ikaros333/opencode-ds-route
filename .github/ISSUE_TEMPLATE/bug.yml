@@ -1,0 +1,56 @@
+name: Bug report
+description: 门控不工作 / 全部 503 / 连不上
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先跑两条命令，把输出贴进来（都已脱敏，可以整段贴）：
+
+        ```
+        node bin\ocg.mjs doctor
+        node bin\ocg.mjs diag
+        ```
+
+        不附这两段输出的 issue 会被直接关闭——没有它们无法判断是环境、上游还是判据问题。
+
+        **不要**贴你的 `OPENCODE_GO_API_KEY` 或 `GATE_TOKEN`：诊断输出本身不含它们，
+        但手工补充时容易顺手带上。key 泄露只能靠轮换补救。
+  - type: textarea
+    id: doctor
+    attributes:
+      label: ocg doctor 输出
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: diag
+    attributes:
+      label: ocg diag 输出
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本与平台
+      description: 版本号 + Windows 版本 + Node 版本
+      placeholder: v0.1.0 / Windows 11 23H2 / Node 24.15.0
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象与复现步骤
+      description: 哪个客户端、哪种协议、什么时候开始的、是否仍能直连上游
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 自查
+      options:
+        - label: 已确认删掉 provider 后能直连 opencode.ai/zen/go（说明是门控问题，不是上游不可用）
+          required: true
+        - label: 已阅读 docs/OPERATIONS-zh.md 第五节「处置手册」
+          required: true

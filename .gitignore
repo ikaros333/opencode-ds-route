@@ -1,0 +1,69 @@
+# 运行时产物：一律不进仓库
+gate/logs/
+logs/
+snapshots/
+probe/*.log
+*.log
+*.jsonl
+official-proof.json
+session.txt
+stop.flag
+*.tmp
+*.temp
+
+# 备份与打包产物
+*.bak
+*.bak-*
+*.bak.*
+ocg-diag*
+*.zip
+*.tgz
+*.tar.gz
+*.7z
+
+# 本地配置与密钥：绝不提交
+.env
+.env.*
+!.env.example
+.npmrc
+cordis.patch.yml
+cordis.patch.yml.*
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa
+id_ed25519
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+.npm/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.claude/
+.cursor/
+.fleet/
+*.code-workspace
+.DS_Store
+desktop.ini
+Thumbs.db
+*.swp
+
+# 合并 / 调试 / 覆盖率残留
+*.orig
+*.rej
+*.pid
+*.stackdump
+*.dmp
+coverage/
+.nyc_output/
+
+# 证书（与上面的 pem/key 同类：只在本地用，不进仓库）
+*.crt
+*.cer
+*.der

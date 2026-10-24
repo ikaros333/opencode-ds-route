@@ -1,0 +1,45 @@
+# examples/overlay-ocg.yml —— 插到 cordis.patch.yml 里的片段（示例）
+#
+# 用法（推荐）：node bin/ocg.mjs setup dsh           打印当前配置对应的片段
+#               node bin/ocg.mjs setup dsh --apply   自动插入（先备份）
+#
+# 形状要点（2026-10-23 用 dsh --dump-config 实测确认）：
+#   1. cordis.patch.yml 是「补丁层数组」，顶层是 `- id: ...` 条目，不是普通配置对象；
+#   2. 新 provider 必须**插进已有 `- id: llm-pi-ai` 的 `config.providers:` 下**；
+#   3. 不要新加第二个 `- id: llm-pi-ai`：后者的 providers 会整体替换前者，
+#      原有 provider（包括直连 opencode-go）会全部消失。
+#
+# 下面按「完整条目」展示，复制时请把 ocg-gated / ocg-gated-msg 两段
+# 并入你现有的 providers 映射，而不是另起一个条目。
+
+- id: llm-pi-ai
+  config:
+    providers:
+      # 默认走这条：openai-responses 协议，判据最强（e1 + id 形态）
+      ocg-gated:
+        displayName: "OpenCode Go · Responses（经门控）"
+        apiKeyEnv: OPENCODE_GO_API_KEY
+        api: openai-responses
+        baseURL: http://127.0.0.1:8787/v1
+        # 仅当门控启用了 GATE_TOKEN 时需要：
+        # headers:
+        #   x-gate-token: "<你的 GATE_TOKEN>"
+        models:
+          - id: deepseek-flash
+
+      # 备选：anthropic-messages 协议，判据是 9 项状态码指纹
+      ocg-gated-msg:
+        displayName: "OpenCode Go · Messages（经门控）"
+        apiKeyEnv: OPENCODE_GO_API_KEY
+        api: anthropic-messages
+        baseURL: http://127.0.0.1:8787
+        models:
+          - id: deepseek-flash
+
+      # 直连（不经门控）保留作退路：门控全线 503 时切回这里
+      opencode-go:
+        apiKeyEnv: OPENCODE_GO_API_KEY
+        api: openai-responses
+        baseURL: https://opencode.ai/zen/go/v1
+        models:
+          - id: deepseek-flash
