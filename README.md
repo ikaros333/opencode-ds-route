@@ -1,5 +1,7 @@
 # opencode-ds-route
 
+[![ci](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml/badge.svg)](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml)
+
 `v0.1.0` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**

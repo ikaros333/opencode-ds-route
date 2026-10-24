@@ -12,6 +12,15 @@
     "deepseek-harness"
   ],
   "license": "MIT",
+  "author": "ikaros333",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikaros333/opencode-ds-route.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ikaros333/opencode-ds-route/issues"
+  },
+  "homepage": "https://github.com/ikaros333/opencode-ds-route#readme",
   "type": "module",
   "bin": {
     "ocg": "bin/ocg.mjs"
