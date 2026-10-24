@@ -252,7 +252,7 @@ Linux / macOS 未验证，也不提供安装脚本。
 - 判据基线：[docs/BASELINE.md](docs/BASELINE.md) ｜ 安全审计：[docs/AUDIT.md](docs/AUDIT.md)
 - dsh 接入：[docs/DSH.md](docs/DSH.md) ｜ 变更记录：[docs/CHANGELOG.md](docs/CHANGELOG.md)
 - 提问前：[docs/FAQ.md](docs/FAQ.md) ｜ 报安全问题：[SECURITY.md](SECURITY.md) ｜ 参与开发：[CONTRIBUTING.md](CONTRIBUTING.md)
-- 维护者：[docs/PUBLISH.md](docs/PUBLISH.md) ｜ 配置样例：[examples/overlay-ocg.yml](examples/overlay-ocg.yml)
+- 配置样例：[examples/overlay-ocg.yml](examples/overlay-ocg.yml)
 
 ## 许可
 

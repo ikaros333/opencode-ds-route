@@ -67,3 +67,6 @@ coverage/
 *.crt
 *.cer
 *.der
+
+# 维护者内部文档：只留在本地，不进公开仓库
+docs/PUBLISH.md

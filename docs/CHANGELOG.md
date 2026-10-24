@@ -56,7 +56,7 @@
 | **发现并修复**：`.env` 从当前工作目录加载 | 在别人放好 `.env` 的目录里运行 `ocg`，`GATE_HOST` 可被改写到攻击者主机，prompt 随之外发。现在只读仓库根 `.env`。 |
 | **发现并修复**：跨域 no-cors 借道（CSRF） | 页面可以用 `text/plain` 往 127.0.0.1 发 JSON，门控照单全收 → 没开 `GATE_TOKEN` 时可被借额度。现在非 `application/json` 一律 415。 |
 | **发现并修复**：DNS rebinding | `evil.com` 解析到 127.0.0.1 时 Host 仍是 evil.com，门控原样受理。现在只认 `127.0.0.1` / `localhost` / `[::1]` 的 Host，否则 421。**第三轮补**：当时校验位置在 `/gate/*` 出口之后，观测端点仍可被 rebind 读取，已上移。 |
-| 发布身份泄漏 | 本机 `git config --global user.email` 是真实个人邮箱，首次提交会写进每个 commit。PUBLISH 增加必做步骤：仓库级改成 GitHub noreply 地址。 |
+| 发布身份泄漏 | 本机 `git config --global user.email` 是真实个人邮箱，首次提交会写进每个 commit。首提交前必须把仓库级身份改成 GitHub noreply 地址。 |
 | 已复查无问题 | key 不落盘、prompt 不进台账、`diag` 脱敏（含 `oc_sk_`）、token 常量时间比较、只绑回环、TLS 默认校验、日志/备份/`.env` 均被 `.gitignore` 覆盖 |
 
 新增断言 V21/V22（JSON content-type、回环 Host），自检 267 → 271；`test-security` 增加 S10/S11/S12，20 项全通过。
@@ -72,7 +72,7 @@
 | **发现并修复**：`install.ps1` 明文回显 `GATE_TOKEN` | 安装完把 token 打到屏幕上（新建与已存在两种情况都打），终端 scrollback / 截图 / 录屏会把它带出去。改为不回显，只提示用 `$env:GATE_TOKEN` 取。 |
 | **发现并修复**：`uninstall.ps1` 只凭 `{"ok":true}` 认领进程 | 端口上任何返回 `ok=true` 的程序都会被当成门控并结束。现在要求 `/gate/health` 同时带 `chain` 数组（本门控独有字段）。 |
 | **发现并修复**：`npm pack` 把运行产物打进包 | `package.json` 的 `files` 写的是目录 `gate/`，会覆盖 `.gitignore`：实测打包包含 `gate/logs/gate.jsonl`（53.8 KB）、`session.txt`、`cov-*.json`，共 52 个文件。改为显式 glob，现 39 个文件、0 命中。 |
-| **发现并修复**：`git init` 默认分支是 `master` | 本机 `init.defaultBranch=master`，PUBLISH 里的 `push -u origin main` 会直接失败。改为 `git init -b main` + 分支校验。 |
+| **发现并修复**：`git init` 默认分支是 `master` | 本机 `init.defaultBranch=master`，原发布清单里的 `push -u origin main` 会直接失败。改为 `git init -b main` + 分支校验。 |
 | 已复查无问题 | key 只在内存与出网请求头里；`diag` 脱敏覆盖 `oc_sk_`/`sk-`/`tok_`/`Bearer`/`ses_`/盘符路径；请求体 16MB 上限按流式累计（chunked 也拦）；路径白名单先于读 body；计划任务 `RunLevel Limited`（不提权）；任务 XML 不含 key；仅绑 `127.0.0.1`；未关 TLS 校验；无第三方依赖 |
 | 接受的风险（已写入 README） | 同用户的本机恶意进程可读 User 环境变量里的 key，`GATE_TOKEN` 只挡"不知道 token 的进程"，挡不住同用户恶意软件；蓄意 TLS 中间人可复刻全部可观测特征 |
 
@@ -185,7 +185,6 @@
 - `bin/ocg-supervise.mjs`：进程监护（计划任务的真实入口；门控退出后 1.5 秒拉起，带退避）。
 - `install.ps1` 新增 `-TaskName` / `-Force`；**同名计划任务指向别的目录时中止**，不再静默覆盖
   （旧实现会无条件 `Unregister-ScheduledTask`，跑一次就能把另一份安装的生产任务改道）。
-- `docs/PUBLISH.md`：发布前待办（账号相关步骤与转 public 的 7 项闸门）。
 - `.gitattributes`：`*.ps1/*.cmd/*.vbs` 固定 CRLF，日志类不参与 diff。
 - `docs/AUDIT.md` 补"代理这一跳"：Node 22+ 会自动使用 `HTTP(S)_PROXY`，抓包核验时要知道。
 - `bin/ocg.mjs` 子命令：`doctor`（九项体检）/ `audit`（离线审计）/ `diag`（脱敏诊断）/
