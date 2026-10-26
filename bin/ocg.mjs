@@ -177,6 +177,15 @@ async function cmdDoctor() {
   const h = await health(1500);
   if (h?.ok) {
     line('ok', `端口 ${PORT}`, `门控在跑（selftest=${h.startupSelfTest?.verdict || 'pending'}）`);
+    // 归属：同机可能装了多份（或旧版残留），端口通了不等于「跑的是仓库里这份代码」
+    if (h.root) {
+      // Windows 路径大小写不敏感，且可能经 8.3 短名 / junction 启动 → 归一后比较，避免误报"另一份安装"
+      const norm = (p) => path.resolve(String(p)).replace(/[\\/]+$/, '').toLowerCase();
+      if (norm(h.root) === norm(ROOT)) line('ok', '门控归属', `当前仓库 ${ROOT}`);
+      else line('warn', '门控归属', `跑的是另一份安装：${h.root}（当前仓库 ${ROOT}）→ 改这份代码不会生效`);
+    } else {
+      line('warn', '门控归属', '门控版本过旧（health 无 root 字段）→ 重启一次以启用归属识别');
+    }
   } else {
     bad++;
     const owner = portOwner(PORT);
@@ -214,6 +223,32 @@ async function cmdDoctor() {
     else line('warn', 'dsh 配置', `存在但没指向门控 → 跑 ocg setup dsh 看片段（${dshCfg}）`);
   } else {
     line('warn', 'dsh 配置', '没找到 ~/.dsh/profiles/web/cordis.patch.yml（不用 dsh 可忽略）');
+  }
+
+  // 6b 客户端把真 key 送过 socket 了吗（R1）：门控只用自己的 key，客户端没理由带真 key。
+  if (fs.existsSync(dshCfg)) {
+    const t = fs.readFileSync(dshCfg, 'utf8');
+    const leaks = [];
+    let cur = '';
+    for (const ln of t.split(/\r?\n/)) {
+      const pk = /^\s*(ocg-gated(?:-msg)?):\s*$/.exec(ln);
+      if (pk) { cur = pk[1]; continue; }
+      if (/^\s*\S/.test(ln) && !/^\s*(apiKeyEnv|api|baseURL|displayName|models|headers|-)/
+        .test(ln) && /^\s{0,6}\S/.test(ln)) cur = '';   // 离开 provider 块
+      if (cur && /^\s*apiKeyEnv:\s*["']?(OPENCODE_GO_API_KEY)/.test(ln)) leaks.push(cur);
+    }
+    if (leaks.length) {
+      line('warn', '客户端 key', `${leaks.join('/')} 用 OPENCODE_GO_API_KEY → 真 key 每次都会经 127.0.0.1 明文送出；` +
+        `改成占位变量：ocg setup dsh（${PLACEHOLDER_ENV}=dummy 即可，门控不用它）`);
+    } else if (new RegExp(`${PLACEHOLDER_ENV}`).test(t)) {
+      if (!process.env[PLACEHOLDER_ENV]) {
+        line('bad', '客户端 key', `配置用了占位 ${PLACEHOLDER_ENV}，但当前环境里没有它 → 先设置，然后**重启 dsh**`);
+      } else {
+        // 2026-10-26 现场教训：dsh 用**自己进程环境**解析 apiKeyEnv；变量晚于 dsh 启动写入时，
+        // 会报 no credential 且该 provider 的模型从选择器里消失。前提写进同一行，不额外加噪。
+        line('ok', '客户端 key', `占位 ${PLACEHOLDER_ENV}（真 key 不经过 socket；前提：dsh 在该变量写入之后启动）`);
+      }
+    }
   }
 
   console.log('');
@@ -351,6 +386,17 @@ async function cmdDiag(outFile) {
  * providers 字典：原有的 `opencode-go` 与 `ocg-gated` 全部消失，只剩新条目里的键。
  * 也就是说"追加一个条目"会把用户自己的直连路由清空。所以只能往既有 providers 块里插。
  */
+/**
+ * 客户端侧用的占位 key 变量名。
+ *
+ * ★ 2026-10-26（R1）：门控**只用自己的环境变量**里的 key 打上游，客户端带来的 key 一律被覆盖
+ *   （headersFor 无条件写 authorization / x-api-key）。所以客户端根本不需要真 key ——
+ *   而 dsh 每发一次请求都会把 apiKeyEnv 指向的值塞进 HTTP 头送到 127.0.0.1。
+ *   若那是真 key：同机其它 Windows 账户可以先抢占 8787 把明文 key 收走（GATE_TOKEN 挡不住这个）。
+ *   改成占位值后，密钥不再经过任何 socket。
+ */
+const PLACEHOLDER_ENV = 'OCG_PLACEHOLDER_KEY';
+
 function providerYaml(indent) {
   const token = process.env.GATE_TOKEN || '';
   const pad = n => ' '.repeat(indent + n);
@@ -358,7 +404,7 @@ function providerYaml(indent) {
   return [
     `${pad(0)}ocg-gated:`,
     `${pad(2)}displayName: "OpenCode Go · Responses（经门控）"`,
-    `${pad(2)}apiKeyEnv: OPENCODE_GO_API_KEY`,
+    `${pad(2)}apiKeyEnv: ${PLACEHOLDER_ENV}`,
     `${pad(2)}api: openai-responses`,
     `${pad(2)}baseURL: http://127.0.0.1:${PORT}/v1`,
     // 逐行拼接，避免模板里多一层缩进
@@ -367,7 +413,7 @@ function providerYaml(indent) {
     `${pad(4)}- id: deepseek-flash`,
     `${pad(0)}ocg-gated-msg:`,
     `${pad(2)}displayName: "OpenCode Go · Messages（经门控）"`,
-    `${pad(2)}apiKeyEnv: OPENCODE_GO_API_KEY`,
+    `${pad(2)}apiKeyEnv: ${PLACEHOLDER_ENV}`,
     `${pad(2)}api: anthropic-messages`,
     `${pad(2)}baseURL: http://127.0.0.1:${PORT}`,
   ].join('\n') + '\n' + (hdr ? hdr : '') + [
@@ -390,7 +436,12 @@ function dshSnippet() {
     body,
     '# 说明：',
     '#   · anthropic-messages 的 baseURL 不带 /v1，dsh 自己拼 /v1/messages',
-    '#   · apiKeyEnv 指向环境变量名，配置文件里不出现明文 key',
+    `#   · apiKeyEnv 写的是占位变量 ${PLACEHOLDER_ENV}（值随便填，如 dummy）：**门控不用客户端带来的 key**，`,
+    '#     它用自己的 OPENCODE_GO_API_KEY 打上游。这样真 key 不会经过任何 socket ——',
+    '#     同机其它账户即便抢占了 8787 也拿不到它。直连 provider（不走门控）才需要真 key。',
+    '#   · ⚠ dsh 从**自己的进程环境**解析 apiKeyEnv，不读实时系统变量：设完变量必须重启 dsh，',
+    '#     否则会报 `no credential for provider route` 且该 provider 的模型会从选择器里消失。',
+    '#   · 不想用环境变量时，也可以在 dsh 的 Models 页面为该 provider 存一份凭证（同样填 dummy）。',
     '#   · 门控启用 GATE_TOKEN 时，headers.x-gate-token 必须与门控一致',
   ].join('\n');
 }
@@ -420,12 +471,37 @@ function locateProvidersSlot(text) {
   return null;
 }
 
+/**
+ * 确保客户端占位 key 的环境变量存在（User 级，值为 dummy）。
+ * 为什么需要它存在：dsh 启动时会解析 provider 的 apiKeyEnv，变量不存在则该 provider 不可用。
+ * 这个值本身没有任何权限意义 —— 门控用自己环境里的真 key。
+ */
+function ensurePlaceholderEnv() {
+  if (process.env[PLACEHOLDER_ENV]) return { ok: true, created: false };
+  if (process.platform !== 'win32') return { ok: false, created: false };
+  const ps = spawnSync('powershell', ['-NoProfile', '-Command',
+    `[Environment]::SetEnvironmentVariable('${PLACEHOLDER_ENV}','dummy','User')`],
+    { encoding: 'utf8', windowsHide: true });
+  if (ps.status === 0) process.env[PLACEHOLDER_ENV] = 'dummy';
+  return { ok: ps.status === 0, created: ps.status === 0 };
+}
+
 async function cmdSetup(args) {
   const target = args[0] || 'dsh';
   if (target !== 'dsh') die(`只支持 dsh：ocg setup dsh [--apply]`);
   const apply = args.includes('--apply');
   const cfg = path.join(os.homedir(), '.dsh', 'profiles', 'web', 'cordis.patch.yml');
+  const ph = ensurePlaceholderEnv();
   console.log(dshSnippet());
+  if (ph.created) {
+    console.log(`\n${C.ok}已写入 User 环境变量 ${PLACEHOLDER_ENV}=dummy${C.off}${C.dim}（dsh 读它；门控不用它）${C.off}`);
+    // 现场教训（2026-10-26）：dsh 只在**启动时**读自己的进程环境。设了变量不重启 dsh，
+    // 它会报 `no credential for provider route`，该 provider 的模型会直接从选择器里消失。
+    console.log(`${C.warn}⚠ 现在必须重启 dsh（完全关闭再打开）才生效；不重启会报 no credential、模型消失。${C.off}`);
+    console.log(`${C.dim}  不想重启：把这两处 apiKeyEnv 改回 OPENCODE_GO_API_KEY 即可（功能不变，只是真 key 会经回环）。${C.off}`);
+  }
+  else if (ph.ok) console.log(`\n${C.dim}${PLACEHOLDER_ENV} 已存在（值不用改）${C.off}`);
+  else console.log(`\n${C.warn}未能自动写入 ${PLACEHOLDER_ENV}，请手动：setx ${PLACEHOLDER_ENV} dummy${C.off}`);
   if (!apply) {
     console.log(`\n${C.dim}（只打印，不改文件。存在 llm-pi-ai 块时可加 --apply 自动插入，会先备份）${C.off}`);
     return;

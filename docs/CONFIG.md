@@ -213,3 +213,6 @@ git checkout <上一个可用版本> -- gate\oc-gate.mjs gate\verify-patch.mjs
 | `health` 打不开但有端口 | 端口被别的程序占用：`Get-NetTCPConnection -LocalPort 8787` 查 PID |
 | `crashCount` 增长 | 看台账 `UNCAUGHT_EXCEPTION` / `UNHANDLED_REJECTION` 行 |
 | `ok=false` 且 `startupSelfTest != pass` | 上游不可达或判据漂移，按第三节处理 |
+| 改了代码但行为没变 | `doctor` 看「门控归属」：`health.root` 指向另一个目录说明 8787 上跑的是**另一份安装**（同名计划任务被覆盖过） |
+| 第二个实例起来就没了、无日志 | 单实例锁：同端口第二个监护 exit 3，提示里带占用者 pid/root；锁文件 `supervise-<port>.lock`。要并存就换端口（`--port 8888`） |
+| 监护反复拉起、门控秒退 | 端口被占用：门控 exit 4 并打印占用者（会探测对端 `/gate/health`）。看 `supervise` 的 stderr；旧版会 15s 退避无限重启，新版直接停 |

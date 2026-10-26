@@ -16,7 +16,7 @@ node bin\ocg.mjs setup dsh
       # 位置：- id: llm-pi-ai → config: → providers: 下面
       ocg-gated:
         displayName: "OpenCode Go · Responses（经门控）"
-        apiKeyEnv: OPENCODE_GO_API_KEY
+        apiKeyEnv: OCG_PLACEHOLDER_KEY
         api: openai-responses
         baseURL: http://127.0.0.1:8787/v1
         headers:                       # 仅启用 GATE_TOKEN 时需要
@@ -25,7 +25,7 @@ node bin\ocg.mjs setup dsh
           - id: deepseek-flash
       ocg-gated-msg:
         displayName: "OpenCode Go · Messages（经门控）"
-        apiKeyEnv: OPENCODE_GO_API_KEY
+        apiKeyEnv: OCG_PLACEHOLDER_KEY
         api: anthropic-messages
         baseURL: http://127.0.0.1:8787
         models:
@@ -50,7 +50,7 @@ node bin\ocg.mjs setup dsh
 
 1. **`anthropic-messages` 的 baseURL 不带 `/v1`**，dsh 自己拼 `/v1/messages`；
 2. **改完必须重启 dsh 进程**（`cordis.patch.yml` 只在启动时加载，刷新页面不够）；
-3. **`apiKeyEnv` 写的是环境变量名**，配置文件里不出现明文 key；门控自己用同一个 key 打上游。
+3. **`apiKeyEnv` 用占位变量 `OCG_PLACEHOLDER_KEY`**（值随便填）：门控只用自己的 `OPENCODE_GO_API_KEY`，客户端带来的 key 会被覆盖。这样真 key 不经过 `127.0.0.1`。**设完变量必须重启 dsh**，否则报 `no credential` 且模型消失。
 
 ## 怎么确认真的生效
 

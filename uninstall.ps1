@@ -61,6 +61,14 @@ $isOurs = $false
 try {
   $h = Invoke-RestMethod "http://127.0.0.1:$Port/gate/health" -TimeoutSec 2
   $isOurs = [bool]$h.ok -and (@($h.chain).Count -gt 0)
+  # 归属（2026-10-26）：同名脚本可能来自另一份安装 —— root 不匹配就不是本目录的门控，不能杀。
+  if ($isOurs -and $h.root) {
+    $norm = { param($p) (([IO.Path]::GetFullPath([string]$p)).TrimEnd('\', '/')).ToLowerInvariant() }
+    if ((& $norm $h.root) -ne (& $norm $Root)) {
+      Write-Host "  --  端口 $Port 上是另一份安装的门控（root=$($h.root)），未动它"
+      $isOurs = $false
+    }
+  }
 } catch {}
 
 if ($isOurs) {
@@ -75,9 +83,12 @@ if ($isOurs) {
   Write-Host "  --  端口 $Port 上没有监听"
 }
 
-# 3) 哨兵文件
+# 3) 哨兵文件与单实例锁
 $flag = Join-Path $Root 'stop.flag'
 if (Test-Path $flag) { Remove-Item $flag -Force -ErrorAction SilentlyContinue; Write-Host '  OK  已删除 stop.flag' }
+# 监护已被结束，锁文件已无意义；留着只会在 PID 复用后误导下一次安装
+$locks = @(Get-ChildItem -Path $Root -Filter 'supervise-*.lock' -File -ErrorAction SilentlyContinue)
+foreach ($l in $locks) { Remove-Item -LiteralPath $l.FullName -Force -ErrorAction SilentlyContinue; Write-Host "  OK  已删除锁文件 $($l.Name)" }
 
 Write-Host ''
 Write-Host '卸载完成。以下内容仍保留（需要就自己删）：'

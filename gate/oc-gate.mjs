@@ -47,6 +47,12 @@ function num(name, def, { min = -Infinity, max = Infinity } = {}) {
   return v;
 }
 const PORT = num('GATE_PORT', 8787, { min: 1, max: 65535 });
+// 安装根：/gate/health 暴露它，让 doctor 能回答「8787 上跑的到底是哪一份安装」。
+// 起因（2026-10-26）：同机两份安装抢同一端口/同一任务名时，从外部只能看到「有个门控在跑」，
+// 无法分辨归属，误判成「改了没生效」。
+const INSTALL_ROOT = path.resolve(import.meta.dirname, '..');
+// 端口被占用是「重复部署」信号，不是可恢复故障：给专用退出码，让监护不要重启（见下方 server.on('error')）。
+const EXIT_PORT_IN_USE = 4;
 const KEY = process.env.OPENCODE_GO_API_KEY || '';
 // 可选本地鉴权。绑回环 ≠ 安全：本机任何进程都能直接 POST 8787，白嫖你的 key 配额。
 // GATE_TOKEN 非空时，/v1/* 代理请求必须带 x-gate-token；/gate/* 只读观测端点不受影响。
@@ -151,8 +157,12 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 以下键原先只在首次触发时动态出现（P2-2）
   passUnverifiedPolicy: 0, precheckFailProofStale: 0, thirdRevalidated: 0, thirdRevalidateRejected: 0, thirdBlockedByLiveFail: 0, httpParseErrors: 0, clientResets: 0, refreshSkippedByPrecheck: 0, precheckNotPass: 0,
   // 第 17 轮：身份白名单的拒绝计数
-  rejectedThirdShape: 0, rejectedUnknownShape: 0 };
+  rejectedThirdShape: 0, rejectedUnknownShape: 0,
+  // 2026-10-26（R1）：客户端是否曾把真 key 送到本机端口
+  clientSentRealKey: 0 };
 
+// 客户端是否曾把真 key 送到本机端口（R1 的可观测信号：health 暴露，doctor 也会查配置）
+const clientSentRealKey = { flag: false };
 // 启动自检结论（第 17 轮，/gate/health 暴露给 watchdog 判活）
 let startupSelfTest = null;
 
@@ -1896,6 +1906,22 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ error: { type: 'gate_bad_host', message: '只接受指向 127.0.0.1 / localhost 的请求（Host 头不符）。', request_id: hid } }));
     }
   }
+  // ★ 2026-10-26（R1）：客户端把**真 key**递过来了 —— 说明它还在用 OPENCODE_GO_API_KEY 直连门控。
+  // 不拒绝（兼容老配置），但记一次：这把 key 本来不必经过任何 socket（门控只用自己的环境变量）。
+  // 风险背景：同机其它账户可以先抢占 8787，把 dsh 发来的明文 key 收走；GATE_TOKEN 挡不住这个
+  //          （它拦的是"借额度"）。缓解办法是把 provider 的 apiKeyEnv 换成占位变量。
+  if (isProxy && !clientSentRealKey.flag) {
+    const gotKey = String(req.headers['x-api-key'] || req.headers.authorization || '');
+    if (KEY.length >= 8 && gotKey.includes(KEY)) {   // 太短的 key 不参与匹配，避免误判
+      clientSentRealKey.flag = true;
+      metrics.clientSentRealKey = 1;
+      log({ ts: new Date().toISOString(), result: 'CLIENT_SENT_REAL_KEY',
+            path: String(req.url).split('?')[0],
+            hint: 'provider 的 apiKeyEnv 应改成 OCG_PLACEHOLDER_KEY（ocg setup dsh 会生成）' });
+      console.warn('[oc-gate] 客户端把真 key 发到了本机回环端口（没必要：门控用自己的 key）。' +
+                   '建议把 dsh provider 的 apiKeyEnv 换成 OCG_PLACEHOLDER_KEY（跑 ocg setup dsh）。');
+    }
+  }
   // 可选本地鉴权（见 GATE_TOKEN 注释）。401 计入 client 类失败台账，与 404/400 同级。
   if (isProxy && GATE_TOKEN) {
     const got = String(req.headers['x-gate-token'] || '');
@@ -1933,6 +1959,8 @@ async function handle(req, res) {
     return res.end(JSON.stringify({
       ok: true, chain: ALLOWED, forbidden: [...FORBIDDEN], probe: USE_PROBE, ttl: PROBE_TTL,
       blind: 'block', port: PORT,
+      // 归属标识：doctor / 人工用它判断「这个端口上跑的是哪一份安装」
+      root: INSTALL_ROOT, pid: process.pid,
       // 身份白名单（第 17 轮）
       deliverableShapes: [...DELIVERABLE_SHAPES],
       blockedProtos: [...BLOCKED_PROTOS],
@@ -1956,6 +1984,8 @@ async function handle(req, res) {
       lastJudgeOk: !!lastPc && lastPc.verdict === 'pass',
       egressHost: `${HOST}:${HOST_PORT}`,
       tokenRequired: !!GATE_TOKEN,
+      // R1 可观测：客户端是否曾把真 key 送到本机端口（true = 配置该改成占位 key）
+      clientKeyFromEnv: clientSentRealKey.flag,
       baselineObservedAt: OBSERVED_AT,
       startupSelfTest,
       rejectedThirdShape: metrics.rejectedThirdShape, rejectedUnknownShape: metrics.rejectedUnknownShape,
@@ -2643,6 +2673,43 @@ if (NON_DS.length) {
     ' 非 DeepSeek=' + JSON.stringify(NON_DS) + ' 完整链=' + JSON.stringify(ALLOWED));
   process.exit(1);
 }
+// ★ 2026-10-26：端口被占用必须「说清是谁」并立即失败，不能静默重启。
+// 现场：两个监护实例同时拉门控（同端口）→ 第二个 EADDRINUSE 后立刻退出 → 监护按 1.5s/15s
+// 退避无限重启；而 stderr 进的是 conhost，从外部完全看不见，表现为「有个门控在跑，但重启了个寂寞」。
+// 处理：探一下对端的 /gate/health 拿到 pid/root（这就是归属证据），打印后以 EXIT_PORT_IN_USE 退出，
+// 监护见到这个退出码就不再重启。
+server.on('error', (e) => {
+  if (e?.code !== 'EADDRINUSE') {
+    console.error('[oc-gate] 监听 127.0.0.1:' + PORT + ' 失败：' + String(e?.message || e));
+    process.exit(1);
+  }
+  const report = (who) => {
+    // stderr 在计划任务下进 conhost（看不见），所以同时写一条台账：这是"重复部署"唯一的持久证据
+    try {
+      log({ ts: new Date().toISOString(), result: 'PORT_IN_USE', port: PORT, occupant: who || null });
+    } catch {}
+    console.error('[oc-gate] 端口 ' + PORT + ' 已被占用（EADDRINUSE）' + (who ? '：' + who : '') +
+                  '。本次启动放弃，不重试。');
+    console.error('[oc-gate] 若这是误装的第二份：结束重复实例，或用 GATE_PORT 换端口；`ocg doctor` 可查占用者与归属。');
+    process.exit(EXIT_PORT_IN_USE);
+  };
+  const req = http.get({ host: '127.0.0.1', port: PORT, path: '/gate/health', timeout: 1200 }, (r) => {
+    let buf = '';
+    r.setEncoding('utf8');
+    r.on('data', (c) => { if (buf.length < 65536) buf += c; });
+    r.on('end', () => {
+      let who = '';
+      try {
+        const h = JSON.parse(buf);
+        who = '已有门控 pid=' + (h.pid ?? '?') + ' root=' + (h.root ?? '?') +
+              ' shapes=' + (Array.isArray(h.deliverableShapes) ? h.deliverableShapes.join(',') : '?');
+      } catch (err) { who = '端口上有 HTTP 服务，但不是本门控（/gate/health 无法解析）'; }
+      report(who);
+    });
+  });
+  req.on('timeout', () => req.destroy());
+  req.on('error', () => report('占用者不响应 /gate/health（不是本门控，或版本过旧）'));
+});
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[oc-gate v4] 127.0.0.1:${PORT} chain=${ALLOWED.join(' -> ')} forbidden=${[...FORBIDDEN].join(',')} probe=${USE_PROBE} ttl=${PROBE_TTL}ms hedge=${HEDGE} refresh=${REFRESH_MS}ms`);
   if (CONFIG_WARNINGS.length) {

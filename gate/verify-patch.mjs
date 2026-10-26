@@ -20,6 +20,9 @@ const probeLines = probeSrc.split('\n');
 // CLI 也要断言：它是最可能把本机路径/调用栈打给用户的地方
 const CLI_SRC = path.join(import.meta.dirname, '..', 'bin', 'ocg.mjs');
 const cliLines = fs.readFileSync(CLI_SRC, 'utf8').split('\n');
+// 监护也要断言：它是「重复部署 → 隐形重启循环」那条故障链的入口
+const SUP_SRC = path.join(import.meta.dirname, '..', 'bin', 'ocg-supervise.mjs');
+const supLines = fs.readFileSync(SUP_SRC, 'utf8').split('\n');
 let pass = 0, fail = 0;
 const failures = [];
 
@@ -446,6 +449,26 @@ hasIn(cliLines, 'V24 diag 写盘失败只给人话', '写入 ${outFile} 失败')
 // `curl -H 'Host: evil.example' /gate/proof` 返回 200 —— rebind 页面同源可读走响应体。
 hasOrder('V25 Host 校验早于 /gate/* 出口', 'const hostHdr = String(req.headers.host', "req.url === '/gate/health'");
 has('V26 /gate/proof 不回传绝对路径', 'file: path.basename(PROOF_FILE)');
+
+// 2026-10-26：重复部署（同机多份安装 / 同端口被拉两次）必须「可识别 + 不隐形重启」。
+// 现场证据：两个监护同时拉门控，第二个 EADDRINUSE 后 15s 退避无限重启，stderr 进 conhost 看不见。
+has('W1 health 暴露安装根（doctor 判归属）', 'root: INSTALL_ROOT,');
+has('W2 端口占用使用专用退出码', 'EXIT_PORT_IN_USE = 4');
+has('W3 端口占用时探测占用者归属', "path: '/gate/health'");
+hasIn(supLines, 'W4 监护按端口加单实例锁', 'supervise-${process.env.GATE_PORT');
+hasIn(supLines, 'W5 端口占用退出码不再重启', 'code === PORT_IN_USE_CODE');
+hasIn(supLines, 'W6 陈旧锁可回收（崩溃后仍能起）', "fs.openSync(LOCK, 'wx')");
+// 只看 pidAlive 会被 Windows 的 PID 复用骗死：锁里的 pid 被任意新进程占用后，这个端口再也起不来。
+// 锁的真值来源必须是「端口上有没有我们的门控应答」。
+hasIn(supLines, 'W7 锁的真值来源是端口应答', 'await liveGate()');
+hasIn(supLines, 'W8 锁不可用时不阻断启动', '本次不加锁继续运行');
+has('W9 端口占用写入台账（stderr 在计划任务下看不见）', "result: 'PORT_IN_USE'");
+// 2026-10-26（R1）：客户端不该把真 key 送过回环。门控只用自己的 key，
+// 客户端侧用占位变量；门控对「仍送真 key」做一次性告警，便于迁移是否生效可验证。
+hasIn(cliLines, 'W11 客户端侧使用占位 key', 'OCG_PLACEHOLDER_KEY');
+has('W12 客户端送真 key 时记一次台账', "result: 'CLIENT_SENT_REAL_KEY'");
+has('W13 health 暴露客户端是否送过真 key', 'clientKeyFromEnv:');
+hasIn(cliLines, 'W10 doctor 归属比较做路径归一', 'norm(h.root) === norm(ROOT)');
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

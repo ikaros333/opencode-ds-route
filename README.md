@@ -106,7 +106,7 @@ node bin\ocg.mjs setup dsh --apply
       # 位置：- id: llm-pi-ai → config: → providers: 下面
       ocg-gated:
         displayName: "OpenCode Go · Responses（经门控）"
-        apiKeyEnv: OPENCODE_GO_API_KEY
+        apiKeyEnv: OCG_PLACEHOLDER_KEY
         api: openai-responses
         baseURL: http://127.0.0.1:8787/v1
         # 启用 GATE_TOKEN 时才需要下面两行
@@ -116,7 +116,7 @@ node bin\ocg.mjs setup dsh --apply
           - id: deepseek-flash
       ocg-gated-msg:
         displayName: "OpenCode Go · Messages（经门控）"
-        apiKeyEnv: OPENCODE_GO_API_KEY
+        apiKeyEnv: OCG_PLACEHOLDER_KEY
         api: anthropic-messages
         baseURL: http://127.0.0.1:8787      # messages 不带 /v1
         models:
@@ -159,12 +159,32 @@ dsh --profile web --dump-config | Select-String ocg-gated
 
 细节与错误对照见 [docs/DSH.md](docs/DSH.md)。
 
+> **为什么用占位 key**：门控只用自己的 `OPENCODE_GO_API_KEY` 打上游，客户端带来的 key 一律被覆盖，
+> 所以 dsh 侧填什么都行。填占位值后，真 key 不再经 `127.0.0.1` 传输（同机其它账户即便抢占端口也拿不到）。
+> 前提：`setx OCG_PLACEHOLDER_KEY dummy` 之后**重启 dsh** —— dsh 只在启动时读进程环境，
+> 不重启会报 `no credential for provider route` 且该 provider 的模型从选择器里消失。
+> 不想折腾就把这两行改回 `OPENCODE_GO_API_KEY`（功能不变，只是真 key 会经过回环）。
+
+### 可选加固：让客户端不带真 key（R1）
+
+门控只用自己的 key，客户端带什么都会被覆盖。所以 dsh 侧可以填**占位 key**，真 key 就不再经过
+`127.0.0.1`（同机其它账户即便抢占端口也拿不到）：
+
+```powershell
+setx OCG_PLACEHOLDER_KEY dummy      # 只需一次
+# 让新进程能看到它：注销/重启系统（Windows 给每个进程的是父进程的环境快照）
+pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desktop，带备份与守卫
+```
+
+脚本会先检查"当前进程能否看到 `OCG_PLACEHOLDER_KEY`"——看不到就拒绝执行，因为 dsh 只在启动时读
+自己的环境，此时改配置会报 `no credential` 且该 provider 的模型从选择器里消失（2026-10-26 实测事故）。
+回滚：`...enable-placeholder-key.ps1 -Restore`。
 ## 其他客户端（非 dsh）
 
 | 字段 | 填什么 |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1`（Anthropic 风格的 `messages` 协议用 `http://127.0.0.1:8787`，不带 `/v1`） |
-| API Key | 你的 OpenCode key（门控不校验它；开了 `GATE_TOKEN` 时另加 `x-gate-token` 头） |
+| API Key | **填任意占位值即可**（如 `dummy`）：门控用自己的 key、不校验客户端这个值；开了 `GATE_TOKEN` 时另加 `x-gate-token` 头 |
 | Model | `deepseek-flash`（未知模型会被归一到已配置车道） |
 
 成功时长这样（`doctor` 九项全绿）：
@@ -233,18 +253,23 @@ set GATE_TRACE=1; node bin\ocg.mjs start   # 每次出网目标打到屏幕
 | 全部 503 | `diag` + [BASELINE.md](docs/BASELINE.md)；急用先退回直连 |
 | 401 `gate_unauthorized` | 客户端没带 `x-gate-token` 头（或重装用 `-NoToken`） |
 | 装了反而慢 | 多客户端共用 session；只给 dsh 用，或换端口另起实例 |
+| 端口通但代码改了没生效 | `doctor` 看「门控归属」：可能跑的是另一份安装（同名任务被覆盖过） |
+| 起了第二次但没日志、也没报错 | 单实例锁生效：第二个监护 exit 3，占用者写在提示里；查 `supervise-<port>.lock` |
 
 ## 自启 / 停止 / 卸载
 
 - 自启：`install.ps1` 注册计划任务，入口是监护进程 `bin\ocg-supervise.mjs`（门控退出 1.5 秒拉起）；
 - 临时停用：仓库根建一个空文件 `stop.flag`（监护不再拉起；重启后依然有效）；
 - 卸载：`powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`（停监护、删任务、停进程，环境变量与日志保留并告知位置）；
-- 同名任务指向别的目录时，安装脚本会中止并要求 `-Force`，不会静默覆盖。
+- 同名任务指向别的目录时，安装脚本会中止并要求 `-Force`，不会静默覆盖；
+- **同一端口只允许一个监护**：锁文件 `supervise-<port>.lock`（已在 `.gitignore`）。第二个实例会直接退出（exit 3）并打印占用者的 pid/root，而不是变成"抢不到端口的隐形重启循环"。不同端口（如 8787 生产 + 8888 影子）可并存；
+- **端口被占用时门控不重试**：探测占用者的 `/gate/health` 拿到归属后以 exit 4 退出，监护见到这个码也不再拉起；
+- 归属可查：`/gate/health` 现在带 `root` 与 `pid`，`node bin\ocg.mjs doctor` 会指出"8787 上跑的是另一份安装"。
 
 ## 已验证环境
 
-Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 273 + 53 条断言全绿，真实上游 9 套（含 60s soak）全绿。
-最后一次验证：**2026-10-24**（`v0.1.0` 发布，对应 CI `success`）。
+Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 292 + 53 条断言全绿，真实上游 9 套（含 60s soak）全绿。
+最后一次验证：**2026-10-26**（单实例锁 / 端口占用归属 / health `root`，本机生产实测通过）。
 Linux / macOS 未验证，也不提供安装脚本。
 
 ## 免责声明

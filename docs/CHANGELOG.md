@@ -1,5 +1,63 @@
 ## 未发布（本地）
 
+### 安全：客户端不再需要真 key（消除"端口被抢 → key 被收走"）
+
+- **网络/判据**：门控行为不变（它一直用自己的 `OPENCODE_GO_API_KEY`，客户端带来的 key 会被
+  `headersFor()` 无条件覆盖）。改动在**客户端侧**：dsh provider 的 `apiKeyEnv` 改用占位变量
+  `OCG_PLACEHOLDER_KEY`（值 `dummy`），于是真 key 不再经 `127.0.0.1` 传输。
+  风险背景：同机另一个 Windows 账户可以先抢占 8787 收下 dsh 发来的明文 key，`GATE_TOKEN` 挡不住。
+- **可观测**：门控在发现客户端仍送**真 key** 时记一次 `CLIENT_SENT_REAL_KEY`（含修复提示），
+  `/gate/health` 暴露 `clientKeyFromEnv`；`ocg doctor` 增加「客户端 key」检查（配置仍在用真 key 时告警）。
+- **env**：`ocg setup dsh` 会确保 `OCG_PLACEHOLDER_KEY=dummy` 存在；`install.ps1` 同样写入。
+- **文档**：README / `docs/DSH.md` 的 provider 示例改为占位 key，并写明**必须重启 dsh**。
+- **事故与教训（2026-10-26）**：先只改配置、没有重启 dsh → dsh 报
+  `llm-pi-ai: no credential for provider route "ocg-gated-msg"`，且该 provider 的模型从选择器消失。
+  根因：**dsh 只在自己的进程启动时读环境变量**，不读实时系统变量；变量写入时间（13:24）晚于
+  dsh 启动时间（11:28）。已立即回滚配置，并在 `ocg setup dsh` 输出、`install.ps1`、README、
+  `ocg doctor` 四处加上"设完变量必须重启 dsh，否则会 no credential / 模型消失"的显式警告。
+- **工具**：新增 `scripts/enable-placeholder-key.ps1`（带环境变量守卫、逐文件备份、`-WhatIf`、`-Restore`），
+  只有在「当前进程能看到 `OCG_PLACEHOLDER_KEY`」时才允许改配置 —— 这条守卫直接编码了上面的事故条件。
+  现场实测：dsh 由 WMI 拉起的 `cmd.exe` 启动，其环境快照来自 08:18（早于 13:24 的变量写入），
+  所以「重启 dsh」并不等于「重启环境」；必须注销/重启系统，或从新父进程重新拉起。
+- **测试**：`verify-patch` 增加 W11–W13，自检 289 → 292。影子门控 + 假上游实测：客户端送 `dummy`
+  时上游收到的是门控自己的 key；客户端送真 key 时台账只记一条 `CLIENT_SENT_REAL_KEY`、
+  `health.clientKeyFromEnv=true`。
+
+### 仓库卫生：`.gitignore` 补齐 + CI 新增脚本编码断言
+
+- **文件**：`.gitignore` 补 4 条 —— `matrix.json`（`GATE_SNAPSHOT` 指到仓库根时的兜底）、`.envrc`（direnv 里
+  常写 `export OPENCODE_GO_API_KEY=...`，漏忽略等于漏 key）、`*.rar`、`.history/`（编辑器本地历史）。
+  仍**故意不**忽略 `*.lock` 通配：那会连 `yarn.lock` / `pkg` 类锁文件一起吞掉，所以只写 `supervise-*.lock`。
+- **CI**：`windows` job 新增「脚本编码检查」：`.ps1`/`.vbs` 含非 ASCII 必须有 UTF-8 BOM、三类脚本行尾必须
+  CRLF（`.cmd` 例外：BOM 会让 cmd.exe 把首行当命令）。这条正是本轮 BOM 事故的守门人 —— `.gitignore`
+  管不到编码，只有断言能拦。
+- **文档**：CI 步骤名里过期的「273 条断言」改为 289。
+
+### 加固：重复部署可识别、不隐形重启（单实例锁 / 端口占用归属 / health `root`）
+
+- **文件**：新增运行时锁 `supervise-<port>.lock`（已进 `.gitignore`），同端口只允许一个
+  `bin/ocg-supervise.mjs`；第二个实例 exit 3 并打印占用者 pid/root。**锁的真值来源是端口应答**：
+  锁里的 pid 活着但 `/gate/health` 无应答时按陈旧锁回收（Windows 会快速复用 PID，只看 pidAlive
+  会让该端口永久起不来）；目录只读导致锁不可用时降级为"不加锁继续"，不阻断启动。`uninstall.ps1`
+  卸载时清理锁文件。
+- **网络/判据**：无变化。端口被占用时门控**不再退避重启**：探测占用者的 `/gate/health` 拿到
+  `pid`/`root`/`deliverableShapes`，打印后 exit 4；监护见到 4 直接带走自己。同时写一条台账
+  `result: "PORT_IN_USE"`（含占用者描述）—— stderr 在计划任务下进 conhost，台账是唯一持久证据。
+  背景：同端口被拉起两次时，第二个门控必然 EADDRINUSE 秒退，旧监护按 1.5s/15s 无限重启，
+  而 stderr 进的是 conhost —— 从外部完全看不出"有个空转循环"，表现为"有个门控在跑但重启了个寂寞"。
+- **观测**：`/gate/health` 新增 `root`（安装根绝对路径）与 `pid`；`ocg doctor` 增加「门控归属」一行，
+  路径归一（大小写/尾斜杠）后比较，指向另一份安装时明确告警（此前只能看到"端口上有门控在跑"，
+  会误判为"改了没生效"）。`install.ps1` 与 `uninstall.ps1` 同样改用 `root` 判归属：
+  安装时发现端口属于另一份安装会提示并改端口，卸载时不再误杀别人的门控。
+- **测试**：`verify-patch` 增加 W1–W10，自检 279 → 289。本机实测：同端口第二实例 → exit 3；
+  非门控占用端口 → exit 4（0.2s，无重启，台账留 `PORT_IN_USE`）；门控占用端口 → 打印归属后 exit 4；
+  强杀后陈旧锁回收；**伪造"pid 活着但端口无门控"的 PID 复用场景 → 正确回收并启动**；
+  `stop.flag` 存在 → 监护 exit 0 且不留锁；非回环 Host 读 `/gate/health` 仍 421（`root` 不外泄）；
+  生产重启后 `health.root` 正确、`selftest=pass`、真实 messages 请求 `200 official`。
+- **构建卫生**：本轮编辑一度把 `install.ps1` / `uninstall.ps1` 的 UTF-8 BOM 去掉（PowerShell 5.1 会按
+  GBK 解析含中文的脚本而失败）。已回写 BOM + CRLF，并用 **PowerShell 5.1 真实解析器**验证两个脚本
+  解析通过、`install.ps1 -WhatIf` 可运行。
+
 ### 安全修复：resp_ 后缀必须符合 UUID4 位模式
 
 - **网络/判据**：`resp_` 不再一律视为中性。网关改写的 id 后缀必须是「UUID4 去横线」的位模式

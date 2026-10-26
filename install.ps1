@@ -78,6 +78,15 @@ if (-not $key) {
   Say "  OK  已存在（长度 $($key.Length)）"
 }
 
+# 客户端占位 key（R1）：门控只用自己的 OPENCODE_GO_API_KEY，dsh 侧用占位值即可，
+# 真 key 就不必经过 127.0.0.1（同机其它账户即便抢占端口也拿不到）。
+if (-not [Environment]::GetEnvironmentVariable('OCG_PLACEHOLDER_KEY', 'User')) {
+  [Environment]::SetEnvironmentVariable('OCG_PLACEHOLDER_KEY', 'dummy', 'User')
+  Say '  OK  已写入 OCG_PLACEHOLDER_KEY=dummy（dsh 侧的占位 key；门控不使用它）'
+  Say '      ⚠ dsh 只在启动时读环境变量：装完请重启 dsh，否则该 provider 会报 no credential、模型消失'
+} else {
+  Say '  OK  OCG_PLACEHOLDER_KEY 已存在（占位 key）'
+}
 # ---------------- 3. 端口 ----------------
 Step 3 "检查端口 $Port"
 $alreadyRunning = $false
@@ -86,8 +95,19 @@ function Test-Listening([int]$p) {
 }
 if (Test-Listening $Port) {
   # 是我们的门控就继续；是别人的就要求换端口（绝不结束别人的进程）
-  $isOurs = $false
-  try { $h = Invoke-RestMethod "http://127.0.0.1:$Port/gate/health" -TimeoutSec 2; $isOurs = [bool]$h.ok } catch {}
+  $h = $null
+  try { $h = Invoke-RestMethod "http://127.0.0.1:$Port/gate/health" -TimeoutSec 2 } catch {}
+  $isOurs = [bool]($h -and $h.ok)
+  # 归属校验（2026-10-26）：health.ok 只能说明「这个端口上有门控」，不能说明「跑的是当前目录这份」。
+  # 同机两份安装时，改了代码却不生效，根因就在这里。root 归一后比较（Windows 路径大小写不敏感）。
+  if ($isOurs -and $h.root) {
+    $norm = { param($p) (([IO.Path]::GetFullPath([string]$p)).TrimEnd('\', '/')).ToLowerInvariant() }
+    if ((& $norm $h.root) -ne (& $norm $Root)) {
+      Say "  注意：这个端口上跑的是另一份安装：$($h.root)"
+      Say "        当前目录：$Root —— 在这份里改代码不会生效。"
+      $isOurs = $false
+    }
+  }
   if ($isOurs) {
     $alreadyRunning = $true
     Say '  已有门控在这个端口上运行，稍后只注册任务、不重复启动（避免抢端口）。'
