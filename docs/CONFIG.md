@@ -148,7 +148,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_TOTAL_BUDGET_MS` | 120000 | 单请求总预算（= 车道数 × 单次超时，保证每条车道至少一次完整机会） |
+| `GATE_TOTAL_BUDGET_MS` | 90000 | 单请求总预算（首选车道 60s + 后备 30s；见下方说明） |
 | `GATE_UPSTREAM_TIMEOUT_MS` | 60000 | 上游单次超时 |
 | `GATE_BODY_IDLE_TIMEOUT_MS` | 120000 | 流空闲超时 |
 | `GATE_MAX_BODY` | 16 MB | 请求体上限 |

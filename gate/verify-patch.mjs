@@ -240,7 +240,7 @@ has('L23u TTL 取值走协议分档', 'precheckTtlFor(proto)');
 has('L24 响应头到达后清除等待超时', 'req.setTimeout(0)');
 has('L24b body 阶段独立空闲超时', 'res.setTimeout(BODY_IDLE_TIMEOUT_MS');
 has('L24c body 空闲超时可配', "GATE_BODY_IDLE_TIMEOUT_MS', 120000");
-has('L24d 路由预算 = 车道数×单次上限（留给第二车道）', "GATE_TOTAL_BUDGET_MS', 120000");
+has('L24d 路由预算 = 60s 首选 + 30s 后备（90s）', "GATE_TOTAL_BUDGET_MS', 90000");
 has('L23q 跳过探测不再硬编码 30000', "const skipProbeTtl = SKIP_PROBE_TTL_MS");
 has('L9 hedge 无胜者时回落主循环', 'idx = 0;');
 has('L10 预检注入 session 头', "'x-opencode-session': STABLE_SESSION");
