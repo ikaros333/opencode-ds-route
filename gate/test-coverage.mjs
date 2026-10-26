@@ -80,6 +80,7 @@ const mock = http.createServer((req, res) => {
     }
     const isProbe = b.length < 200 && /"input"\s*:\s*"hi"/.test(b);
     if (probeFail && isProbe) { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"probe":"fail"}'); }
+
     if (mode === 'hang') { res.writeHead(200, { 'content-type': 'application/json' }); return; }   // 永不响应
     if (mode === 'third') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ id: HEX32 })); }
     if (mode === 'noid') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ object: 'response' })); }
@@ -132,14 +133,14 @@ const rawGet = (port, urlPath, hostHeader) => new Promise((resolve, reject) => {
 });
 
 try {
-  console.log('=== G1 gate_budget_exhausted（预算耗尽路径）===');
+  console.log('=== G1 全挂 → fail-closed（慢挂不重试同车道）===');
   {
     await fetch(`http://127.0.0.1:${MP}/mode/hang`);
-    const g = await startGate(P0 + 0, { GATE_UPSTREAM_TIMEOUT_MS: '2500', GATE_TOTAL_BUDGET_MS: '3500', GATE_LANE_RETRY: '2' });
+    const g = await startGate(P0 + 0, { GATE_UPSTREAM_TIMEOUT_MS: '2500', GATE_TOTAL_BUDGET_MS: '6000', GATE_LANE_RETRY: '2' });
     check('G1 实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
     const r = await gate(P0 + 0);
     check('G1 返回 503', r.status === 503, `status=${r.status} ${r.ms}ms`);
-    check('G1 错误类型为 gate_budget_exhausted', r.j?.error?.type === 'gate_budget_exhausted', `type=${r.j?.error?.type}`);
+    check('G1 全挂 → 归类为上游不可达（fail-closed）', r.j?.error?.type === 'gate_upstream_unreachable', `type=${r.j?.error?.type}`);
     check('G1 带 budget_ms 与 elapsed_ms', typeof r.j?.error?.budget_ms === 'number' && typeof r.j?.error?.elapsed_ms === 'number',
       `budget_ms=${r.j?.error?.budget_ms} elapsed_ms=${r.j?.error?.elapsed_ms}`);
     // ★ 2026-10-21 实测：预算 3500ms + 上游超时 2500ms + LANE_RETRY=2 时，
@@ -151,9 +152,11 @@ try {
     // 回归：探针原本在预算之外，上游 hang 时 2×15s 让客户端等 33s。修复后应 ≤ 8s
     check('G1 墙钟不因探针 hang 而暴涨（≤8s）', r.ms <= 8000, `${r.ms}ms`);
     const m = await met(P0 + 0);
-    check('G1 budgetExhausted 只计一次', m.budgetExhausted === 1 && m.blocked === 1, `budgetExhausted=${m.budgetExhausted} blocked=${m.blocked}`);
+    check('G1 慢挂计数与 blocked 各 1 次', (m.laneSlowHang || 0) >= 1 && m.blocked === 1, `laneSlowHang=${m.laneSlowHang} blocked=${m.blocked}`);
     g.child.kill('SIGKILL');
     await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+
+
   }
 
   console.log('\n=== G2 HEDGE：车道判定未知时并行对冲 ===');

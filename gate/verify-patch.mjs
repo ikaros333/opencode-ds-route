@@ -240,7 +240,7 @@ has('L23u TTL 取值走协议分档', 'precheckTtlFor(proto)');
 has('L24 响应头到达后清除等待超时', 'req.setTimeout(0)');
 has('L24b body 阶段独立空闲超时', 'res.setTimeout(BODY_IDLE_TIMEOUT_MS');
 has('L24c body 空闲超时可配', "GATE_BODY_IDLE_TIMEOUT_MS', 120000");
-has('L24d 路由预算不与输出时长混同', "GATE_TOTAL_BUDGET_MS', 60000");
+has('L24d 路由预算 = 车道数×单次上限（留给第二车道）', "GATE_TOTAL_BUDGET_MS', 120000");
 has('L23q 跳过探测不再硬编码 30000', "const skipProbeTtl = SKIP_PROBE_TTL_MS");
 has('L9 hedge 无胜者时回落主循环', 'idx = 0;');
 has('L10 预检注入 session 头', "'x-opencode-session': STABLE_SESSION");
@@ -462,7 +462,9 @@ hasIn(supLines, 'W6 陈旧锁可回收（崩溃后仍能起）', "fs.openSync(LO
 // 锁的真值来源必须是「端口上有没有我们的门控应答」。
 hasIn(supLines, 'W7 锁的真值来源是端口应答', 'await liveGate()');
 hasIn(supLines, 'W8 锁不可用时不阻断启动', '本次不加锁继续运行');
-has('W9 端口占用写入台账（stderr 在计划任务下看不见）', "result: 'PORT_IN_USE'");
+// 2026-10-26：慢挂（吃满单次上限）若还按 LANE_RETRY 重试同车道，会把总预算烧在同一条坏车道上，
+// 第二条车道永远轮不到。必须直接换道。
+has('W9 慢挂不重试同车道（直接换道）', "result: 'LANE_SLOW_HANG',");has('W9 端口占用写入台账（stderr 在计划任务下看不见）', "result: 'PORT_IN_USE'");
 // 2026-10-26（R1）：客户端不该把真 key 送过回环。门控只用自己的 key，
 // 客户端侧用占位变量；门控对「仍送真 key」做一次性告警，便于迁移是否生效可验证。
 hasIn(cliLines, 'W11 客户端侧使用占位 key', 'OCG_PLACEHOLDER_KEY');

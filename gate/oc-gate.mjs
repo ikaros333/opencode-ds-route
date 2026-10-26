@@ -159,7 +159,9 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 第 17 轮：身份白名单的拒绝计数
   rejectedThirdShape: 0, rejectedUnknownShape: 0,
   // 2026-10-26（R1）：客户端是否曾把真 key 送到本机端口
-  clientSentRealKey: 0 };
+  clientSentRealKey: 0,
+  // 2026-10-26：整段挂在单次上限的「慢挂」次数（这类不重试同车道，直接换道）
+  laneSlowHang: 0 };
 
 // 客户端是否曾把真 key 送到本机端口（R1 的可观测信号：health 暴露，doctor 也会查配置）
 const clientSentRealKey = { flag: false };
@@ -313,7 +315,14 @@ const UPSTREAM_FAST_FAIL_LANES = num('GATE_UPSTREAM_FAST_FAIL_LANES', 2, { min: 
 // 注意它约束的是「路由判定过程的耗时」（探针 + 多次尝试 + 换道），**不是单次推理的
 // 输出时长** —— 后者由 BODY_IDLE_TIMEOUT_MS 兜底。原值 45000 会把长输出误杀：
 // 实测 16K token 输出需 44s，加上探针 2s 就超预算 → gate_budget_exhausted 503。
-const TOTAL_BUDGET_MS = num('GATE_TOTAL_BUDGET_MS', 60000, { min: 5000, max: 600000 });
+//
+// ★ 2026-10-26 实测标定（本机台账）：大包流式请求（≈2.6MB / 39 tools）首字节
+//   p50=3.9s、p90=36.4s、p99=54.3s —— 单次尝试上限 60s 是对的，不能压。
+//   但「总预算 = 单次上限 = 60s」时，一次挂死就把预算烧光，第二条车道永远轮不到
+//   （台账 8480b685/7d51cad2/e1b768a4 都是 attempts 只有 1 条）。
+//   故总预算取「车道数 × 单次上限」= 2 × 60s = 120s：保证每条车道至少有一次完整机会。
+//   若你改 CHAIN 增加了车道数，请同步放大该值（否则后面的车道仍拿不到时间）。
+const TOTAL_BUDGET_MS = num('GATE_TOTAL_BUDGET_MS', 120000, { min: 5000, max: 600000 });
 // 单个探针的超时；必须远小于总预算，否则上游 hang 时探针会把预算吃光
 const PROBE_TIMEOUT_MS = num('GATE_PROBE_TIMEOUT_MS', 5000, { min: 500, max: 60000 });
 // ★ 探针「总时长」上限（覆盖 DNS/连接/TLS/滴流）。实测 2026-10-22 上游慢时 m1=3919ms、m8=3452ms，
@@ -2584,6 +2593,17 @@ async function handle(req, res) {
           continue;
         }
         break;   // 本车道结束 → 换下一条车道
+      }
+      // ★ 2026-10-26：整段挂在本次尝试上限（拿不到任何 HTTP 响应）**不是**瞬时抖动。
+      // 同车道重试只会把预算烧在同一条坏车道上 —— 实测 60s 预算下 1 次挂死即 503；
+      // 即使把总预算加到 120s，若仍按 LANE_RETRY 重试同车道，就变成「同一条车道连挂两次」，
+      // 第二条车道依然轮不到（attempts 里 laneRetry:0/1 都是同一个 model）。
+      // 所以「慢挂」直接换道；LANE_RETRY 只保留给毫秒级连接错误（ECONNRESET / socket hang up 早期）。
+      if (r && r.verdict === 'error' && !r.status && (Number(r.ms) || 0) >= perTry * 0.9) {
+        metrics.laneSlowHang = (metrics.laneSlowHang || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, result: 'LANE_SLOW_HANG',
+              model, ms: r.ms, capMs: perTry, error: r.error || '' });
+        break;
       }
       if (t < LANE_RETRY) {
         metrics.laneRetries++;

@@ -78,6 +78,7 @@ $env:OPENCODE_GO_API_KEY = $key
 $env:GATE_PORT = [string]$ShadowPort
 $env:GATE_REFRESH_MS = '0'
 $env:GATE_PRECHECK_TTL_MS = '0'
+$env:GATE_TOTAL_BUDGET_MS = '60000'   # 测试自己钉住预算：断言里的 <70s / max<60000 不依赖生产默认值
 $env:GATE_BLOCK_PROTOS = 'chat'
 $env:GATE_PROOF_MODE = 'monitor'
 $env:GATE_SNAPSHOT = Join-Path $LogDir 'shadow-matrix.json'

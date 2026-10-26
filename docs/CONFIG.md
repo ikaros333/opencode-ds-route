@@ -148,7 +148,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_TOTAL_BUDGET_MS` | 60000 | 单请求总预算 |
+| `GATE_TOTAL_BUDGET_MS` | 120000 | 单请求总预算（= 车道数 × 单次超时，保证每条车道至少一次完整机会） |
 | `GATE_UPSTREAM_TIMEOUT_MS` | 60000 | 上游单次超时 |
 | `GATE_BODY_IDLE_TIMEOUT_MS` | 120000 | 流空闲超时 |
 | `GATE_MAX_BODY` | 16 MB | 请求体上限 |
@@ -195,6 +195,12 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 precheckWaitMs() + min(MIN_UPSTREAM_BUDGET_MS, TOTAL_BUDGET_MS/2) ≤ TOTAL_BUDGET_MS
 ```
 
+
+**关于总预算（2026-10-26 标定）**：大包流式请求（≈2.6MB / 39 tools）首字节
+p50 3.9s / p90 36.4s / p99 54.3s，所以单次上限保持 60s；而总预算若等于单次上限，
+一次挂死就会烧光预算、第二条车道永远轮不到，因此默认取 120s（2 车道 × 60s）。
+另外「吃满单次上限的慢挂」不再重试同车道，直接换道（台账记 `LANE_SLOW_HANG`）。
+改 `GATE_CHAIN` 增加车道时，请同步放大该值。
 ## 六、回滚
 
 ```powershell
