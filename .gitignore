@@ -7,7 +7,10 @@ probe/*.log
 *.jsonl
 official-proof.json
 session.txt
+# GATE_SNAPSHOT 指到仓库根时的兜底（默认在 gate/logs/ 下，已被上面覆盖）
+matrix.json
 stop.flag
+supervise-*.lock
 *.tmp
 *.temp
 
@@ -20,11 +23,13 @@ ocg-diag*
 *.tgz
 *.tar.gz
 *.7z
+*.rar
 
 # 本地配置与密钥：绝不提交
 .env
 .env.*
 !.env.example
+.envrc
 .npmrc
 cordis.patch.yml
 cordis.patch.yml.*
@@ -49,6 +54,7 @@ yarn-error.log*
 .cursor/
 .fleet/
 *.code-workspace
+.history/
 .DS_Store
 desktop.ini
 Thumbs.db

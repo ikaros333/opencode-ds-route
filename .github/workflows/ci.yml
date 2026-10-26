@@ -76,7 +76,27 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
-      - name: 源码自检（273 条断言，离线）
+      - name: 脚本编码检查（PS 5.1 兼容：.ps1/.vbs 含非 ASCII 必须有 BOM，行尾必须 CRLF）
+        shell: pwsh
+        run: |
+          # 背景：PowerShell 5.1 对无 BOM 的 .ps1 会按 GBK 解码，中文注释会吞掉后面的引号导致解析失败。
+          # .gitignore 管不到这个 —— 编辑器/脚本改写吃掉 BOM 时，只有断言能拦住。
+          # .cmd 例外：BOM 会让 cmd.exe 把首行当成命令执行，所以只要求 CRLF，不要求 BOM。
+          $bad = @()
+          foreach ($f in Get-ChildItem -Recurse -File -Include *.ps1, *.vbs, *.cmd) {
+            $b = [IO.File]::ReadAllBytes($f.FullName)
+            $hasBom = $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF
+            $text = [IO.File]::ReadAllText($f.FullName)
+            $nonAscii = [regex]::IsMatch($text, '[^\x00-\x7F]')
+            $bareLf = [regex]::Matches($text, "(?<!`r)`n").Count
+            $needsBom = $f.Extension -in '.ps1', '.vbs'
+            if ($needsBom -and $nonAscii -and -not $hasBom) { $bad += "$($f.Name): 含非 ASCII 但缺 UTF-8 BOM" }
+            if ($bareLf -gt 0) { $bad += "$($f.Name): 有 $bareLf 处裸 LF（应为 CRLF）" }
+          }
+          if ($bad) { $bad | ForEach-Object { Write-Host "FAIL $_" }; exit 1 }
+          Write-Host 'OK：脚本编码与行尾安全'
+
+      - name: 源码自检（292 条断言，离线）
         run: node gate/verify-patch.mjs
 
       - name: 自包含回归（53 条，自带 mock 上游，不需要 key）
