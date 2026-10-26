@@ -76,6 +76,18 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
+      - name: 版本一致性（README 顶部 ↔ package.json）
+        shell: pwsh
+        run: |
+          # 起因：v0.1.1 发布后发现 README 顶部与下载链接仍写着 v0.1.0，用户会照旧版去下载。
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $m = Select-String -Path README.md -Pattern '`v(\d+\.\d+\.\d+)`' | Select-Object -First 1
+          if (-not $m) { Write-Error 'README 顶部找不到 `vX.Y.Z` 版本标记'; exit 1 }
+          $rv = $m.Matches[0].Groups[1].Value
+          if ($rv -ne $pkg) { Write-Error "版本不一致：README=v$rv package.json=$pkg"; exit 1 }
+          $zip = "opencode-ds-route-v$pkg.zip"
+          if (-not (Select-String -Path README.md -SimpleMatch $zip -Quiet)) { Write-Error "README 未引用当前发布包名 $zip"; exit 1 }
+          Write-Host "OK：v$pkg（README 与 package.json 一致，且引用了 $zip）"
       - name: 脚本编码检查（PS 5.1 兼容：.ps1/.vbs 含非 ASCII 必须有 BOM，行尾必须 CRLF）
         shell: pwsh
         run: |

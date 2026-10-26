@@ -4,7 +4,7 @@
 
 > **如果你也是 opencode go 套餐的订阅者，而且还是 deepseek 模型的深度使用者，同时不想让 opencode 给你路由到第三方的、自部署的掺水 deepseek 模型的话，请看看这个项目！它能极大地保证你在使用 opencode go 套餐时能路由到官方的 deepseek。**
 
-`v0.1.0` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.1` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
 它不改变 OpenCode 的路由，只判断"这次响应是不是官方的"。
@@ -19,15 +19,15 @@
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.0](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.0) 下载
-`opencode-ds-route-v0.1.0.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.1](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.1) 下载
+`opencode-ds-route-v0.1.1.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.0.zip -Algorithm SHA256
+Get-FileHash .\opencode-ds-route-v0.1.1.zip -Algorithm SHA256
 # 与 Release 附件里的 SHA256SUMS.txt 对照，必须完全一致
 ```
 
