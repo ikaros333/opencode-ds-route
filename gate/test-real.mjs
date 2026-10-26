@@ -43,7 +43,7 @@ console.log('=== R1 多轮对话：验证会话亲和与 prompt cache 命中 ===
   }
   check('R1 三轮全部成功', results.every(r => r.status === 200), results.map(r => r.status).join('/'));
   check('R1 三轮全部已证明官方', results.every(r => PROVEN(verdict(r))), results.map(r => verdict(r)).join('/'));
-  check('R1 三轮 id 形态合法（UUID4 或 resp_）', results.every(r => ['UUID4', 'resp_', ''].includes(shape(r))), results.map(r => shape(r)).join('/'));
+  check('R1 三轮 id 形态合法（UUID4 或 resp_）', results.every(r => ['UUID4', 'resp_uuid4', 'resp_', ''].includes(shape(r))), results.map(r => shape(r)).join('/'));
   // 缓存专门由 test-cache.mjs 用「真正带历史的请求」验证；这里只测连续可用性与 id 唯一性
   check('R1 三轮 id 互不相同', new Set(results.map(r => r.j?.id)).size === 3,
     results.map(r => (r.j?.id || '').slice(0, 8)).join(' '));

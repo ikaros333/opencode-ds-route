@@ -209,7 +209,7 @@ has('L22b 日志带实例标识', 'port: PORT, pid: process.pid');
 has('L23 配置数值安全解析', 'function num(name, def');
 has('L23b peekBody 中断兜底', "res.on('error', onErr); res.on('close', onErr)");
 has('L23c vote 无 id 不凭 completed_at 判官方', "signals.push('id:none')");
-has('L23d resp_ 形态为中性', "idShape === 'resp_'");
+has('L23d resp_ 分为 resp_uuid4/resp_bad', "if (idShape === 'resp_' || idShape === 'resp_uuid4') {");
 // ★ 第 17 轮：判定口径由「质量」改为「身份」，以下三条随之改写。
 // unknown 不再无条件放行，必须命中身份白名单；third 不再允许重验翻案。
 has('L23e unknown 须命中身份白名单', "DELIVERABLE_SHAPES.has(r.idShape) && pgate.allowAllLanes");
@@ -282,7 +282,7 @@ has('P2-6 latency 挂 finish+close', "res.on('finish', recordOnce);");
 has('P2-6 latency close 兜底', "res.on('close', recordOnce);");
 
 console.log('\n=== Q. 第 17 轮：身份白名单（只收官方后端）===');
-hasIn(baseLines, 'Q1 白名单只含 UUID4/resp_（baseline 单源）', "const DELIVERABLE_SHAPES = new Set(['UUID4', 'resp_']);");
+hasIn(baseLines, 'Q1 白名单含 UUID4/resp_uuid4/resp_（baseline 单源）', "const DELIVERABLE_SHAPES = new Set(['UUID4', 'resp_uuid4', 'resp_']);");
 has('Q2 third 直接拒绝（4xx 透传除外）', "if (r.verdict === 'third' && !r.passthrough) {");
 has('Q3 拒绝计数 third', 'metrics.rejectedThirdShape = (metrics.rejectedThirdShape || 0) + 1;');
 has('Q4 拒绝计数 unknown', 'metrics.rejectedUnknownShape = (metrics.rejectedUnknownShape || 0) + 1;');
@@ -395,7 +395,6 @@ has('Q58 硬上限计时器', 'hardTimer = setTimeout(() => {');
 has('Q59 切断并结算 error', "error: 'attempt_hard_cap'");
 has('Q60 结算时清除计时器', 'if (hardTimer) { try { clearTimeout(hardTimer); } catch {} hardTimer = null; }');
 has('Q61 硬超时留痕', "result: 'ATTEMPT_HARD_TIMEOUT'");
-console.log(`\n===== 自检：${pass} 通过 / ${fail} 失败 =====`);if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 has('Q62 硬上限受单请求预算约束', 'const capMs = Math.max(5000, Math.min(ATTEMPT_HARD_CAP_MS, timeoutMs || UPSTREAM_TIMEOUT_MS));');
 has('Q63 大包请求更长冷却', 'const BIG_PAYLOAD_COOLDOWN_MS = num(');
 has('Q64 按体积档选冷却时长', "const ms = cls === 'B' ? BIG_PAYLOAD_COOLDOWN_MS : LANE_COOLDOWN_MS;");
@@ -403,6 +402,14 @@ has('Q65 请求形状诊断记录', "result: 'REQUEST_SHAPE'");
 has('Q66 冷却键含体积档', "const laneKey = (m, p, cls) => m + '|' + p + '|' + cls;");
 has('Q67 体积分两档', "const sizeClassOf = (bytes) => (BIG_PAYLOAD_BYTES > 0 && bytes >= BIG_PAYLOAD_BYTES) ? 'B' : 'S';");
 has('Q68 排序时传入体积', 'candidates = preferHealthyLanes(candidates, proto, bodyBuf ? bodyBuf.length : 0);');
+
+// ★ 2026-10-26：resp_ 后缀必须校验 UUID4 位模式（关闭「resp_ + 任意 hex 被放行」的洞）
+has('Q74 UUID4 位模式校验存在', "const UUID4_BITS = (h) => typeof h === 'string'");
+has('Q75 只有显式 0 才回退（fail-closed）', "const RESP_SHAPE_STRICT = RESP_SHAPE_RAW !== '0';");
+has('Q76 shapeOf 产出 resp_bad', "return (m && UUID4_BITS(m[1])) ? 'resp_uuid4' : 'resp_bad';");
+has('Q77 resp_bad 不在可交付白名单', "'resp_bad'", { count: 1 });
+has('Q78 回退开关生效点', "if (!RESP_SHAPE_STRICT) return 'resp_';");
+has('Q79 非法取值记配置告警', 'GATE_RESP_SHAPE_STRICT="');
 
 console.log('\n=== V. 判据单源 / 本地鉴权 / 状态可见性 ===');
 // 判据常量只允许有一个来源：baseline.mjs。gate 与 probe 都 import 它，任何一处复制字面量 = 漂移隐患。

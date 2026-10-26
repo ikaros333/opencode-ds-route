@@ -1,3 +1,15 @@
+## 未发布（本地）
+
+### 安全修复：resp_ 后缀必须符合 UUID4 位模式
+
+- **网络/判据**：`resp_` 不再一律视为中性。网关改写的 id 后缀必须是「UUID4 去横线」的位模式
+  （第 13 位 = `4`，第 17 位 ∈ `89ab`），否则判 `resp_bad` → 第三方 → 拒绝。
+  背景：`resp_` + 任意 32 hex 的伪造响应曾被当作中性形态放行（安全洞）。
+- **env**：新增 `GATE_RESP_SHAPE_STRICT`。只有显式 `0` 才回退旧行为；未设置 / 空串 / `1` / 拼错
+  一律按严格模式处理（配置错误 fail-closed），非 0/1 取值记 `CONFIG_WARNING`。
+- **判据**：`DELIVERABLE_SHAPES` 由 `UUID4`/`resp_` 改为 `UUID4`/`resp_uuid4`/`resp_`（`resp_` 仅回退模式）。
+- **测试**：`test-bugfix` 增加 3 条回归（合法 `resp_uuid4` 交付、伪造 `resp_bad` 拒绝、畸形 `resp_` 拒绝）；
+  `verify-patch` 增加 Q74–Q79，自检 273 → 279。
 # CHANGELOG
 
 变更标注三类影响面：**网络**（出网行为/判据）、**文件**（读写路径）、**env**（环境变量）。

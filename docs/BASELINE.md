@@ -12,7 +12,7 @@
 | # | 判据 | 观测事实 | 实测日期 | 失效时改哪 |
 |---|---|---|---|---|
 | B1 | `responses` id 形态 | 官方直出 = UUIDv4（37/37）；第三方 = `HEX32` / `resp_` / `chatcmpl` / `gw-` / 纯数字（38/38 非 UUIDv4） | 2026-10-19 | `baseline.mjs` 的 `ID_UUID4`；分类逻辑在 `shapeOf()` |
-| B2 | 可交付形态白名单 | 只有 `UUID4` 与 `resp_` 可交付；`resp_` 还必须叠加协议级背书 | 2026-10-19 | `baseline.mjs` 的 `DELIVERABLE_SHAPES` |
+| B2 | 可交付形态白名单 | 只有 `UUID4` 与 `resp_uuid4` 可交付；`resp_uuid4` 还必须叠加协议级背书。`resp_` 后缀不符合 UUID4 位模式时判 `resp_bad` 拒绝（2026-10-26 起） | 2026-10-26 | `baseline.mjs` 的 `DELIVERABLE_SHAPES`、`oc-gate.mjs` 的 `UUID4_BITS` |
 | B3 | `responses` e1 探针 | 发一个缺 `input` 的 0-token 请求，官方返回 serde 层原话 + 内嵌 UUID4 `request_id` | 2026-10-23 | `baseline.mjs` 的 `E1_MSG` |
 | B4 | `messages` 状态码指纹 | 9 项非法参数请求 → `400,400,400,400,400,400,422,422,422`（400=业务层，422=反序列化层） | 2026-10-19 | `baseline.mjs` 的 `MSG_FINGERPRINT` |
 | B5 | `chat` 协议 | 无可用的零成本判据，默认封禁 | — | 保持封禁（`GATE_BLOCK_PROTOS=chat`） |

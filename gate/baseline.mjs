@@ -29,10 +29,12 @@ export const ID_UUID_ANY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 
 /**
  * 允许交付的 id 形态：
- *   UUID4 : 官方 endpoint 直出
- *   resp_ : OpenCode 网关改写产物，本身不携带后端身份，必须叠加协议级背书
+ *   UUID4      : 官方 endpoint 直出
+ *   resp_uuid4 : OpenCode 网关改写产物，后缀是「UUID4 去横线」的位模式（第13位=4，第17位∈89ab）
+ *   resp_      : 仅 GATE_RESP_SHAPE_STRICT=0 的应急回退模式（恢复旧行为）
+ * resp_bad（resp_ 前缀但后缀不是 UUID4 位模式）不在白名单内 → 一律拒绝。
  */
-export const DELIVERABLE_SHAPES = new Set(['UUID4', 'resp_']);
+export const DELIVERABLE_SHAPES = new Set(['UUID4', 'resp_uuid4', 'resp_']);
 
 /** messages 协议：9 项非法参数请求的期望状态码序列（分两层校验：400 业务层 / 422 反序列化层） */
 export const MSG_FINGERPRINT = '400,400,400,400,400,400,422,422,422';

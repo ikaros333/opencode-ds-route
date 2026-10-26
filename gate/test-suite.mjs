@@ -57,7 +57,7 @@ const small = (model) => ({ model, input: 'hi', max_output_tokens: 8 });
   record('非流式 responses 成功', r.status === 200, `status=${r.status} verdict=${r.headers.get('x-gate-result')}`);
   record('非流式判官方（official 或 proof 放行）',
     ['official', 'pass-by-proof'].includes(r.headers.get('x-gate-result'))
-      && ['UUID4', 'resp_'].includes(r.headers.get('x-gate-id-shape')),
+      && ['UUID4', 'resp_uuid4', 'resp_'].includes(r.headers.get('x-gate-id-shape')),
     `${r.headers.get('x-gate-result')}/${r.headers.get('x-gate-id-shape')}`);
 }
 {

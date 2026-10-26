@@ -235,11 +235,30 @@ const ALLOWED = CHAIN.filter(m => !FORBIDDEN.has(m));
 
 // ★ 第 17 轮：身份白名单 —— 允许交付的响应 id 形态（唯一定义点，勿在别处硬编码）。
 // 目标：只接受官方后端；第三方（自部署 / 异模型 / 第三方池）一律拒绝；官方自身降智不管。
-//   UUID4 : 官方 endpoint 直出（实测官方 responses 16/16 全是 UUID4）
-//   resp_ : OpenCode 网关的 id 改写产物（实测 OC 侧 16/16 全是 resp_，官方侧 0/16）
-//           → 它**不携带**后端身份信息，所以必须叠加协议级背书（allowAllLanes）才交付
+//   UUID4      : 官方 endpoint 直出（实测官方 responses 全 UUID4）
+//   resp_uuid4 : OpenCode 网关改写产物，但后缀是「UUID4 去横线」的位模式（第13位=4，第17位∈89ab）。
+//                实测 35/35 样本符合；随机 32hex 命中该模式概率 1/64 → 8 连中≈1e-14
+//                ⇒ 它是 UUID4 的变形，不是网关自造。
+//   resp_bad   : resp_ 前缀但后缀不符合 UUID4 位模式（或不是 32 hex）→ 判第三方伪造，拒绝。
+//   resp_      : 仅 GATE_RESP_SHAPE_STRICT=0（应急回退）时出现，恢复旧行为。
 // 其余形态（HEX32 / chatcmpl / gw- / other / numeric / 空 id）一律拒绝，不再允许「重验翻案」。
 // 白名单本身定义在 baseline.mjs（判据常量唯一来源）。
+
+// ★ resp_ 后缀位模式校验开关。0 = 回退；其它任何值（未设置 / "1" / 空串 / 拼错 / "true"）= 严格。
+//   原写法 `?? '1'` 有 fail-open：空串与 "true" 都不等于 '1'，会静默回退到旧行为（伪造 resp_ 被放行）。
+//   配置错误必须 fail-closed：只有显式 '0' 才回退，非 0/1 的值记一条告警。
+const RESP_SHAPE_RAW = process.env.GATE_RESP_SHAPE_STRICT;
+const RESP_SHAPE_STRICT = RESP_SHAPE_RAW !== '0';
+if (RESP_SHAPE_RAW !== undefined && RESP_SHAPE_RAW !== '' && RESP_SHAPE_RAW !== '0' && RESP_SHAPE_RAW !== '1') {
+  CONFIG_WARNINGS.push(`GATE_RESP_SHAPE_STRICT="${RESP_SHAPE_RAW}" 不是 0/1，按严格模式处理（只有 "0" 才回退）`);
+}
+
+/** UUID4 去横线后的位模式：第 13 位版本号必须是 4，第 17 位变体必须是 8/9/a/b */
+const UUID4_BITS = (h) => typeof h === 'string'
+  && /^[0-9a-f]{32}$/i.test(h)
+  && h[12].toLowerCase() === '4'
+  && '89ab'.includes(h[16].toLowerCase());
+
 
 const HOST = process.env.GATE_HOST || 'opencode.ai';
 const HOST_PORT = num('GATE_HOST_PORT', 443, { min: 1, max: 65535 });
@@ -384,15 +403,23 @@ function log(rec) {
 const protoOf = (pathName) => pathName.endsWith('/messages') ? 'messages'
   : pathName.endsWith('/chat/completions') ? 'chat' : 'responses';
 
-const shapeOf = (id) => !id ? ''
-  : UUID4.test(id) ? 'UUID4'
-  : UUID_ANY.test(id) ? 'UUID'
-  : /^resp_/.test(id) ? 'resp_'
-  : /^chatcmpl/.test(id) ? 'chatcmpl'
-  : /^gw-/.test(id) ? 'gw-'
-  : /^\d+$/.test(id) ? 'numeric'
-  : /^[0-9a-f]{32}$/i.test(id) ? 'HEX32'
-  : 'other';
+const shapeOf = (id) => {
+  if (!id) return '';
+  if (UUID4.test(id)) return 'UUID4';
+  if (UUID_ANY.test(id)) return 'UUID';
+  // ★ resp_ 不能只看前缀：后缀必须是「UUID4 去横线」的位模式，
+  //   否则就是第三方自造的 hex（实测漏洞：resp_ + 任意 32hex 曾被当作中性形态放行）。
+  if (/^resp_/.test(id)) {
+    if (!RESP_SHAPE_STRICT) return 'resp_';   // 应急回退：仅当显式 GATE_RESP_SHAPE_STRICT=0
+    const m = /^resp_([0-9a-f]{32})$/i.exec(id);
+    return (m && UUID4_BITS(m[1])) ? 'resp_uuid4' : 'resp_bad';
+  }
+  if (/^chatcmpl/.test(id)) return 'chatcmpl';
+  if (/^gw-/.test(id)) return 'gw-';
+  if (/^\d+$/.test(id)) return 'numeric';
+  if (/^[0-9a-f]{32}$/i.test(id)) return 'HEX32';
+  return 'other';
+};
 
 /** 解析 Retry-After：支持秒数与 HTTP-date；无法解析返回 null */
 function parseRetryAfter(v) {
@@ -432,9 +459,12 @@ function vote({ idShape, hasCompletedAt }) {
   // 实测（logprob 2.4e-7 ≪ 1e-5 + E1 文本一致）后端仍是官方未量化模型，
   // 因此 `resp_` 必须视为**中性形态**：既不是第三方特征，也不能单独充当官方证明。
   // 真正的官方证明由协议级预检（eclass 文本 / logprob / msgfp）提供。
-  if (idShape === 'resp_') {
+  // 中性形态有两个来源——旧 `resp_`（仅 GATE_RESP_SHAPE_STRICT=0 回退模式）
+  // 与 `resp_uuid4`（后缀符合 UUID4 位模式，实测 35/35）。两者一律 unknown，行为等同旧逻辑。
+  // `resp_bad`（resp_ 前缀但后缀不是 UUID4 变形）不在此列 → 落到下面的 else → third → 拒绝。
+  if (idShape === 'resp_' || idShape === 'resp_uuid4') {
     if (hasCompletedAt !== undefined) signals.push(`completed_at:${hasCompletedAt}`);
-    signals.push('id:resp_(neutral)');
+    signals.push(`id:${idShape}`);
     return { verdict: 'unknown', votes: { official: 0, third: 0 }, signals };
   }
   official += isOff ? 2 : 0; third += isOff ? 0 : 2;

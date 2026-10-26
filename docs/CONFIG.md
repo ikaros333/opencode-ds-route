@@ -127,6 +127,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PROBE_DEADLINE_MIN` | 5000 | 下限 |
 | `GATE_PROBE_DEADLINE_MAX` | 45000 | 上限 |
 | `GATE_PROOF_REFRESH_MS` | 25000 | 后台保活间隔（把探针移出请求关键路径）；`0` = 关闭 |
+| `GATE_RESP_SHAPE_STRICT` | 严格 | `resp_` 后缀必须是 UUID4 位模式（第13位=4、第17位∈89ab），否则判第三方拒绝；只有显式 `0` 才回退到「resp_ 一律中性」的旧行为（应急用） |
 
 后台保活让正常请求只付生成延迟：窗口内有过 `pass` 就直接复用，最近一次实测是 `fail` 就立即拒绝，
 两者都没有才在现场跑探针。延迟参数只影响可用性，不参与身份判定——超时只会把「未知」变成拒绝，

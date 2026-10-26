@@ -1,4 +1,4 @@
-// 针对本轮 3 个 bug 的精确回归：每个 bug 都有可观测的判据
+// 针对本轮 4 个 bug 的精确回归：每个 bug 都有可观测的判据
 import http from 'node:http';
 
 const GATE = Number(process.argv[2] || 8799);
@@ -43,6 +43,22 @@ const mock = http.createServer((req, res) => {
     if (mode === 'third') {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ id: HEX32, object: 'chat.completion' }));
+    }
+    // ★ 2026-10-26：resp_ 后缀位模式校验的两个方向
+    //   respGood：真实样本（第13位=4，第17位=8）→ 应交付
+    //   respBad ：32hex 但第13位=a（非 UUID4 变形）→ 必须拒绝
+    if (mode === 'respGood') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 'resp_2b3aa2e3705f42ff839262eb637e39de', object: 'response', completed_at: null }));
+    }
+    if (mode === 'respBad') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 'resp_' + HEX32, object: 'response', completed_at: null }));
+    }
+    // resp_ 后不是 32 hex（长度/字符不合法）→ 同样必须拒绝
+    if (mode === 'respShort') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 'resp_abc123', object: 'response', completed_at: null }));
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ id: UUID4, object: 'response', completed_at: null }));
@@ -114,6 +130,30 @@ console.log('\n--- 交叉验证：恢复后连续请求稳定 ---');
   check('连续 5 次均成功', ok === 5, `ok=${ok}/5`);
 }
 
-console.log(`\n===== 3 个 bug 回归：${pass} 通过 / ${fail} 失败 =====`);
+console.log('\n--- 第 4 个 bug 回归：resp_ 后缀必须符合 UUID4 位模式 ---');
+{
+  // 合法：resp_ + 真实样本（第13位=4，第17位=8）→ 应交付（行为与旧版一致）
+  await setMode('respGood');
+  const rg = await gate();
+  check('D1 合法 resp_<UUID4位模式> 正常交付',
+    rg.status === 200 && ['official', 'pass-by-proof'].includes(rg.h.get('x-gate-result')),
+    `status=${rg.status} gate=${rg.h.get('x-gate-result')} shape=${rg.h.get('x-gate-id-shape')}`);
+
+  // 伪造：resp_ + 32hex 但第13位=a（非 UUID4 变形）→ 必须拒绝
+  await setMode('respBad');
+  const rb = await gate();
+  check('D2 伪造 resp_<非UUID4位模式> 被拒绝（旧版会放行）',
+    rb.status === 503,
+    `status=${rb.status} gate=${rb.h.get('x-gate-result')}`);
+
+  // 畸形：resp_ 后不是 32 hex
+  await setMode('respShort');
+  const rs = await gate();
+  check('D3 畸形 resp_<非32hex> 被拒绝', rs.status === 503, `status=${rs.status}`);
+
+  await setMode('ok');
+}
+
+console.log(`\n===== 4 个 bug 回归：${pass} 通过 / ${fail} 失败 =====`);
 mock.close();
 process.exit(fail === 0 ? 0 : 1);
