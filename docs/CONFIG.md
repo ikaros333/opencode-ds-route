@@ -56,7 +56,8 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `gate_no_official_route` | 没拿到官方证据，或全部车道被拒 | 看 `error.precheck_verdict`，对照下表 |
 | `gate_precheck_not_pass` | 预检未通过（最常见的 503） | 同上 |
 | `gate_precheck_failed` | 预检未通过且 `GATE_PROOF_MODE=enforce` | 同上 |
-| `gate_proto_blocked` | 协议被 `GATE_BLOCK_PROTOS` 封禁（默认 `chat`） | 正常行为 |
+| `gate_proto_blocked` | 协议被策略封禁（默认 `chat` + `messages`） | 正常行为；`error.available` 里列出可用端点 |
+| `gate_structure_bad` | 非流式 `responses` 的响应没有正文（只有思考/空内容），且不是工具调用 | 上游把答案写进了 reasoning；直接重试通常可恢复；`error.truncated=true` 表示被 `max_output_tokens` 截断 |
 | `gate_unknown_path` | 路径不在白名单 | 检查客户端端点；`messages` 的 baseURL **不带** `/v1` |
 | `gate_bad_body` / `gate_body_too_large` | 请求体非 JSON / 超 16 MB | 客户端问题 |
 | `gate_upstream_rate_limited` | 上游 429 且 `Retry-After` 过长 | 等，或检查配额 |
@@ -104,11 +105,13 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_CHAIN` | `deepseek-flash,deepseek-v4.1-flash` | **必须是 `deepseek-` 前缀，否则拒绝启动** |
+| `GATE_CHAIN` | `deepseek-v4.1-flash` | **必须是 `deepseek-` 前缀，否则拒绝启动**；2026-10-27 起 `deepseek-flash` 已被上游下线（410） |
 | `GATE_MAX_ATTEMPTS` | 4 | 换道上限 |
 | `GATE_BACKOFF_MS` | 200 | 换道退避 |
 | `GATE_HEDGE` | 1 | 对冲开关（预检通过后不再触发） |
-| `GATE_BLOCK_PROTOS` | 空 | 协议级封禁，推荐 `chat` |
+| `GATE_BLOCK_PROTOS` | `chat` | 追加封禁的协议列表（逗号分隔） |
+| `GATE_IMPL_VECTOR_MS` | 300000 | 实现指纹向量观测间隔（仅告警，不参与放行）；`0` = 关闭 |
+| `GATE_ALLOW_MESSAGES` | 未设置 | **`1` 才解封 `messages`**。上游 messages 侧已混入非 UUID4 id 池，解封前必须先重新标定 `MSG_FINGERPRINT` |
 
 ### 预检（决定能否交付）
 

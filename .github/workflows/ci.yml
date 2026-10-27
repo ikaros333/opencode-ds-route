@@ -108,10 +108,10 @@ jobs:
           if ($bad) { $bad | ForEach-Object { Write-Host "FAIL $_" }; exit 1 }
           Write-Host 'OK：脚本编码与行尾安全'
 
-      - name: 源码自检（293 条断言，离线）
+      - name: 源码自检（312 条断言，离线）
         run: node gate/verify-patch.mjs
 
-      - name: 自包含回归（53 条，自带 mock 上游，不需要 key）
+      - name: 自包含回归（66 条，自带 mock 上游，不需要 key）
         run: node gate/test-coverage.mjs
 
       - name: 冒烟：起服务并读 health

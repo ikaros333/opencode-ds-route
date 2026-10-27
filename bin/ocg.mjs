@@ -167,7 +167,9 @@ async function cmdDoctor() {
 
   // 2 key
   const key = process.env.OPENCODE_GO_API_KEY || '';
-  if (key) line('ok', 'API key', `已设置，长度 ${key.length}`);
+  // 2026-10-27 安全审查：不再打印 key 长度。
+  // 原因：doctor 输出经常被贴进 issue/聊天，长度是账号维度的稳定特征，属不必要的弱泄露。
+  if (key) line('ok', 'API key', '已设置（值不回显）');
   else if (userEnvSet('OPENCODE_GO_API_KEY')) {
     // 计划任务在登录时读 User 级变量，所以门控能用；只有当前终端没继承
     line('warn', 'API key', 'User 级已设置，但当前终端未继承 → 新开一个终端（门控不受影响）');
@@ -410,15 +412,7 @@ function providerYaml(indent) {
     // 逐行拼接，避免模板里多一层缩进
   ].join('\n') + '\n' + (hdr ? hdr : '') + [
     `${pad(2)}models:`,
-    `${pad(4)}- id: deepseek-flash`,
-    `${pad(0)}ocg-gated-msg:`,
-    `${pad(2)}displayName: "OpenCode Go · Messages（经门控）"`,
-    `${pad(2)}apiKeyEnv: ${PLACEHOLDER_ENV}`,
-    `${pad(2)}api: anthropic-messages`,
-    `${pad(2)}baseURL: http://127.0.0.1:${PORT}`,
-  ].join('\n') + '\n' + (hdr ? hdr : '') + [
-    `${pad(2)}models:`,
-    `${pad(4)}- id: deepseek-flash`,
+    `${pad(4)}- id: deepseek-flash      # 客户端别名：门控转发时归一为在售车道（当前 deepseek-v4.1-flash）`,
   ].join('\n');
 }
 
@@ -435,7 +429,8 @@ function dshSnippet() {
     '# 改完必须重启 dsh 进程（cordis.patch.yml 只在启动时加载，刷新页面不够）。',
     body,
     '# 说明：',
-    '#   · anthropic-messages 的 baseURL 不带 /v1，dsh 自己拼 /v1/messages',
+    '#   · 只生成 responses 协议：2026-10-27 起 messages 默认封禁（上游 messages 侧混入',
+    '#     非 UUID4 id 池），要恢复见 docs/CONFIG.md 的 GATE_ALLOW_MESSAGES。',
     `#   · apiKeyEnv 写的是占位变量 ${PLACEHOLDER_ENV}（值随便填，如 dummy）：**门控不用客户端带来的 key**，`,
     '#     它用自己的 OPENCODE_GO_API_KEY 打上游。这样真 key 不会经过任何 socket ——',
     '#     同机其它账户即便抢占了 8787 也拿不到它。直连 provider（不走门控）才需要真 key。',

@@ -101,7 +101,13 @@ const small = (model) => ({ model, input: 'hi', max_output_tokens: 8 });
 }
 {
   const r = await call('/v1/responses', { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, unknown_field: 'x' });
-  record('未知字段透传不影响', r.status === 200, `status=${r.status}`);
+  // 2026-10-27 实测：上游对未知字段**不再忽略**，直接回 503 `Endpoint is unavailable`
+  // （`upstream 503 {"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`）。
+  // 门控此时要么交付（必须带官方证据），要么 fail-closed —— 绝不能返回伪造的成功。
+  const v = r.headers.get('x-gate-result');
+  record('未知字段：交付必须已证明官方，否则 fail-closed',
+    r.status === 200 ? (v === 'official' || v === 'pass-by-proof') : r.status >= 400,
+    `status=${r.status} verdict=${v}`);
 }
 
 // ---------- 5. 协议与路径 ----------

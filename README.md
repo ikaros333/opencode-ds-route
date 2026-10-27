@@ -4,7 +4,7 @@
 
 > **如果你也是 opencode go 套餐的订阅者，而且还是 deepseek 模型的深度使用者，同时不想让 opencode 给你路由到第三方的、自部署的掺水 deepseek 模型的话，请看看这个项目！它能极大地保证你在使用 opencode go 套餐时能路由到官方的 deepseek。**
 
-`v0.1.1` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.2` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
 它不改变 OpenCode 的路由，只判断"这次响应是不是官方的"。
@@ -13,21 +13,42 @@
 
 > 非官方项目，与 OpenCode / DeepSeek 无关联。使用前请读下面的[免责声明](#免责声明)。
 
+## ⚠ 重要：`messages` 协议已默认封禁（2026-10-27）
+
+**本项目现在只支持 `responses` 一个协议。** `messages`（Anthropic 风格）和 `chat` 默认都被拒绝，返回 `503 gate_proto_blocked`。
+
+原因（实测，不是推测）：
+
+| 观测 | 数据 |
+|---|---|
+| `messages` 响应 id 出现三种生成器 | `UUID4` / 13位毫秒时间戳+40hex / 32hex，**同一小时内轮换**；官方直连恒为 `UUID4` |
+| 参数校验时有时无 | `max_tokens=0` 有时 400（正确）有时 **200**（不校验）；`role:"wizard"` 有时 422 有时 **200** |
+| 抓到 Go 实现参与 | `500 Upstream request failed: [invalid_request] json: cannot unmarshal string into Go struct field plain.max_tokens` —— DeepSeek 官方是 Rust/serde，不会产出这句 |
+| 每次响应都被网关改写 | `usage` 恒含 `cost`+`opencode`，恒缺官方的 `service_tier` |
+
+也就是说：这条通道后面挂着**至少三套实现**在轮询，其中至少一套不做官方参数校验。按本项目"只接受官方后端"的约束，它必须被拒绝——这是判据在正常工作，不是 bug。
+
+**想自己验证**：`GATE_ALLOW_MESSAGES=1` 解封后连打 10 次 `/v1/messages`，台账会同时出现 `PASS` 与 `REJECT_SHAPE_UNKNOWN(idShape=other53)`。
+
+**要恢复 `messages`**：先按 [docs/BASELINE.md](docs/BASELINE.md) 的 B4-drift 重新标定指纹，再设 `GATE_ALLOW_MESSAGES=1`；否则只会得到"时而 200 时而 503"。
+
+**能力边界**：`responses` 通道最高只能到 `trustLevel=medium`（`/gate/health` 可见）。官方直连的强证据（UUID4 直出 id、UUID4 `request_id`、原样字段名、严格枚举、`service_tier`、logprobs 真值）已被 OpenCode 全部替换，本通道**无法**给出"官方后端"的证明——详见 [docs/BASELINE.md](docs/BASELINE.md)。
+
 ## 下载与安装
 
 **先决条件**：Windows 10/11、Node ≥ 22、一个 **OpenCode Go 套餐的 key**。
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.1](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.1) 下载
-`opencode-ds-route-v0.1.1.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.2](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.2) 下载
+`opencode-ds-route-v0.1.2.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.1.zip -Algorithm SHA256
+Get-FileHash .\opencode-ds-route-v0.1.2.zip -Algorithm SHA256
 # 与 Release 附件里的 SHA256SUMS.txt 对照，必须完全一致
 ```
 
@@ -113,14 +134,9 @@ node bin\ocg.mjs setup dsh --apply
         # headers:
         #   x-gate-token: "<你的 GATE_TOKEN>"
         models:
-          - id: deepseek-flash
-      ocg-gated-msg:
-        displayName: "OpenCode Go · Messages（经门控）"
-        apiKeyEnv: OCG_PLACEHOLDER_KEY
-        api: anthropic-messages
-        baseURL: http://127.0.0.1:8787      # messages 不带 /v1
-        models:
-          - id: deepseek-flash
+          - id: deepseek-flash      # 客户端别名：门控转发时归一为在售车道（当前 deepseek-v4.1-flash）
+      # 2026-10-27 起 messages 协议默认封禁（上游 messages 侧混入非 UUID4 id 池），
+      # 因此不再推荐配置 ocg-gated-msg；要恢复见 docs/CONFIG.md 的 GATE_ALLOW_MESSAGES。
       # 原有 provider（例如直连的 opencode-go）留在同一个 providers 下，不要删
 ```
 
@@ -138,12 +154,14 @@ node bin\ocg.mjs setup dsh --apply
 dsh --profile web --dump-config | Select-String ocg-gated
 ```
 
-输出里能看到 `ocg-gated` 与 `ocg-gated-msg` 才说明补丁层被解析；然后打开 dsh 的模型选择器，
-列表里应出现「OpenCode Go · Responses（经门控）」与 Messages 那条。
+输出里能看到 `ocg-gated`（以及你原有的直连 provider）才说明补丁层被解析；然后打开 dsh 的模型选择器，
+列表里应出现「OpenCode Go · Responses（经门控）」。
+
+> 2026-10-27 起不再生成 `ocg-gated-msg`（`messages` 协议已默认封禁，见上方重要提示）。
 
 **第 5 步 · 试一条消息**
 
-选中 Responses 那条（判据最强），发一句 "hello"。之后 `node bin\ocg.mjs doctor` 的
+选中 Responses 那条（当前唯一可用协议，判据为 serde 文案 + id 形态），发一句 "hello"。之后 `node bin\ocg.mjs doctor` 的
 「dsh 配置」一项会显示 **已指向 127.0.0.1:8787**。
 
 **回滚**：用 `.bak-<时间戳>` 覆盖回去，或删掉这两个 provider 段，然后重启 dsh 引擎。
@@ -183,15 +201,15 @@ pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desk
 
 | 字段 | 填什么 |
 |---|---|
-| Base URL | `http://127.0.0.1:8787/v1`（Anthropic 风格的 `messages` 协议用 `http://127.0.0.1:8787`，不带 `/v1`） |
+| Base URL | `http://127.0.0.1:8787/v1`（**只支持 `responses`**；`messages` 默认封禁，见上方重要提示） |
 | API Key | **填任意占位值即可**（如 `dummy`）：门控用自己的 key、不校验客户端这个值；开了 `GATE_TOKEN` 时另加 `x-gate-token` 头 |
-| Model | `deepseek-flash`（未知模型会被归一到已配置车道） |
+| Model | `deepseek-flash`（**客户端别名**：门控按 `rankCandidates` 归一为在售车道 `deepseek-v4.1-flash`，台账记 `x-gate-model-substituted`） |
 
 成功时长这样（`doctor` 九项全绿）：
 
 ```text
 ✅ Node       v24.15.0
-✅ API key    已设置，长度 51
+✅ API key    已设置（值不回显）
 ✅ 端口 8787   门控在跑（selftest=pass）
 ✅ 计划任务   Running（登录自启）
 ✅ 判据       最近一次通过：2.4s 前（基线 2026-10-23）
@@ -205,18 +223,21 @@ pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desk
 | 挡住"看起来像官方、实际是第三方池"的响应 | 判断官方模型是否降智 |
 | 交付前给出可读的拒绝原因 | 防蓄意的 TLS 中间人（复刻全部可观测特征即可通过） |
 | 出问题能定位到具体判据 | 分辨"第三方转售真官方 API" |
+| 拦掉"只有思考、没有正文"的响应（`gate_structure_bad`） | 证明响应来自 DeepSeek 官方服务端（上游已抹掉全部官方指纹，见下） |
+| 把 `trustLevel`（`strong`/`medium`/`weak`/`blocked`）暴露到 health 与响应头 | 把 `medium` 变成 `strong`（只有上游恢复官方直出形态才可能） |
 
-一句话：**能拒绝「意外的第三方」，不能拒绝「蓄意的中间人」。**
+一句话：**能拒绝「意外的第三方」，不能拒绝「蓄意的中间人」，也不能证明「这就是官方后端」。**
 
 ## 怎么工作
 
 ```text
-客户端 ──POST──▶ 127.0.0.1:8787 ──▶ ① 预检：这条车道还是官方吗？
-                                   ② 转发：用你的 key 打 opencode.ai:443（唯一出网目标）
-                                   ③ 复核：响应 id 形态 / 错误文案 / 状态码指纹
-判定为官方 ──▶ 交付；判定不了 ──▶ 503 + 可读原因（/gate/alerts）
+客户端 ──POST──▶ 127.0.0.1:8787 ──▶ ① 形态预检：这条通道还是正常网关形态吗？
+                                  ② 转发：用你的 key 打 opencode.ai:443（唯一出网目标）
+                                  ③ 交付闸：id 位模式 / usage 键集 / 结构完整性
+判定通过 ──▶ 交付（附 x-gate-trust）；判不了 ──▶ 503 + 可读原因（/gate/alerts）
 ```
 
+只有 `responses` 一个协议；`messages` 与 `chat` 默认拒绝（见上方重要提示）。
 判据全部是黑盒可观测的结构事实，常量与观测日期见 [docs/BASELINE.md](docs/BASELINE.md)。
 
 ## 出问题了
@@ -251,6 +272,8 @@ set GATE_TRACE=1; node bin\ocg.mjs start   # 每次出网目标打到屏幕
 |---|---|
 | 客户端 `Connection error` | `doctor`：门控没在跑，或端口不对 |
 | 全部 503 | `diag` + [BASELINE.md](docs/BASELINE.md)；急用先退回直连 |
+| `messages` 503 `gate_proto_blocked` | **预期行为**：`messages` 已默认封禁，改用 `responses`（见上方重要提示） |
+| `x-gate-trust` 只有 `medium` | 预期：本通道上限就是 `medium`（见 [FAQ.md](docs/FAQ.md)） |
 | 401 `gate_unauthorized` | 客户端没带 `x-gate-token` 头（或重装用 `-NoToken`） |
 | 装了反而慢 | 多客户端共用 session；只给 dsh 用，或换端口另起实例 |
 | 端口通但代码改了没生效 | `doctor` 看「门控归属」：可能跑的是另一份安装（同名任务被覆盖过） |
@@ -268,7 +291,7 @@ set GATE_TRACE=1; node bin\ocg.mjs start   # 每次出网目标打到屏幕
 
 ## 已验证环境
 
-Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 293 + 53 条断言全绿，真实上游 9 套（含 60s soak）全绿。
+Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 312 + 66 条断言全绿，真实上游 9 套（含 60s soak）全绿。
 最后一次验证：**2026-10-26**（单实例锁 / 端口占用归属 / health `root`，本机生产实测通过）。
 Linux / macOS 未验证，也不提供安装脚本。
 

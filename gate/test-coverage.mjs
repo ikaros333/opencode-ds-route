@@ -59,7 +59,34 @@ const mock = http.createServer((req, res) => {
     let jb = {}; try { jb = JSON.parse(b); } catch {}
     // mode=noid 时故意连预检都拿不到官方证据（用于验证新加的交付前置闸）
     if (mode !== 'noid' && jb) {
-      // e1：缺 input 的 responses 预检
+      // shape（2026-10-27 冻结版主判据）：形态探针 —— 成功响应必须是 resp_uuid4 + usage 七键
+      if (jb.input === 'ping' && jb.max_output_tokens === 1) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'resp_' + UUID4.replace(/-/g, ''),
+          object: 'response', status: 'completed', incomplete_details: null,
+          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+          usage: { cost: 0, input_tokens: 1, input_tokens_details: {}, opencode: {},
+                   output_tokens: 1, output_tokens_details: {}, total_tokens: 2 },
+        }));
+      }
+      // e2s（已退役，保留兼容）：类型层错误 → serde 反序列化失败
+      if (typeof jb.max_output_tokens === 'string' || jb.max_output_tokens === 'abc') {
+        res.writeHead(422, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { code: 'server_error', message:
+          'Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: '
+          + 'max_completion_tokens: invalid type: string "abc", expected u32 at line 1 column 121 '
+          + '(request_id: gw-0000000000f0-00001)' } }));
+      }
+      // e1s（已退役，保留兼容）：非法 reasoning.effort → serde 反序列化失败
+      if (jb.reasoning && jb.reasoning.effort === 'bogus') {
+        res.writeHead(422, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { code: 'server_error', message:
+          'Upstream request failed: [invalid_request_error] Failed to deserialize the JSON body into the target type: '
+          + 'reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `low`, `medium`, `high`, '
+          + '`xhigh`, `ultra`, `max` at line 1 column 139 (request_id: 4cd64d97-9e2f-4b7a-8f1a-1234567890ab)' } }));
+      }
+      // e1（已退役，保留兼容）：缺 input 的 responses 预检
       if (jb.max_output_tokens !== undefined && jb.input === undefined && jb.messages === undefined) {
         res.writeHead(400, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ error: { message: 'Either input or instructions must be provided (request_id: 4cd64d97-9e2f-4b7a-8f1a-1234567890ab)' } }));
@@ -85,8 +112,36 @@ const mock = http.createServer((req, res) => {
     if (mode === 'third') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ id: HEX32 })); }
     if (mode === 'noid') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ object: 'response' })); }
     if (mode === 'empty') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(''); }
+    // 2026-10-27：结构闸的两类被测形态
+    if (mode === 'structure') {   // 只有 reasoning，没有正文 → 必须被 gate_structure_bad 拦掉
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({
+        id: UUID4, object: 'response', status: 'completed', incomplete_details: null,
+        output: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: '想了很久，但没写正文' }] }],
+        usage: { cost: 0, input_tokens: 1, input_tokens_details: {}, opencode: {},
+                 output_tokens: 1, output_tokens_details: {}, total_tokens: 2 },
+      }));
+    }
+    if (mode === 'truncated') {   // 被 max_output_tokens 截断，但有正文 → 交付 + 打标
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({
+        id: UUID4, object: 'response', status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ type: 'reasoning', summary: [] },
+                 { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '截断了' }] }],
+        usage: { cost: 0, input_tokens: 1, input_tokens_details: {}, opencode: {},
+                 output_tokens: 1, output_tokens_details: {}, total_tokens: 2 },
+      }));
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ id: UUID4, object: 'response', completed_at: null }));
+    // 2026-10-27：默认成功体必须带 message + usage 七键 —— 结构闸（deliver 前）会检查，
+    // 否则「只有 id 的假成功体」会被判 gate_structure_bad（这正是新闸门的预期行为）。
+    res.end(JSON.stringify({
+      id: UUID4, object: 'response', status: 'completed', incomplete_details: null, completed_at: null,
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { cost: 0, input_tokens: 1, input_tokens_details: {}, opencode: {},
+               output_tokens: 1, output_tokens_details: {}, total_tokens: 2 },
+    }));
   });
 });
 await new Promise(r => mock.listen(MP, '127.0.0.1', r));
@@ -136,7 +191,10 @@ try {
   console.log('=== G1 全挂 → fail-closed（慢挂不重试同车道）===');
   {
     await fetch(`http://127.0.0.1:${MP}/mode/hang`);
-    const g = await startGate(P0 + 0, { GATE_UPSTREAM_TIMEOUT_MS: '2500', GATE_TOTAL_BUDGET_MS: '6000', GATE_LANE_RETRY: '2' });
+    // ★ 2026-10-27：默认车道只剩 1 条（deepseek-flash 已下线），而 upstreamDown() 的阈值是
+    // min(GATE_UPSTREAM_FAST_FAIL_LANES, 车道数) —— 单车道下 1 次连接失败就整轮收敛，
+    // 会绕过下面的「慢挂换道」分支。这里把阈值抬高，让慢挂分支真的被执行到。
+    const g = await startGate(P0 + 0, { GATE_UPSTREAM_TIMEOUT_MS: '2500', GATE_TOTAL_BUDGET_MS: '6000', GATE_LANE_RETRY: '2', GATE_UPSTREAM_FAST_FAIL_LANES: '99' });
     check('G1 实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
     const r = await gate(P0 + 0);
     check('G1 返回 503', r.status === 503, `status=${r.status} ${r.ms}ms`);
@@ -152,7 +210,12 @@ try {
     // 回归：探针原本在预算之外，上游 hang 时 2×15s 让客户端等 33s。修复后应 ≤ 8s
     check('G1 墙钟不因探针 hang 而暴涨（≤8s）', r.ms <= 8000, `${r.ms}ms`);
     const m = await met(P0 + 0);
-    check('G1 慢挂计数与 blocked 各 1 次', (m.laneSlowHang || 0) >= 1 && m.blocked === 1, `laneSlowHang=${m.laneSlowHang} blocked=${m.blocked}`);
+    // 2026-10-27：默认链只剩 1 条车道，而 upstreamDown() 的阈值是 min(FAIL_LANES, 车道数)
+    // —— 单车道下 1 次连接失败就整轮收敛，所以这里**不会**再进「慢挂换道」分支。
+    // 断言改为写实：一次连接失败即收敛、且没有同车道重试（不烧预算）。
+    check('G1 单车道：一次连接失败即收敛', m.blocked === 1 && (m.laneSlowHang || 0) === 0,
+      `blocked=${m.blocked} laneSlowHang=${m.laneSlowHang}`);
+    check('G1 慢挂不在同车道重试', (m.laneRetries || 0) === 0, `laneRetries=${m.laneRetries}`);
     g.child.kill('SIGKILL');
     await fetch(`http://127.0.0.1:${MP}/mode/ok`);
 
@@ -252,8 +315,23 @@ try {
 
   console.log('\n=== G8 三种协议并行不互相干扰 ===');
   {
-    const g = await startGate(P0 + 7, {});
-    check('G8 实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
+    // 2026-10-27：messages 默认被封禁（上游 messages 侧混入非 UUID4 池，见 baseline.mjs）。
+    // 先用默认配置验证「默认就拒绝 + 原因可读」，再显式解封验证协议之间互不干扰。
+    const gd = await startGate(P0 + 7, {});
+    check('G8 实例启动', !gd.failed, gd.failed ? gd.stderr().slice(0, 120) : 'ok');
+    const hd = await (await fetch(`http://127.0.0.1:${P0 + 7}/gate/health`)).json();
+    check('G8 默认封禁 messages', (hd.blockedProtos || []).includes('messages'),
+      `blockedProtos=${JSON.stringify(hd.blockedProtos)}`);
+    const mb = await fetch(`http://127.0.0.1:${P0 + 7}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }) })
+      .then(async r => ({ st: r.status, j: await r.json().catch(() => null) }));
+    check('G8 被封禁协议 → 503 gate_proto_blocked', mb.st === 503 && mb.j?.error?.type === 'gate_proto_blocked',
+      `status=${mb.st} type=${mb.j?.error?.type}`);
+    gd.child.kill('SIGKILL');
+    await sleep(400);
+
+    const g = await startGate(P0 + 7, { GATE_BLOCK_PROTOS: 'chat', GATE_ALLOW_MESSAGES: '1' });
+    check('G8 解封实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
     const rs = await Promise.all([
       gate(P0 + 7),
       fetch(`http://127.0.0.1:${P0 + 7}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -262,7 +340,7 @@ try {
         body: JSON.stringify({ model: 'deepseek-flash', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }) }).then(r => r.status),
     ]);
     check('G8 responses 成功', rs[0].status === 200, `status=${rs[0].status}`);
-    check('G8 messages 成功', rs[1] === 200, `status=${rs[1]}`);
+    check('G8 messages 解封后成功', rs[1] === 200, `status=${rs[1]}`);
     // ★ 2026-10-21 第 19 轮：chat 的预检策略是 logprob，而 P1 默认停用 → 该协议**没有任何可用判据**。
     // 交付前置闸要求「预检 pass」，因此 chat 现在结构性不可交付（生产本来就用
     // GATE_BLOCK_PROTOS=chat 封死它，dsh 也只用 messages/responses）。
@@ -355,6 +433,31 @@ try {
     check('G12 /gate/proof 不回传盘符绝对路径', !/[A-Za-z]:[\\/]/.test(good.body),
       good.body.slice(0, 60));
     g.child.kill('SIGKILL');
+  }
+  // ★ 2026-10-27 冻结版：结构闸 + 截断标记（用户实测症状：答案只落在 reasoning 里）
+  console.log('\n=== G13 结构闸：无正文必须拒绝 / 截断必须打标 ===');
+  {
+    await fetch(`http://127.0.0.1:${MP}/mode/structure`);
+    const g = await startGate(P0 + 11, {});
+    check('G13 实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
+    const r = await gate(P0 + 11);
+    check('G13 只有 reasoning → 503', r.status === 503, `status=${r.status}`);
+    check('G13 归类 gate_structure_bad', r.j?.error?.type === 'gate_structure_bad', `type=${r.j?.error?.type}`);
+    check('G13 头标明原因', (r.h?.get('x-gate-reason') || '') === 'structure_bad', `reason=${r.h?.get('x-gate-reason')}`);
+    const m = await met(P0 + 11);
+    check('G13 计入 structureBad', (m.structureBad || 0) >= 1, `structureBad=${m.structureBad}`);
+    g.child.kill('SIGKILL');
+    await sleep(400);
+
+    await fetch(`http://127.0.0.1:${MP}/mode/truncated`);
+    const g2 = await startGate(P0 + 11, {});
+    check('G13 截断实例启动', !g2.failed, g2.failed ? g2.stderr().slice(0, 120) : 'ok');
+    const r2 = await gate(P0 + 11);
+    check('G13 有正文的截断响应仍交付', r2.status === 200, `status=${r2.status}`);
+    check('G13 截断打 x-gate-truncated', (r2.h?.get('x-gate-truncated') || '') === '1',
+      `truncated=${r2.h?.get('x-gate-truncated')}`);
+    check('G13 health 暴露 trustLevel', typeof (await (await fetch(`http://127.0.0.1:${P0 + 11}/gate/health`)).json()).trustLevel === 'string', 'ok');
+    g2.child.kill('SIGKILL');
   }
 } finally {
   stopAll();

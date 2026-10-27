@@ -257,8 +257,8 @@ has('P0-2 覆盖 ECONNRESET/EOF 等', "new Set(['ECONNRESET', 'EPIPE', 'ECONNABO
 has('P0-2 心跳只计 clientResets', 'metrics.clientResets = (metrics.clientResets || 0) + 1;');
 // P1-1：交付阶段不再重复计 abortedByClient（handle close + 主循环 catch 共 2 处）
 has('P1-1 abortedByClient 只计 2 处', 'metrics.abortedByClient++;', { count: 2 });
-// P1-2：三个预检器必须走 transport（probe / realRequest / 3 个预检 = 5）
-has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 5 });
+// P1-2：所有上游请求必须走 transport（probe / realRequest / 形态探针 / 实现向量探针 / 3 个预检 = 7）
+has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 7 });
 has('P1-2 预检不再硬编码 https.request', 'const req = https.request(', { count: 0 });
 // P1-3：矩阵刷新与告警覆盖三条协议
 has('P1-3 刷新覆盖 chat', "for (const proto of ['responses', 'messages', 'chat'])");
@@ -290,7 +290,9 @@ has('Q2 third 直接拒绝（4xx 透传除外）', "if (r.verdict === 'third' &&
 has('Q3 拒绝计数 third', 'metrics.rejectedThirdShape = (metrics.rejectedThirdShape || 0) + 1;');
 has('Q4 拒绝计数 unknown', 'metrics.rejectedUnknownShape = (metrics.rejectedUnknownShape || 0) + 1;');
 has('Q5 hedge 受白名单约束', "allowThird && r.verdict === 'unknown' && DELIVERABLE_SHAPES.has(r.idShape)");
-has('Q6 e1 要求 request_id 形态', 'requestIdUuid: true');
+// 2026-10-27 晚间：上游不再返回官方 UUID4 request_id（改 gw-…），该开关已关闭，
+// 但**校验机制本身必须保留**（将来若恢复可一行打开）。
+has('Q6 request_id 形态校验机制保留', 'if (c.requestIdUuid) {');
 has('Q7 request_id 必须是 UUID4', 'if (!m || !UUID4.test(m[1]))');
 has('Q8 health 暴露白名单', 'deliverableShapes: [...DELIVERABLE_SHAPES]');
 has('Q9 health 暴露 proof 信任', 'proofTrust: pg.trust');
@@ -471,6 +473,36 @@ hasIn(cliLines, 'W11 客户端侧使用占位 key', 'OCG_PLACEHOLDER_KEY');
 has('W12 客户端送真 key 时记一次台账', "result: 'CLIENT_SENT_REAL_KEY'");
 has('W13 health 暴露客户端是否送过真 key', 'clientKeyFromEnv:');
 hasIn(cliLines, 'W10 doctor 归属比较做路径归一', 'norm(h.root) === norm(ROOT)');
+
+// ===== 2026-10-27：上游单方面变更后的重新标定（模型下线 + 判据漂移）=====
+// 现场：16:01 UTC+8 起所有探针返回 410 ModelDeprecated，9 项指纹变 410×9 → 全量 503。
+// 结论：不是门控 bug（fail-closed 正确），但默认车道与 responses 判据都必须跟着改，否则永久 503。
+console.log('\n=== X. 2026-10-27 重新标定 ===');
+has('X1 默认车道改为官方在售别名', "process.env.GATE_CHAIN || 'deepseek-v4.1-flash'");
+has('X2 已下线的旧默认链不再存在', "'deepseek-flash,deepseek-v4.1-flash'", { count: 0 });
+has('X3 messages 无条件封禁（除显式白名单开关）', "process.env.GATE_ALLOW_MESSAGES === '1' ? [] : ['messages']");
+has('X4 responses 主判据改用类型层 serde 文案', 'expect: E_SERDE_TYPE_MSG');
+has('X5 serde 伴生特征参与判定', 'c.expectExtra.every(re => re.test(msg))');
+has('X5b request_id 证据永久失效后不再强制 UUID4', 'requestIdUuid: false');
+hasIn(baseLines, 'X6 baseline 定义类型层 serde 判据', 'export const E_SERDE_TYPE_MSG =');
+hasIn(baseLines, 'X7 baseline 留档 messages 漂移指纹', 'export const MSG_FINGERPRINT_2026_10_27');
+hasIn(baseLines, 'X8 旧枚举判据标记退役', '已退役（2026-10-27 晚间）');
+
+// ===== 2026-10-27 判据冻结版：只依赖"实测 100% 稳定"的特征 =====
+// 背景：参数校验类探针会随上游实现池轮询而抖（同一条探针 422↔200），拿它放行 = 随机 503。
+// 冻结后 responses 只用形态探针（id 位模式 38/38 + usage 键集 20/20），
+// 参数探针降级为"实现指纹向量"，只告警不放行。
+console.log('\n=== Y. 判据冻结版（形态探针 + 结构闸 + 信任分级）===');
+has('Y1 形态探针存在', 'function runShapeProbe()');
+has('Y2 responses 走形态策略', "responses: 'shape',");
+has('Y3 形态判据校验 usage 键集', 'USAGE_KEYS_REQUIRED.filter(k => !(k in usage))');
+has('Y4 结构闸拒绝无正文', "result: 'STRUCTURE_BAD'");
+has('Y5 结构闸错误类型可读', "type: 'gate_structure_bad'");
+has('Y6 截断响应打标', "'x-gate-truncated'");
+has('Y7 信任分级存在', 'function trustLevel()');
+has('Y8 实现向量仅告警不放行', "result: 'IMPL_VECTOR_DRIFT'");
+hasIn(baseLines, 'Y9 baseline 定义必需 usage 键', 'export const USAGE_KEYS_REQUIRED =');
+hasIn(baseLines, 'Y10 baseline 留档实现向量', 'export const IMPL_VECTOR_2026_10_27 =');
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

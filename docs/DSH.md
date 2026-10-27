@@ -22,14 +22,9 @@ node bin\ocg.mjs setup dsh
         headers:                       # 仅启用 GATE_TOKEN 时需要
           x-gate-token: "<你的 token>"
         models:
-          - id: deepseek-flash
-      ocg-gated-msg:
-        displayName: "OpenCode Go · Messages（经门控）"
-        apiKeyEnv: OCG_PLACEHOLDER_KEY
-        api: anthropic-messages
-        baseURL: http://127.0.0.1:8787
-        models:
-          - id: deepseek-flash
+          - id: deepseek-flash      # 客户端别名：门控转发时归一为在售车道（当前 deepseek-v4.1-flash）
+      # 2026-10-27 起 messages 协议默认封禁（上游 messages 侧混入非 UUID4 id 池），
+      # 所以不再生成 ocg-gated-msg；要恢复见 docs/CONFIG.md 的 GATE_ALLOW_MESSAGES。
       # 原有 provider（例如直连的 opencode-go）保持在同一个 providers 下，不要删
 ```
 
@@ -42,7 +37,7 @@ node bin\ocg.mjs setup dsh
 
 也就是说"追加一个条目"会把你自己的直连路由清空。`setup dsh --apply` 因此做的是**文本插入**
 （定位到 `- id: llm-pi-ai` 下的 `providers:`，把新键插进去），并在写盘前自检：
-条目数不变、`ocg-gated`/`ocg-gated-msg` 各出现一次。写前会备份成 `.bak-<时间戳>`。
+条目数不变、`ocg-gated` 出现一次（messages 已默认封禁，不再生成它的条目）。写前会备份成 `.bak-<时间戳>`。
 
 结构不符合预期时它拒绝写入，只打印片段让你手工合并。
 
@@ -58,7 +53,7 @@ node bin\ocg.mjs setup dsh
 dsh --profile web --dump-config | Select-String ocg-gated
 ```
 
-能打出 `ocg-gated` 与 `ocg-gated-msg` 两个 provider 就说明补丁层被正确解析；
+能打出 `ocg-gated` 这个 provider 就说明补丁层被正确解析；
 再在模型选择器里选「OpenCode Go · Responses（经门控）」发一条消息即可。
 
 ## 改完怎么重启
@@ -90,7 +85,7 @@ code "$env:USERPROFILE\.dsh\profiles\web\cordis.patch.yml"
 | 问题 | 门控的处理 |
 |---|---|
 | dsh 把 MCP 工具 schema 转成 messages 时丢 `$defs`，只留悬空 `$ref` → 必然 400 | `normalizeToolSchemas` 只摘掉确实无指向的 `$ref` 并保留 `description`（实测修正 493 处后 200） |
-| 三条协议判据强度不等价 | `responses`（e1 + id 形态）最强；`messages`（9 项状态码指纹）次之；`chat` 无判据，默认封禁 |
+| 三条协议判据强度不等价 | 现状（2026-10-27）：`responses` 用形态判据（id 位模式 + usage 键集）+ 结构闸；`messages` 侧混入非 UUID4 id 池与 Go 实现，**默认封禁**；`chat` 无判据，默认封禁 |
 | `x-opencode-endpoint-id` 实测恒为 `undefined` | 不作为判据，避免误判 |
 
 ## 常见错误对照

@@ -74,7 +74,12 @@ const PROVEN = (v) => v === 'official' || v === 'pass-by-proof';
       ],
     }],
   });
-  check('messages 协议 + 图片', r.status === 200, `status=${r.status} verdict=${verdict(r)}`);
+  // 2026-10-27 起 messages 默认封禁（上游 messages 侧混入非 UUID4 id 池）：
+  // 此时应回 503 proto_blocked，而不是交付一个无法证明来源的响应。
+  const blockedM = r.status === 503 && (r.h.get('x-gate-reason') || '') === 'proto_blocked';
+  check('messages 协议 + 图片（解封后应为 200，封禁时须 proto_blocked）',
+    (r.status === 200 && PROVEN(verdict(r))) || blockedM,
+    `status=${r.status} reason=${r.h.get('x-gate-reason') || ''} verdict=${verdict(r)}`);
 }
 
 // 4) 纯文本对照（确认不是所有请求都被当成 official）

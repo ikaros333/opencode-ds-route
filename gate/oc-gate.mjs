@@ -12,7 +12,7 @@
 // 环境变量：
 //   OPENCODE_GO_API_KEY（必填）
 //   GATE_PORT=8787
-//   GATE_CHAIN="deepseek-flash,deepseek-v4.1-flash"   （default：优先 deepseek-flash，实测官方车道更稳）
+//   GATE_CHAIN="deepseek-v4.1-flash"   （default：官方唯一在售别名；探针随 ALLOWED[0] 走）
 //   GATE_MAX_ATTEMPTS=4  GATE_BACKOFF_MS=200  GATE_PROBE_TTL_MS=120000
 //   GATE_PROBE=1|0                    是否启用探针（默认 1）
 //   GATE_FORCE_THIRD=1                自检：强制判第三方
@@ -28,7 +28,10 @@ import {
   ID_UUID_ANY as UUID_ANY,
   DELIVERABLE_SHAPES,
   MSG_FINGERPRINT,
-  E1_MSG,
+  E_SERDE_TYPE_MSG,
+  E_SERDE_TYPE_EXTRAS,
+  USAGE_KEYS_REQUIRED,
+  IMPL_VECTOR_2026_10_27,
   OBSERVED_AT,
 } from './baseline.mjs';
 
@@ -68,7 +71,10 @@ const tokenMatches = (got) => {
   const b = Buffer.from(GATE_TOKEN);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
-const CHAIN = (process.env.GATE_CHAIN || 'deepseek-flash,deepseek-v4.1-flash')
+// 2026-10-27：deepseek-flash 被上游下线（410 ModelDeprecated，官方替代 = deepseek-v4.1-flash）。
+// 车道的存在意义是「同一后端的优先级偏好」，不是换模型；因此只保留官方指定替代品这一条。
+// 若以后又出现新的官方别名，用 GATE_CHAIN 追加即可（探针自动跟随 ALLOWED[0]）。
+const CHAIN = (process.env.GATE_CHAIN || 'deepseek-v4.1-flash')
   .split(',').map(s => s.trim()).filter(Boolean);
 const MAX_ATTEMPTS = num('GATE_MAX_ATTEMPTS', 4, { min: 1, max: 64 });
 const BACKOFF_MS = num('GATE_BACKOFF_MS', 200, { min: 0, max: 60000 });
@@ -161,7 +167,13 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 2026-10-26（R1）：客户端是否曾把真 key 送到本机端口
   clientSentRealKey: 0,
   // 2026-10-26：整段挂在单次上限的「慢挂」次数（这类不重试同车道，直接换道）
-  laneSlowHang: 0 };
+  laneSlowHang: 0,
+  // 2026-10-27：结构闸拒绝次数（响应没有正文、也没有工具调用）
+  structureBad: 0 };
+
+// 2026-10-27 冻结版：形态探针的最近结论 / 实现指纹向量（仅观测）
+let lastShape = null;      // { at, verdict, idShape, detail }
+let implVector = '';       // 例如 '422,422,200,503,503'
 
 // 客户端是否曾把真 key 送到本机端口（R1 的可观测信号：health 暴露，doctor 也会查配置）
 const clientSentRealKey = { flag: false };
@@ -961,39 +973,50 @@ const precheckTtlFor = (p) => (PRECHECK_TTL_BY_PROTO[p] ?? PRECHECK_TTL_MS);
 // 因此「放开全部车道」只在有判据的协议上生效，其余保持只认 id=UUID4 的保守策略。
 
 // 协议级封禁（宁杀错不放过）：没有任何前置判据的协议直接拒绝，不做「靠 id 猜」的尝试。
-// 默认**不封禁任何协议**：messages 已有 msgfp 状态码指纹判据（见 PROTO_TRUST）。
-// 如需临时封禁某个协议（例如判据被上游改动失效），用 GATE_BLOCK_PROTOS=messages。
-const BLOCKED_PROTOS = new Set(
-  (process.env.GATE_BLOCK_PROTOS ?? '')
-    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-);
+// 2026-10-27 起 messages **无条件**封禁（除非显式 GATE_ALLOW_MESSAGES=1）。理由（实测，见
+// baseline.mjs 的 MSG_FINGERPRINT_2026_10_27）：
+//   · 9 项指纹整体漂移（max_tokens=0 → 200、缺 messages → 500、非法 role → 200）；
+//   · 正常响应里约 5/8 的 id 是 53 位 hex（非 UUID4）→ 命中交付闸的「形态未知」分支，
+//     表现为「同一会话时而 200 时而 503」，既不可用也不可信；
+//   · 非法 role 竟被 200 接受，说明 messages 侧至少混入了一个不做官方参数校验的实现。
+// 为什么不用 GATE_BLOCK_PROTOS 兜底：那是「追加」语义的旧开关，机器上普遍留的是
+// GATE_BLOCK_PROTOS=chat；靠代码默认值兜底时，任何沿用旧 env 的部署都会静默解封 messages。
+const BLOCKED_PROTOS = new Set([
+  ...(process.env.GATE_ALLOW_MESSAGES === '1' ? [] : ['messages']),
+  ...(process.env.GATE_BLOCK_PROTOS ?? 'chat')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+]);
 
 const PROTO_TRUST = {
-  responses: 'eclass',
+  // 2026-10-27 判据冻结：responses 改用「形态探针」。
+  // 原因（实测）：参数校验类探针会随上游实现池轮询而抖（同一条 max_output_tokens:"abc"
+  // 在 09:20 是 422、09:2x 变成 200），拿它当放行条件 = 门控随机 503。
+  // 形态探针（id 位模式 + usage 键集）实测 38/38、20/20 稳定，是当前唯一可靠的门槛。
+  responses: 'shape',
   chat: 'logprob',
   messages: 'msgfp',
 };
 
 const PRECHECK_CASES_BY_PROTO = {
-  // 2026-10-20 复测（10 个候选用例逐条对照官方直连）：只有 e1 的文本与官方**完全一致**。
-  // e2/e3 等已被 OpenCode 网关层自行拦截（返回 "Upstream response was invalid" /
-  // "Endpoint is unavailable"），不再穿透到 DeepSeek 后端，因此不能作为官方判据。
-  // e1 之所以有效：网关没有替它做参数校验，官方 serde 层原话（见 baseline.mjs 的 E1_MSG）
-  // 是 DeepSeek Rust 服务端 serde 层原话，第三方 OpenAI 兼容层不会产出这个文本。
-  // 单用例 + 确认重测（PRECHECK_CONFIRM）足以抗抖动。
+  // 2026-10-27 第二次标定（当晚）：上一版 e1s（非法 reasoning.effort）失效 —— 上游对该字段
+  // 已完全不校验（200 接受任意值），探针恒 drift → 预检永久 fail → responses 全量 503。
+  // 换成 e2s：**类型层**错误（max_output_tokens 传字符串）仍穿透到 serde。
+  // 类型校验比枚举校验稳定（枚举随版本增删，类型不会）。
   responses: [
-    { id: 'e1', name: '缺 input（穿透到后端）',
+    { id: 'e2s', name: '类型层非法（穿透到 serde）',
       path: '/zen/go/v1/responses',
-      body: { model: ALLOWED[0], max_output_tokens: 8 },
-      // 第 17 轮：除文本外还要求内嵌 request_id 是 UUID4。
-      // 官方错误体形如 `... must be provided (request_id: 4cd64d97-…)`；
-      // 自部署/异实现不产出这个结构（实测 ollama：`[] is too short - 'messages'`）。
-      requestIdUuid: true,
-      expect: E1_MSG },
+      body: { model: ALLOWED[0], input: 'ping', max_output_tokens: 'abc' },
+      // 2026-10-27 起上游不再返回官方 UUID4 request_id（改发 `gw-<hex>-<n>`），
+      // 该证据永久失效，故关闭 requestIdUuid 校验（否则永远 fail）。
+      requestIdUuid: false,
+      expect: E_SERDE_TYPE_MSG,
+      // 除主体文案外还要求 serde 目标类型与行列位置，防止只回了半句话的转发层。
+      expectExtra: E_SERDE_TYPE_EXTRAS },
   ],
   // chat 没有可用的错误指纹，改用 logprobs 精度探针（成本约 40 token）
   chat: [],
   // messages 用状态码指纹（9 项失败请求的 400/422 序列），见 MSG_FINGERPRINT
+  // 2026-10-27 起该协议默认被封禁（BLOCKED_PROTOS），本配置只在显式解封时生效。
   messages: [],
 };
 
@@ -1173,6 +1196,132 @@ async function runMsgFingerprint() {
   };
 }
 
+/**
+ * responses 形态探针（2026-10-27 判据冻结版）。
+ *
+ * 为什么不查错误文案：上游参数校验行为会随实现池轮询而变（实测同一探针 422↔200 都出现过），
+ * 拿它当放行条件会让门控随机 503。这里只查两个实测 100% 稳定的特征：
+ *   ① 成功响应的 id 是 resp_uuid4 位模式（38/38）
+ *   ② usage 含基线要求的 7 个键（20/20）
+ * 代价：输出 1 token；结果进 PRECHECK 缓存（TTL 90s），不会每请求都打。
+ */
+function runShapeProbe() {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    // 所有出口都记一次 lastShape：health 的 trustLevel 依赖它
+    const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '' }; resolve(o); };
+    const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], input: 'ping', max_output_tokens: 1 }), 'utf8');
+    const req = transport.request({
+      host: HOST, port: HOST_PORT, path: '/zen/go/v1/responses', method: 'POST',
+      timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      headers: { 'content-type': 'application/json', 'content-length': payload.length,
+                 authorization: `Bearer ${KEY}`,
+                 'x-opencode-session': STABLE_SESSION, 'x-opencode-session-id': STABLE_SESSION },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const ms = Date.now() - t0;
+        const st = res.statusCode;
+        if (st === 429) return finish({ id: 'shape', verdict: 'rate', detail: 'HTTP 429' });
+        if (st >= 500) return finish({ id: 'shape', verdict: 'net', detail: `HTTP ${st}` });
+        if (st !== 200) return finish({ id: 'shape', verdict: 'fail', detail: `HTTP ${st}` });
+        let j = null; try { j = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
+        if (!j) return finish({ id: 'shape', verdict: 'net', detail: 'body 非 JSON' });
+        const id = String(j.id || '');
+        const shape = shapeOf(id);
+        if (shape !== 'resp_uuid4' && shape !== 'UUID4') {
+          return finish({ id: 'shape', verdict: 'fail', detail: `idShape=${shape} id=${id.slice(0, 28)}` });
+        }
+        const usage = j.usage || {};
+        const missing = USAGE_KEYS_REQUIRED.filter(k => !(k in usage));
+        if (missing.length) {
+          return finish({ id: 'shape', verdict: 'fail', detail: `usage 缺键 ${missing.join(',')}`, idShape: shape });
+        }
+        return finish({ id: 'shape', verdict: 'pass', detail: `${shape} usage ok ${ms}ms`, idShape: shape });
+      });
+    });
+    req.on('error', (e) => finish({ id: 'shape', verdict: 'net', detail: 'err=' + (e?.code || e?.name || String(e?.message || e)) }));
+    req.on('timeout', () => { try { req.destroy(); } catch {} finish({ id: 'shape', verdict: 'net', detail: 'socket-timeout' }); });
+    req.end(payload);
+  });
+}
+
+/**
+ * 信任分级（health / 响应头 / 台账共用）。
+ * 诚实口径：本通道最高只能到 medium —— 因为 OpenCode 把"官方身份"的可验证证据
+ * （UUID4 直出 id、UUID4 request_id、原样字段名、严格枚举、logprobs 真值）全部替换了。
+ * strong 只有在"上游恢复官方直出形态"时才会出现（代码里保留该分支，不做假承诺）。
+ */
+function trustLevel() {
+  const pc = precheckLastFor('responses');
+  if (pc && pc.verdict === 'fail') return 'blocked';
+  const sh = lastShape;
+  if (!sh) return 'unknown';
+  if (sh.verdict !== 'pass') return 'weak';
+  if (sh.idShape === 'UUID4') return 'strong';
+  return 'medium';
+}
+
+/**
+ * 实现指纹向量（**仅观测**）：5 个参数探针的返回码序列。
+ * 2026-10-27 实测：同一探针在不同时刻给出 422 / 200（上游实现池轮询），
+ * 因此它不进放行路径 —— 只用于"实现换了"的告警，避免门控随机 503。
+ */
+const IMPL_PROBES = [
+  { id: 'max_output_tokens', extra: { max_output_tokens: 'abc' } },
+  { id: 'temperature', extra: { max_output_tokens: 4, temperature: 'hot' } },
+  { id: 'top_p', extra: { max_output_tokens: 4, top_p: 'x' } },
+  { id: 'instructions', extra: { max_output_tokens: 4, instructions: 123 } },
+  { id: 'tool_choice', extra: { max_output_tokens: 4, tool_choice: 123 } },
+];
+
+function implProbeOnce(c) {
+  return new Promise((resolve) => {
+    const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], input: 'ping', ...c.extra }), 'utf8');
+    const req = transport.request({
+      host: HOST, port: HOST_PORT, path: '/zen/go/v1/responses', method: 'POST',
+      timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      headers: { 'content-type': 'application/json', 'content-length': payload.length,
+                 authorization: `Bearer ${KEY}`, 'x-opencode-session': STABLE_SESSION },
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { if (body.length < 4096) body += d; });
+      res.on('end', () => {
+        // Go 实现的特征（messages 侧已实测到）：json: cannot unmarshal ... Go struct field
+        const goStack = /json: cannot unmarshal|cannot unmarshal .* into Go (struct|value)/i.test(body);
+        resolve({ id: c.id, code: res.statusCode, goStack });
+      });
+    });
+    req.on('error', () => resolve({ id: c.id, code: -1, goStack: false }));
+    req.on('timeout', () => { try { req.destroy(); } catch {} resolve({ id: c.id, code: -1, goStack: false }); });
+    req.end(payload);
+  });
+}
+
+async function runImplVector() {
+  let rows;
+  try { rows = await Promise.all(IMPL_PROBES.map(implProbeOnce)); } catch { return; }
+  const vec = rows.map(r => (r.code < 0 ? 'ERR' : String(r.code))).join(',');
+  implVector = vec;
+  const drift = vec !== IMPL_VECTOR_2026_10_27;
+  const goStack = rows.some(r => r.goStack);
+  metrics.implVectorChecks = (metrics.implVectorChecks || 0) + 1;
+  if (goStack) {
+    metrics.implGoStack = (metrics.implGoStack || 0) + 1;
+    pushAlert('IMPL_GO_STACK', { vector: vec, rows });
+    log({ ts: new Date().toISOString(), result: 'IMPL_GO_STACK', vector: vec, rows });
+  }
+  if (drift) {
+    metrics.implVectorDrift = (metrics.implVectorDrift || 0) + 1;
+    pushAlert('IMPL_VECTOR_DRIFT', { vector: vec, baseline: IMPL_VECTOR_2026_10_27, rows });
+    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_DRIFT', vector: vec, baseline: IMPL_VECTOR_2026_10_27 });
+  } else {
+    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR', vector: vec });
+  }
+}
+
 function runOnePrecheckCase(c) {
   return new Promise((resolve) => {
     const payload = Buffer.from(JSON.stringify(c.body), 'utf8');
@@ -1191,6 +1340,12 @@ function runOnePrecheckCase(c) {
         let msg = '';
         try { msg = JSON.parse(buf)?.error?.message || ''; } catch {}
         if (c.expect.test(msg)) {
+          // 2026-10-27：主体文案之外还要求伴随特征（unknown variant / 枚举里的 xhigh）。
+          // 只回了半句话的转发层/被截断的错误页不构成官方证据 → 记 drift（参与 fail 判定）。
+          if (c.expectExtra && !c.expectExtra.every(re => re.test(msg))) {
+            return resolve({ id: c.id, verdict: 'drift',
+              detail: 'serde 伴生特征缺失: ' + msg.slice(0, 100) });
+          }
           // 第 17 轮：e1 除文本匹配外，还校验内嵌 request_id 的形态。
           // 官方 Rust 服务端在 400 里带回 `(request_id: <uuid4>)`；自部署/异模型的
           // OpenAI 兼容层不会产出这个结构。只匹配文本容易被同文本的转发层骗过。
@@ -1262,6 +1417,8 @@ function precheck(proto = 'responses', opts = {}) {
       return Promise.all(cases.map(runOnePrecheckCase));
     }
     if (strategy === 'logprob') return runChatPrecisionProbe().then(r => [r]);
+    // 2026-10-27 冻结版：responses 用形态探针（稳定特征），不再用错误文案探针。
+    if (strategy === 'shape') return runShapeProbe().then(r => [r]);
     if (strategy === 'msgfp') return runMsgFingerprint().then(r => [r]);
     return Promise.resolve([]);
   }
@@ -1991,6 +2148,17 @@ async function handle(req, res) {
       proofRefreshMs: num('GATE_PROOF_REFRESH_MS', 25000, { min: 5000, max: 300000 }),
       lastPass: Object.fromEntries(['responses','messages'].map(p => { const x = precheckPassFor(p); return [p, x ? Date.now() - x.at : null]; })),
       lastPrecheck: lastPc ? { proto: lastPc.proto, verdict: lastPc.verdict, ageMs: Date.now() - lastPc.at } : null,
+      // ★ 2026-10-27 冻结版：信任分级（把"能不能证明官方"变成可测量，而不是假装）
+      //   strong : 官方直连形态（id 直出 UUID4）——本通道不可达
+      //   medium : resp_uuid4 + usage 七键 + 结构完整（当前 opencode 通道上限）
+      //   weak   : 预检未知/形态探针异常
+      //   blocked: 预检 fail（fail-closed）
+      trustLevel: trustLevel(),
+      shapeProbe: lastShape ? { at: new Date(lastShape.at).toISOString(), verdict: lastShape.verdict,
+        idShape: lastShape.idShape || '', detail: lastShape.detail } : null,
+      // 实现指纹向量（仅观测）：与基线不一致 → IMPL_VECTOR_DRIFT 告警，不影响放行
+      implVector: implVector || null, implVectorBaseline: IMPL_VECTOR_2026_10_27,
+      usageKeysRequired: USAGE_KEYS_REQUIRED,
       // 保护状态可见性（对外信任设计的核心）：判据最近一次成功距今多久、当前连的是哪
       judgeAgeMs: lastPc ? Date.now() - lastPc.at : null,
       lastJudgeOk: !!lastPc && lastPc.verdict === 'pass',
@@ -2197,6 +2365,46 @@ async function handle(req, res) {
 
   let currentTrust = null;
   const deliver = (model, r, attemptNo) => {
+    // ★ 2026-10-27 冻结版：结构闸放在**所有计数之前**。
+    // 早期版本把它接在 metrics.pass++ 之后，导致「被判 pass 但实际返回 503」的台账/指标不一致
+    // （实测 10 次请求里 1 次被拦，却显示 passByProof=10）。
+    // 目的：拦掉「只有思考、没有正文」的响应；放行工具调用；body 解析失败时不判定（避免误杀大响应）。
+    let truncatedFlag = '';
+    if (proto === 'responses' && !String(r.ctype || '').includes('event-stream')) {
+      let sbody = null;
+      try { sbody = JSON.parse(Buffer.concat(r.buffered).toString('utf8')); } catch {}
+      if (sbody) {
+        const items = Array.isArray(sbody.output) ? sbody.output : [];
+        const msgText = items.filter(x => x && x.type === 'message')
+          .flatMap(x => (x.content || [])).map(x => (x && x.text) || '').join('').trim();
+        const hasTool = items.some(x => x && (x.type === 'function_call' || x.type === 'custom_tool_call' || x.type === 'local_shell_call'));
+        const incReason = sbody.status === 'incomplete'
+          ? String((sbody.incomplete_details && sbody.incomplete_details.reason) || '') : '';
+        if (!msgText && !hasTool) {
+          // 2026-10-27 冻结版修正：**调用方自己把 max_output_tokens 设得太小**导致的截断
+          // 不是上游缺陷（test-suite 用 max_output_tokens:8 就会命中），必须放行并打标，
+          // 否则会误杀"调用方主动限制预算"这类正常用法。只有 status=completed 却没有任何
+          // 正文/工具调用，才是真正的结构异常（用户截图那种"答案只在思考里"）。
+          if (incReason === 'max_output_tokens') {
+            truncatedFlag = '1';
+          } else {
+            metrics.structureBad = (metrics.structureBad || 0) + 1;
+            log({ ts: new Date().toISOString(), reqId, proto, result: 'STRUCTURE_BAD', model,
+                  status: sbody.status, incompleteReason: incReason || '-',
+                  items: items.map(x => (x && x.type) || '?').join('+') });
+            try { r.stream && r.stream.destroy(); } catch {}
+            res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
+              'x-gate-result': 'blocked', 'x-gate-reason': 'structure_bad',
+              'x-gate-trust': trustLevel(), 'x-gate-req-id': reqId });
+            return res.end(JSON.stringify({ error: { type: 'gate_structure_bad',
+              message: '上游返回的响应没有正文（只有思考或空内容）；已 fail-closed，未交付任何内容，请重试。',
+              truncated: false, incomplete_reason: incReason || null, request_id: reqId } }));
+          }
+        }
+        // 只要是被 max_output_tokens 截断就统一打标（有正文也打：调用方需要知道"没答完"）
+        if (incReason === 'max_output_tokens') truncatedFlag = '1';
+      }
+    }
     // 判定分级：id 形态为 official 直接算 pass；
     // 否则若「本请求的」信任决策放开了车道，记 passByProof。
     // 必须用 currentTrust（handle 里已算好的决策），不能再读一次 proofGate()：
@@ -2253,6 +2461,9 @@ async function handle(req, res) {
       'x-gate-model-requested': headerSafe(requestedModel),
       'x-gate-model-served': headerSafe(model),
       'x-gate-model-substituted': (requestedModel && requestedModel !== model) ? '1' : '0',
+      // 2026-10-27：被上游 max_output_tokens 截断的响应打标记，客户端/人可以区分"模型没答完"
+      ...(truncatedFlag ? { 'x-gate-truncated': '1' } : {}),
+      'x-gate-trust': trustLevel(),
     });
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
@@ -2745,6 +2956,12 @@ server.listen(PORT, '127.0.0.1', () => {
   else writeSnapshot();
   // （P2-5：这里原本还有一次无条件 writeSnapshot()，与上面的 else 分支重复，已删除）
   if (REFRESH_MS > 0) setInterval(refreshMatrix, REFRESH_MS).unref();
+  // 2026-10-27：实现指纹向量观测（仅告警，不影响放行）。默认 5 分钟。
+  const IMPL_VECTOR_MS = num('GATE_IMPL_VECTOR_MS', 300000, { min: 0, max: 86400000 });
+  if (IMPL_VECTOR_MS > 0) {
+    setInterval(() => { runImplVector().catch(() => {}); }, IMPL_VECTOR_MS).unref();
+    setTimeout(() => { runImplVector().catch(() => {}); }, 5000).unref();
+  }
 
   // ★ 第 17 轮：启动自检（D5-2）
   // 目的：区分「端口通了但上游废」的假活状态。

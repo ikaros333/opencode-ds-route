@@ -21,6 +21,10 @@ import path from 'node:path';
 // 否则上游一变化就会出现「预检 pass、交付却 503」的漂移。
 import {
   E1_MSG,
+  E_SERDE_MSG,
+  E_SERDE_EXTRAS,
+  E_SERDE_TYPE_MSG,
+  E_SERDE_TYPE_EXTRAS,
   E2_MAX,
   E3_RANGE,
   P1_TOP1_MAX,
@@ -54,12 +58,22 @@ const HDR = IS_OFFICIAL_TARGET
 // ---------- 基线常量：全部来自 ../gate/baseline.mjs（唯一来源）----------
 // 这里只是给下游旧代码沿用旧字段名，不重新定义任何判据。
 const BASELINE = {
-  e1_msg: E1_MSG,
+  // 2026-10-27：e1（缺 input）已被网关拦截（503 Endpoint is unavailable），不再穿透；
+  // 主判据换成 serde 反序列化文案（非法 reasoning.effort），见 gate/baseline.mjs。
+  e1_msg: E_SERDE_MSG,
+  e1_extra: E_SERDE_EXTRAS,
+  e1_retired: E1_MSG,
+  // 2026-10-27 晚间第二标定：类型层判据（沿用旧字段名 e1_* 以免改下游逻辑）
+  etype_msg: E_SERDE_TYPE_MSG,
+  etype_extra: E_SERDE_TYPE_EXTRAS,
   e2_max: E2_MAX,
   e3_range: E3_RANGE,
   p1_top1_max: P1_TOP1_MAX,       // top1 logprob 应小于此值（越负越不确定）
   p1_gateway_block: GATEWAY_BLOCK,
 };
+
+// 2026-10-27：deepseek-flash 已下线（410 ModelDeprecated），统一用官方在售别名。
+const MODEL = process.env.OCG_PROBE_MODEL || 'deepseek-v4.1-flash';
 
 const cost = { tokens: 0, calls: 0 };
 const results = [];
@@ -117,9 +131,16 @@ function classify(res, passRe) {
 }
 
 // ---------- E 类判据 ----------
+// 2026-10-27 晚间（第二标定）：枚举校验已失效（reasoning.effort 任意值被 200 接受），
+// 改用类型层 —— max_output_tokens 传字符串仍穿透到 serde。
 async function runE1() {
-  const r = await post('/v1/responses', { model: 'deepseek-flash', max_output_tokens: 8 });
-  return { id: 'e1', name: '缺 input 返回官方业务错误', ...classify(r, BASELINE.e1_msg) };
+  const r = await post('/v1/responses', { model: MODEL, input: 'ping', max_output_tokens: 'abc' });
+  const res = classify(r, BASELINE.etype_msg);
+  // 主体文案之外还要求 serde 目标类型与行列位置，防止只回了半句话的转发层。
+  if (res.verdict === 'pass' && !BASELINE.etype_extra.every(re => re.test(r.j?.error?.message || ''))) {
+    return { id: 'e2s', name: '类型层非法返回官方 serde 错误', ...res, verdict: 'format', detail: 'serde 伴生特征缺失' };
+  }
+  return { id: 'e2s', name: '类型层非法返回官方 serde 错误', ...res };
 }
 // 2026-10-20 停用 e2/e3：OpenCode 网关层改为自行拦截参数校验（返回 "Upstream response was invalid"
 // 或直接 200），不再穿透到 DeepSeek 后端，因此无法作为官方判据。实测 10 个候选用例中只有 e1 仍一致。
@@ -145,7 +166,7 @@ async function runP1() {
   const obs = [];
   for (const p of P_PROBES) {
     const r = await post('/v1/chat/completions', {
-      model: 'deepseek-flash', max_tokens: 8, temperature: 0,
+      model: MODEL, max_tokens: 8, temperature: 0,
       messages: [{ role: 'user', content: p }],
       logprobs: true, top_logprobs: 3,
     }, 30000);

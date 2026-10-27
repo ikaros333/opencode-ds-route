@@ -1,4 +1,103 @@
-## 未发布（本地）
+## v0.1.2 — 2026-10-27
+
+### 上游单方面变更：`deepseek-flash` 下线 + 判据整体漂移（门控全量 503 的根因）
+
+**现象**：16:01 起所有请求 503 `gate_no_official_route`，预检 detail 为
+`msgfp:net(fingerprint=410,410,…,410 有效0/9)`；e1 侧同时失效。
+
+**根因（实测）**：`opencode.ai/zen/go` 下架 `deepseek-flash`，任何带该模型的请求返回
+
+```json
+410 {"type":"error","error":{"type":"ModelDeprecated",
+     "message":"Model deepseek-flash has been deprecated. Use deepseek-v4.1-flash instead."}}
+```
+
+而门控所有探针固定使用 `ALLOWED[0]`（当时的 `deepseek-flash`），9 项指纹变成 `410×9`，
+与基线 `400×6,422×3` 不符 → `verdict:unknown` → fail-closed。
+
+**这不是 bug**：fail-closed 正确地拦住了「拿不到官方证据」的流量；问题在默认车道与判据都过期了。
+
+### 改动
+
+1. **默认车道** `GATE_CHAIN`：`deepseek-flash,deepseek-v4.1-flash` → **`deepseek-v4.1-flash`**。
+   车道的语义是「同一后端的优先级偏好」，不是选模型；官方已明确 `deepseek-flash` 永久退役。
+2. **`responses` 主判据换成 serde 文案**（`baseline.mjs` 新增 `E_SERDE_MSG` / `E_SERDE_EXTRAS`）：
+   - 旧 e1（缺 `input`）现在被网关自行拦掉，返回 `503 Endpoint is unavailable`，**不再穿透**；
+   - 新 e1s：`reasoning.effort="bogus"` → 官方 Rust serde 层原话
+     `Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant ...`
+     + `(request_id: <uuid4>)`；
+   - 除主体文案外还要求伴生特征（`unknown variant` + 枚举里的 `xhigh`），防止只回了半句话的转发层；
+   - 实测 2026-10-27：**5/5 = 422 + 该文案 + UUID4 request_id**。
+3. **`messages` 协议无条件封禁**（除显式 `GATE_ALLOW_MESSAGES=1`）。理由（实测）：
+   - 9 项指纹整体漂移：`max_tokens=0` 由 400→**200**、缺 `messages` 由 422→**500**、
+     非法 `role` 由 400→**200**（说明该侧至少混入了一个不做官方参数校验的实现）；
+   - 正常响应的 id 有 **5/8** 落到 53 位 hex 池（非 UUID4）→ 命中交付闸「形态未知」分支，
+     表现为「同一会话时而 200 时而 503」，既不可用也不可信；
+   - 不用 `GATE_BLOCK_PROTOS` 兜底：那是「追加」语义的旧开关，机器上普遍留的是
+     `GATE_BLOCK_PROTOS=chat`，靠代码默认值兜底会让沿用旧 env 的部署静默解封 messages。
+4. **独立探针 `probe/official-detect.mjs`** 同步换模型与判据（`--lite` 仍是 0 token）。
+
+### 验证
+
+- `verify-patch` 293 → **300**（新增 X1–X7：默认车道、旧链不得回归、messages 无条件封禁、
+  serde 判据与伴生特征、baseline 单源）；
+- `test-coverage` 53 → **57**：G8 拆成「默认封禁 messages（503 `gate_proto_blocked`）」+
+  「显式解封后三协议并行」；G1 因默认链只剩 1 条车道改写实——
+  `upstreamDown()` 的阈值是 `min(FAIL_LANES, 车道数)`，单车道下 1 次连接失败即收敛，
+  慢挂换道分支只在多车道时才会命中（断言改为「一次失败即收敛 + 无同车道重试」）；
+- `node probe/official-detect.mjs --lite` 对真实上游跑通。
+
+### 已知取舍
+
+- `messages` 解封后的指纹基线（`MSG_FINGERPRINT_2026_10_27`）只作留档、**未启用**；
+  重新标定前解封会永久 `unknown` → 全量 503（安全方向）。
+- dsh 侧的模型别名仍是 `deepseek-flash`（门控转发时按 `rankCandidates` 归一为 `deepseek-v4.1-flash`，
+  台账会记 `x-gate-model-substituted`），因此无需改动任何 dsh profile 的 model 字段。
+
+### 判据冻结（同日 18:0x，最终形态）
+
+**为什么冻结**：这一晚判据被上游打断了两次（e1 不再穿透 → e1s 枚举校验被取消 → e2s 类型校验开始抖），
+每次重标定都是一次全量 503 风险。实测数据说明根因不是"判据选错"，而是**上游至少两个实现在轮询**：
+
+```
+同一探针 max_output_tokens:"abc"：09:20 → 422，09:2x → 200（门控探针同时刻仍是 422）
+messages 侧：同一小时内 id 出现 UUID4 / 13位时间戳+40hex / 32hex 三种形态，
+             并抓到 Go 实现报错 `json: cannot unmarshal … Go struct field plain.max_tokens`
+```
+
+**冻结后的判据（只依赖实测 100% 稳定的特征）**：
+
+| 判据 | 实测稳定性 | 用途 |
+|---|---|---|
+| 成功响应 id = `resp_uuid4` 位模式 | 38/38 | **放行条件**（形态探针 + 交付闸） |
+| `usage` 含 7 个必需键 | 20/20 | **放行条件** |
+| 响应含非空 `message`（或工具调用） | 20/20（空正文只在 max_output_tokens 过小时出现） | **交付结构闸** |
+| 5 参数探针的返回码向量 | 不稳定（422↔200） | **降级为观测**：`IMPL_VECTOR_DRIFT` / `IMPL_GO_STACK` 告警，不参与放行 |
+
+**代码改动**：
+- `PROTO_TRUST.responses: 'eclass' → 'shape'`，新增 `runShapeProbe()`（1 token，id 位模式 + usage 键集）；
+- `deliver()` 新增结构闸：非流式 `responses` 无正文且无工具调用 → `503 gate_structure_bad`；
+  被 `max_output_tokens` 截断但有正文 → 交付并打 `x-gate-truncated: 1`；
+- 新增 `trustLevel()`（`strong/medium/weak/blocked`）与 `health.trustLevel`、响应头 `x-gate-trust`；
+- 新增 `runImplVector()`（默认 5 分钟）只告警不放行；`GATE_IMPL_VECTOR_MS=0` 可关；
+- `baseline.mjs` 增 `USAGE_KEYS_REQUIRED`、`IMPL_VECTOR_2026_10_27`。
+
+**能力边界（写清楚，不再含糊）**：本通道最高只能到 `medium`——能证明"是同一个 DeepSeek 模型 + 网关形态正常 + 结构合法"，
+**不能**证明"由 DeepSeek 官方服务生成"，因为 OpenCode 已把 UUID4 直出 id / UUID4 request_id / 原样字段名 /
+严格枚举校验 / logprobs 真值全部替换掉。需要 `strong` 只能直连 `api.deepseek.com`（由使用者自行决定，不在本项目的默认路径内）。
+
+**验证**：`verify-patch` 300 → **312**（新增 Y1–Y10）；`test-coverage` 57 → **66**（新增 G13 结构闸/截断标记）；
+真实上游端到端连打 20 次 0 失败。
+
+### 安全与发布卫生（上传前审查）
+
+- **`doctor` 不再打印 key 长度**（`bin/ocg.mjs`）：doctor 输出常被贴进 issue/聊天，长度是账号维度的稳定特征，属不必要的弱泄露；现在只显示「已设置（值不回显）」。
+- **清除真实上游 `request_id`**：`gate/baseline.mjs` 注释与 `gate/test-coverage.mjs` 夹具里曾出现一次真实观测到的 `gw-…` 网关 id，改为占位形态。
+- **`.env.example` 修正**：`GATE_CHAIN` 改为在售的 `deepseek-v4.1-flash`（旧值 `deepseek-flash` 现在返回 410，照抄会让门控全量 503）；`GATE_PRECHECK_TTL_MS` 示例对齐代码默认 `90000`；补 `messages` 默认封禁与 `GATE_ALLOW_MESSAGES` 的说明。
+- **文档明确 `messages` 已不可用**：README 顶部新增「⚠ 重要：`messages` 协议已默认封禁」小节（含实测数据表与恢复步骤），`docs/FAQ.md` 新增两问（封禁原因与处理、`medium` 为何升不到 `strong`），`docs/DSH.md` 判据表同步更新。
+- **审查结论（工作区 + 全 git 历史）**：无密钥/令牌/私钥、无个人绝对路径、无运行时产物、无二进制与大文件；CI 为 `contents: read` 且不使用仓库 secret；监听固定 `127.0.0.1` + 非回环 Host 拒绝 + 可选 `GATE_TOKEN`。
+
+## v0.1.1 — 2026-10-26（已发布）
 
 ### 修复：大包请求「一次挂死 = 整条报废」（总预算 60s → 120s + 慢挂不再重试同车道）
 
