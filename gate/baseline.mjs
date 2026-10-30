@@ -105,5 +105,47 @@ export const USAGE_KEYS_REQUIRED = [
  */
 export const IMPL_VECTOR_2026_10_27 = '422,422,200,503,503';
 
+/**
+ * 每响应指纹（2026-10-29 实测 flash 车道 10/10 完全一致）。
+ * 用途：把"交付闸只查 id 形态"升级为"逐响应 8 项必要条件"，
+ *      提高对第三方/自部署实现的拒答率；不改变 id 白名单本身。
+ * 纪律：上游增删字段 → RESP_KEYS_COMPAT 必须重标定，并更新 docs/BASELINE.md 的 B13。
+ */
+export const RESP_KEYS_COMPAT = new Set([
+  'created_at', 'error', 'id', 'incomplete_details', 'instructions', 'max_output_tokens',
+  'metadata', 'model', 'object', 'output', 'parallel_tool_calls', 'reasoning', 'status',
+  'temperature', 'tool_choice', 'tools', 'top_p', 'usage',
+]);
+
+/**
+ * 必须存在的字段（15 项）。三项是**条件回显**，不能进必需集：
+ *   · `instructions` / `metadata` —— 请求里没给时上游可能不回
+ *   · `reasoning` —— 请求里没有 `reasoning` 字段时上游不回（实测：这正是 keyCount=17 的来源）
+ * 因此判定改成「必需项全在 + 不许出现未知字段」，并对 `reasoning` 做请求相关的条件校验。
+ */
+export const RESP_KEYS_REQUIRED = [
+  'created_at', 'error', 'id', 'incomplete_details', 'max_output_tokens', 'model',
+  'object', 'output', 'parallel_tool_calls', 'status', 'temperature',
+  'tool_choice', 'tools', 'top_p', 'usage',
+];
+
+/** output item id 形态：rs_/msg_/fc_ + 32 hex（实测 10/10） */
+export const ITEM_ID_RE = /^(rs|msg|fc)_[0-9a-f]{32}$/;
+
+/** message.content[*] 的键集（实测 3/3） */
+export const CONTENT_PART_KEYS = new Set(['annotations', 'logprobs', 'text', 'type']);
+
+/**
+ * 流式必须具备的事件家族（实测 3/3 全有；缺任何一个说明实现被换）。
+ * 注意：终止事件是二选一——正常结束是 `response.completed`，
+ * 被 max_output_tokens 截断时是 `response.incomplete`（实测：max_output_tokens=400 + effort=high 很容易触发）。
+ * 两者都算合法终止，不能只认 completed（否则会误报 38 次假警报）。
+ */
+export const EVENT_FAMILY_REQUIRED = [
+  'response.created', 'response.in_progress',
+  'response.output_item.added', 'response.output_item.done',
+];
+export const EVENT_TERMINAL = ['response.completed', 'response.incomplete'];
+
 /** logprob 判据阈值（已退役，chat 协议无判据被默认封禁） */
 export const P1_TOP1_MAX = -0.01;

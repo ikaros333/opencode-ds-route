@@ -118,8 +118,10 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GATE_PRECHECK` | 1 | `0` = 全断（没有判据就不交付） |
-| `GATE_PRECHECK_TTL_MS` | 90000 | 预检复用窗口（responses） |
-| `GATE_PRECHECK_TTL_MS_MESSAGES` | 90000 | messages 窗口 |
+| `GATE_PRECHECK_TTL_MS` | 15000 | 预检复用窗口（responses）。2026-10-29 由 90000 收紧：池切换是分钟级，90s 窗口会让预检结论与交付时刻错位 |
+| `GATE_PRECHECK_TTL_MS_MESSAGES` | 90000 | messages 窗口（协议已封禁） |
+| `GATE_FP_POLICY` | retry | 每响应指纹策略：`retry` 不匹配就丢弃重发，`block` 直接 503 `gate_response_fingerprint`，`warn` 只记录 |
+| `GATE_FP_RETRIES` | 2 | `retry` 模式下的最大重发次数 |
 | `GATE_PRECHECK_TTL_MS_CHAT` | 15000 | chat 窗口（已封禁，实际不起作用） |
 | `GATE_PRECHECK_WAIT_MS` | 未设（自动派生） | 一般不要设；设了也必须 ≥ 探针上限，否则被强制抬升并记 `CONFIG_CLAMPED` |
 | `GATE_PRECHECK_WAIT_SLACK_MS` | 5000 | 派生时在探针上限上留的余量 |

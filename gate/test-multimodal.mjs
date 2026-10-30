@@ -12,7 +12,8 @@ async function post(path, body, headers = {}) {
   const t0 = Date.now();
   const r = await fetch(BASE + path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS, ...headers },
+    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS,
+      ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}), ...headers },
     body: JSON.stringify(body),
   });
   return { status: r.status, h: r.headers, text: await r.text().catch(() => ''), ms: Date.now() - t0 };

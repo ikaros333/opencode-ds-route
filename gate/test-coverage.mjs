@@ -42,6 +42,26 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const UUID4 = '01234567-89ab-4cde-8f01-23456789abcd';
 const HEX32 = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
 
+/**
+ * 2026-10-29：完整的 18 字段成功体（与 flash 车道实测形态一致）。
+ * slim=true 时只给 8 个字段 → 用于验证「每响应指纹」的 FP_MISMATCH 分支。
+ */
+function fullBody(id, slim = false) {
+  const usage = { cost: 0, input_tokens: 1, input_tokens_details: { cached_tokens: 0 },
+                  opencode: {}, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 },
+                  total_tokens: 2 };
+  const output = [{ id: 'msg_' + HEX32, type: 'message', role: 'assistant', status: 'completed',
+                    content: [{ type: 'output_text', text: 'ok', annotations: [], logprobs: null }] }];
+  if (slim) return { id, object: 'response', status: 'completed', incomplete_details: null,
+                     output, usage };
+  return {
+    created_at: 1793000000, error: null, id, incomplete_details: null, instructions: null,
+    max_output_tokens: 8, metadata: {}, model: 'deepseek-v4.1-flash', object: 'response',
+    output, parallel_tool_calls: true, reasoning: { effort: null, summary: null },
+    status: 'completed', temperature: 1, tool_choice: 'auto', tools: [], top_p: 1, usage,
+  };
+}
+
 // ---------- 可控假上游 ----------
 let mode = 'ok';
 let served = 0;
@@ -136,12 +156,8 @@ const mock = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     // 2026-10-27：默认成功体必须带 message + usage 七键 —— 结构闸（deliver 前）会检查，
     // 否则「只有 id 的假成功体」会被判 gate_structure_bad（这正是新闸门的预期行为）。
-    res.end(JSON.stringify({
-      id: UUID4, object: 'response', status: 'completed', incomplete_details: null, completed_at: null,
-      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
-      usage: { cost: 0, input_tokens: 1, input_tokens_details: {}, opencode: {},
-               output_tokens: 1, output_tokens_details: {}, total_tokens: 2 },
-    }));
+    // 2026-10-29：再补齐「每响应指纹」要求的 18 个顶层字段，否则会被判 FP 不一致并触发重发。
+    res.end(JSON.stringify(fullBody(UUID4, mode === 'fpbad')));
   });
 });
 await new Promise(r => mock.listen(MP, '127.0.0.1', r));
@@ -150,7 +166,7 @@ await new Promise(r => mock.listen(MP, '127.0.0.1', r));
 const children = [];
 async function startGate(port, env = {}) {
   const child = spawn(process.execPath, [GATE], {
-    env: { ...process.env, OPENCODE_GO_API_KEY: 'test-key', GATE_PORT: String(port),
+    env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: 'test-key', GATE_PORT: String(port),
            GATE_HOST: '127.0.0.1', GATE_HOST_PORT: String(MP), GATE_HOST_SCHEME: 'http',
            GATE_REFRESH_MS: '0', GATE_PRECHECK_TTL_MS: '0',   // 测试要每请求实测，不吃生产 TTL
            GATE_SNAPSHOT: path.join(import.meta.dirname, 'logs', `cov-${port}.json`), ...env },
@@ -274,7 +290,7 @@ try {
   console.log('\n=== G5 缺 KEY 时拒绝启动 ===');
   {
     const child = spawn(process.execPath, [GATE], {
-      env: { ...process.env, OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4) },
+      env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let err = '';
@@ -457,6 +473,42 @@ try {
     check('G13 截断打 x-gate-truncated', (r2.h?.get('x-gate-truncated') || '') === '1',
       `truncated=${r2.h?.get('x-gate-truncated')}`);
     check('G13 health 暴露 trustLevel', typeof (await (await fetch(`http://127.0.0.1:${P0 + 11}/gate/health`)).json()).trustLevel === 'string', 'ok');
+    g2.child.kill('SIGKILL');
+  }
+  // ★ 2026-10-29：每响应指纹（提高拒答率的主闸）
+  console.log('\n=== G14 每响应指纹：不匹配→重发 / block 拒 / 正常通过 ===');
+  {
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const g = await startGate(P0 + 12, {});
+    check('G14 实例启动', !g.failed, g.failed ? g.stderr().slice(0, 120) : 'ok');
+    const r = await gate(P0 + 12);
+    check('G14 完整形态 → 200', r.status === 200, `status=${r.status}`);
+    check('G14 完整形态 fp=ok', (r.h?.get('x-gate-fp') || '') === 'ok', `fp=${r.h?.get('x-gate-fp')}`);
+    let m = await met(P0 + 12);
+    check('G14 完整形态不计 mismatch', (m.fpMismatch || 0) === 0, `fpMismatch=${m.fpMismatch}`);
+
+    await fetch(`http://127.0.0.1:${MP}/mode/fpbad`);
+    const r2 = await gate(P0 + 12);
+    check('G14 缺字段 → 重发后仍 200（retry 策略）', r2.status === 200, `status=${r2.status}`);
+    check('G14 缺字段 → fp=degraded', (r2.h?.get('x-gate-fp') || '') === 'degraded', `fp=${r2.h?.get('x-gate-fp')}`);
+    m = await met(P0 + 12);
+    check('G14 缺字段 → 记录 mismatch 且发生重发',
+      (m.fpMismatch || 0) >= 1 && (m.fpRetries || 0) >= 1,
+      `fpMismatch=${m.fpMismatch} fpRetries=${m.fpRetries}`);
+    const h = await (await fetch(`http://127.0.0.1:${P0 + 12}/gate/health`)).json();
+    check('G14 health 暴露 fingerprint', h?.fingerprint?.policy === 'retry' && Array.isArray(h?.fingerprint?.topMissing),
+      `policy=${h?.fingerprint?.policy} topMissing=${JSON.stringify(h?.fingerprint?.topMissing)}`);
+    g.child.kill('SIGKILL');
+    await sleep(400);
+
+    const g2 = await startGate(P0 + 12, { GATE_FP_POLICY: 'block' });
+    check('G14 block 实例启动', !g2.failed, g2.failed ? g2.stderr().slice(0, 120) : 'ok');
+    const r3 = await gate(P0 + 12);
+    check('G14 block 模式下缺字段 → 503', r3.status === 503, `status=${r3.status}`);
+    check('G14 归类 gate_response_fingerprint', r3.j?.error?.type === 'gate_response_fingerprint',
+      `type=${r3.j?.error?.type}`);
+    check('G14 报错体带缺失项', Array.isArray(r3.j?.error?.missing) && r3.j.error.missing.includes('keys'),
+      `missing=${JSON.stringify(r3.j?.error?.missing)}`);
     g2.child.kill('SIGKILL');
   }
 } finally {

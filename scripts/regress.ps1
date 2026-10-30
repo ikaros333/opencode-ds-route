@@ -1,4 +1,4 @@
-﻿# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
+# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\regress.ps1
@@ -82,6 +82,13 @@ $env:GATE_TOTAL_BUDGET_MS = '60000'   # 测试自己钉住预算：断言里的 
 $env:GATE_BLOCK_PROTOS = 'chat'
 $env:GATE_PROOF_MODE = 'monitor'
 $env:GATE_SNAPSHOT = Join-Path $LogDir 'shadow-matrix.json'
+# 2026-10-29：生产门控已启用 GATE_TOKEN。影子门控继承同一个值，测试脚本也从
+# process.env.GATE_TOKEN 读取并发送（见各 test-*.mjs 的 headers）。
+# 这样即使某个套件回落到默认端口 8787（生产门控），也能正常鉴权，不会出现「设了 token 却 401」。
+if (-not $env:GATE_TOKEN) {
+  $tok = [Environment]::GetEnvironmentVariable('GATE_TOKEN', 'User')
+  if ($tok) { $env:GATE_TOKEN = $tok }
+}
 $env:GATE_LOG_FILE = Join-Path $LogDir 'shadow-gate.jsonl'
 
 $shadow = Start-Process $NodePath -ArgumentList $Gate -PassThru -WindowStyle Hidden `
@@ -98,7 +105,7 @@ if (-not $ready) {
   try { Stop-Process -Id $shadow.Id -Force } catch {}
   exit 1
 }
-Write-Host "  影子门控就绪：$base"
+Write-Host "  影子门控就绪：$base  tokenRequired=$($h.tokenRequired)  envToken=[" + $env:GATE_TOKEN + "]"
 
 $fail = 0
 function Run([string]$name, [string[]]$args) {

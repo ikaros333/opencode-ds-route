@@ -504,6 +504,23 @@ has('Y8 实现向量仅告警不放行', "result: 'IMPL_VECTOR_DRIFT'");
 hasIn(baseLines, 'Y9 baseline 定义必需 usage 键', 'export const USAGE_KEYS_REQUIRED =');
 hasIn(baseLines, 'Y10 baseline 留档实现向量', 'export const IMPL_VECTOR_2026_10_27 =');
 
+// ===== 2026-10-29：每响应指纹（提高对第三方/自部署实现的拒答率）=====
+// 交付闸从"只查 id 形态"升级为 8 项必要条件；实测 flash 车道 10/10 全绿，加严不误伤。
+console.log('\n=== Z. 每响应指纹 ===');
+hasIn(baseLines, 'Z1 baseline 定义 18 字段集', 'export const RESP_KEYS_COMPAT =');
+hasIn(baseLines, 'Z2 baseline 定义 item id 正则', 'export const ITEM_ID_RE =');
+hasIn(baseLines, 'Z3 baseline 定义流式事件家族', 'export const EVENT_FAMILY_REQUIRED =');
+has('Z4 指纹函数存在（含请求侧条件校验）', 'function fingerprint(body, reqBody)');
+has('Z4b reasoning 条件回显校验', "bad.push('reasoningEcho')");
+has('Z5 六项结构检查齐全', "bad.push('arithmetic')");
+has('Z6 流式旁路采样器存在', 'function makeEventTap(');
+has('Z7 旁路不缓冲（原样透传同一 chunk）', 'this.push(chunk); cb();');
+has('Z8 默认策略 retry', "process.env.GATE_FP_POLICY || 'retry'");
+has('Z9 block 模式错误类型', "type: 'gate_response_fingerprint'");
+has('Z10 响应头暴露指纹结论', "'x-gate-fp': fpDegraded ? 'degraded' : 'ok'");
+has('Z11 health 暴露 fingerprint', 'fingerprint: {');
+has('Z12 预检窗口默认 15s', "num('GATE_PRECHECK_TTL_MS', 15000");
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

@@ -10,7 +10,8 @@ const check = (name, ok, detail, note) => {
 };
 
 async function post(path, body, opts = {}) {
-  const headers = { 'content-type': 'application/json', ...(opts.headers || {}) };
+  const headers = { 'content-type': 'application/json',
+    ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}), ...(opts.headers || {}) };
   const r = await fetch(BASE + path, {
     method: opts.method || 'POST',
     headers,
@@ -137,7 +138,8 @@ const small = (model = 'deepseek-flash') => ({ model, input: 'hi', max_output_to
   const rawWithHost = (hostHdr) => new Promise((resolve) => {
     const u = new URL(BASE);
     const rq = request({ host: u.hostname, port: u.port, path: '/v1/responses', method: 'POST',
-      headers: { 'content-type': 'application/json', host: hostHdr } }, (r) => {
+      headers: { 'content-type': 'application/json', host: hostHdr,
+        ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}) } }, (r) => {
       let b = ''; r.on('data', (d) => (b += d)); r.on('end', () => resolve({ status: r.statusCode, text: b }));
     });
     rq.end(JSON.stringify(small()));
@@ -151,7 +153,8 @@ const small = (model = 'deepseek-flash') => ({ model, input: 'hi', max_output_to
 // ---------- S12 不回应 CORS ----------
 {
   const r = await fetch(BASE + '/v1/responses', { method: 'POST',
-    headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+    headers: { 'content-type': 'application/json', origin: 'https://evil.example',
+      ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}) },
     body: JSON.stringify(small()) });
   const acao = r.headers.get('access-control-allow-origin');
   check('S12 不返回 Access-Control-Allow-Origin', !acao, `acao=${acao}`);

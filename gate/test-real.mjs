@@ -15,7 +15,8 @@ async function call(body, headers = {}) {
   const t0 = Date.now();
   const r = await fetch(BASE + '/v1/responses', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS, ...headers },
+    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS,
+      ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}), ...headers },
     body: JSON.stringify(body),
   });
   const text = await r.text();
@@ -68,7 +69,8 @@ console.log('\n=== R3 流式长输出：验证 SSE 完整送达 ===');
   const t0 = Date.now();
   const r = await fetch(BASE + '/v1/responses', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS, accept: 'text/event-stream' },
+    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS, accept: 'text/event-stream',
+      ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}) },
     body: JSON.stringify({ model: 'deepseek-flash', stream: true, max_output_tokens: 600,
       input: [{ role: 'user', content: [{ type: 'input_text', text: '用中文数从 1 到 40，用逗号分隔，不要多余文字' }] }] }),
   });

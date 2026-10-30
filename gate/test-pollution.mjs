@@ -10,7 +10,8 @@ const check = (n, ok, d) => { ok ? pass++ : fail++; console.log(`${ok ? 'PASS' :
 async function post(path, body, raw) {
   const r = await fetch(BASE + path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS },
+    headers: { 'content-type': 'application/json', 'x-opencode-session': SESS,
+      ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}) },
     body: raw !== undefined ? raw : JSON.stringify(body),
   });
   return { status: r.status, text: await r.text().catch(() => ''), h: r.headers };

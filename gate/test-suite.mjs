@@ -12,7 +12,8 @@ function record(name, ok, detail) {
 }
 
 async function call(path, body, opts = {}) {
-  const headers = { 'content-type': 'application/json', 'x-opencode-session': SESS, ...(opts.headers || {}) };
+  const headers = { 'content-type': 'application/json', 'x-opencode-session': SESS,
+    ...(process.env.GATE_TOKEN ? { 'x-gate-token': process.env.GATE_TOKEN } : {}), ...(opts.headers || {}) };
   const t0 = Date.now();
   const method = opts.method || 'POST';
   const hasBody = method !== 'GET' && method !== 'HEAD' && body != null || opts.raw !== undefined;

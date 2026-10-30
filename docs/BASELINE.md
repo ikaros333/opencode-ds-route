@@ -25,6 +25,8 @@
 | B9 | `responses` 形态判据（现行主判据） | 成功响应 id 必须是 `resp_uuid4` 位模式（38/38 稳定）；errors 类判据已全部失效（参数校验随实现池轮询，同一探针 422↔200） | 2026-10-27 | `oc-gate.mjs` 的 `runShapeProbe()`；基线 `USAGE_KEYS_REQUIRED` |
 | B10 | `responses` usage 键集 | 必须含 `cost,input_tokens,input_tokens_details,opencode,output_tokens,output_tokens_details,total_tokens`（20/20 稳定） | 2026-10-27 | `baseline.mjs` 的 `USAGE_KEYS_REQUIRED` |
 | B11 | 实现指纹向量（**仅观测**） | 5 个参数探针的返回码序列，2026-10-27 实测基线 `422,422,200,503,503`；与基线不符只告警 `IMPL_VECTOR_DRIFT`，**不参与放行** | 2026-10-27 | `baseline.mjs` 的 `IMPL_VECTOR_2026_10_27` |
+| B14 | 已**停用**的探针（2026-10-30 证伪） | `input:[]` 从 10-29 的 400 稳定原文退化为 **400/503 抖动（3:3）**；`reasoning.effort:"bogus"` 从 200 忽略变为偶发 400 `[InvalidParameter]` 透传（池级抖动）。两者**永久禁止进入预检与交付闸**，只可作告警信号 |
+| B13 | 每响应指纹（**交付闸，2026-10-29**） | 非流式 `responses` 交付前校验 6 项结构事实：必需字段全在且无未知字段（15+3 口径，见 B13 细则）、`usage` 七键、`total=input+output`、`output item id` 形如 `rs_/msg_/fc_`+32hex、`incomplete` 必有 `reason`、`content` 元素键 ⊆ `{annotations,logprobs,text,type}`；请求带 `reasoning` 时响应必须回显 `reasoning`。流式校验事件家族（`created/in_progress/output_item.added/output_item.done` 且终止事件 ∈ `{completed,incomplete}`）+ `sequence_number` 单调。**实测 flash 车道 10/10 全绿**。策略 `GATE_FP_POLICY=retry|block|warn`（默认 retry） |
 | B12 | 结构闸 | 非流式 `responses` 响应必须含非空 `message`（或工具调用 item）；只有 `reasoning` → 拒 `gate_structure_bad`。被 `max_output_tokens` 截断且有正文 → 交付并打 `x-gate-truncated:1` | 2026-10-27 | `oc-gate.mjs` 的 `deliver()` 结构闸 |
 
 ## 上游变化时怎么判断是哪条断了

@@ -21,6 +21,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { Transform } from 'node:stream';
 // 判据基线唯一来源：id 形态 / messages 状态码指纹 / e1 文案都从这里拿。
 // 不要在别处复制字面量——verify-patch 会断言这一点。
 import {
@@ -32,6 +33,12 @@ import {
   E_SERDE_TYPE_EXTRAS,
   USAGE_KEYS_REQUIRED,
   IMPL_VECTOR_2026_10_27,
+  RESP_KEYS_COMPAT,
+  RESP_KEYS_REQUIRED,
+  ITEM_ID_RE,
+  CONTENT_PART_KEYS,
+  EVENT_FAMILY_REQUIRED,
+  EVENT_TERMINAL,
   OBSERVED_AT,
 } from './baseline.mjs';
 
@@ -169,11 +176,15 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 2026-10-26：整段挂在单次上限的「慢挂」次数（这类不重试同车道，直接换道）
   laneSlowHang: 0,
   // 2026-10-27：结构闸拒绝次数（响应没有正文、也没有工具调用）
-  structureBad: 0 };
+  structureBad: 0,
+  // 2026-10-29：每响应指纹
+  fpMismatch: 0, fpRetries: 0, fpBlocked: 0 };
 
 // 2026-10-27 冻结版：形态探针的最近结论 / 实现指纹向量（仅观测）
 let lastShape = null;      // { at, verdict, idShape, detail }
 let implVector = '';       // 例如 '422,422,200,503,503'
+// 2026-10-29：指纹缺失项分布（health 用，回答"最常缺哪一项"）
+const fpMissing = new Map();
 
 // 客户端是否曾把真 key 送到本机端口（R1 的可观测信号：health 暴露，doctor 也会查配置）
 const clientSentRealKey = { flag: false };
@@ -338,6 +349,16 @@ const UPSTREAM_FAST_FAIL_LANES = num('GATE_UPSTREAM_FAST_FAIL_LANES', 2, { min: 
 //   这样：一次挂死仍能换道（4.3s 级成功），最坏单请求等待从 120s 压到 90s。
 //   若你改 CHAIN 增加车道数，请同步放大该值（否则后面的车道仍拿不到时间）。
 const TOTAL_BUDGET_MS = num('GATE_TOTAL_BUDGET_MS', 90000, { min: 5000, max: 600000 });
+// ---------- 2026-10-29：每响应指纹（提高对第三方/自部署实现的拒答率）----------
+// 今天交付闸只查 id 形态（1 项）；指纹把它升级为 8 项必要条件（顶层字段集、usage 键集、
+// token 算术、item id 形态、status 自洽、content 键集、流式事件家族、sequence 单调）。
+// 实测 flash 车道 10/10 全绿 → 加严不会误伤现有流量。
+//   warn  : 只记录（GATE_FP_MISMATCH 台账 + 计数），不干预
+//   retry : 非流式不匹配 → 丢弃并重发（最多 GATE_FP_RETRIES 次）；仍不匹配则按 warn 交付
+//   block : 非流式不匹配 → 503 gate_response_fingerprint
+// 流式无法在发送前判定（事件家族要等流结束），因此流式一律只记录 + 告警。
+const FP_POLICY = (process.env.GATE_FP_POLICY || 'retry').toLowerCase();
+const FP_RETRIES = num('GATE_FP_RETRIES', 2, { min: 0, max: 5 });
 // 单个探针的超时；必须远小于总预算，否则上游 hang 时探针会把预算吃光
 const PROBE_TIMEOUT_MS = num('GATE_PROBE_TIMEOUT_MS', 5000, { min: 500, max: 60000 });
 // ★ 探针「总时长」上限（覆盖 DNS/连接/TLS/滴流）。实测 2026-10-22 上游慢时 m1=3919ms、m8=3452ms，
@@ -957,7 +978,12 @@ const precheckWaitMs = () => {
 // 实测池切换 λ ≈ 5.4e-6/s（51h 内 1 次）。窗口 W 的暴露面 = λ×W：
 //   W=90s → 0.049%    W=180s → 0.097%    W=300s → 0.16%
 // 取 90s：后台保活（25s 一轮）保证每个窗口内 ≥3 次刷新，暴露面压在 0.05% 以下。
-const PRECHECK_TTL_MS = num('GATE_PRECHECK_TTL_MS', 90000, { min: 0, max: 3600000 });
+// ★ 2026-10-29 收紧：90s → 15s。
+// 起因：实测池切换是**分钟级**（10-27 16:01、10-28 09:00、10-29 均在一小时内变过实现），
+// 原 90s 窗口意味着「预检通过」可能已经过期 90 秒，而交付落在另一套实现上。
+// 成本：形态探针是 1 token 的请求，15s 一次 = 4 次/分，可忽略。
+// 收益：预检结论与交付时刻的偏差从「≤90s」压到「≤15s」。
+const PRECHECK_TTL_MS = num('GATE_PRECHECK_TTL_MS', 15000, { min: 0, max: 3600000 });
 const PRECHECK_TTL_BY_PROTO = {
   responses: PRECHECK_TTL_MS,
   messages: num('GATE_PRECHECK_TTL_MS_MESSAGES', 90000, { min: 0, max: 3600000 }),
@@ -1205,6 +1231,104 @@ async function runMsgFingerprint() {
  *   ② usage 含基线要求的 7 个键（20/20）
  * 代价：输出 1 token；结果进 PRECHECK 缓存（TTL 90s），不会每请求都打。
  */
+/**
+ * 每响应指纹（2026-10-29）。返回"缺失项"数组，空数组 = 通过。
+ * 只读交付响应的结构事实，不发额外请求；实测 flash 车道 10/10 全绿。
+ */
+function fingerprint(body, reqBody) {
+  const bad = [];
+  const b = body || {};
+  const keys = Object.keys(b);
+  // 2026-10-29 修正：网关偶尔只回 17 项（少 metadata），因此不比对"恰好 18 项"，
+  // 而是「必需项全在 + 不许出现未知字段」——既稳定又能挡住换了实现的响应。
+  if (RESP_KEYS_REQUIRED.some(k => !(k in b)) || keys.some(k => !RESP_KEYS_COMPAT.has(k))) bad.push('keys');
+  // 条件校验：请求里带了 reasoning，响应就必须回显 reasoning（否则说明实现没按官方语义处理）
+  if (reqBody && reqBody.reasoning && !('reasoning' in b)) bad.push('reasoningEcho');
+  const u = b.usage || {};
+  if (USAGE_KEYS_REQUIRED.some(k => !(k in u))) bad.push('usage');
+  if (typeof u.total_tokens === 'number'
+      && u.total_tokens !== (u.input_tokens || 0) + (u.output_tokens || 0)) bad.push('arithmetic');
+  const items = Array.isArray(b.output) ? b.output : [];
+  if (items.some(x => x && x.id && !ITEM_ID_RE.test(String(x.id)))) bad.push('itemId');
+  if (b.status === 'incomplete' && !(b.incomplete_details && b.incomplete_details.reason)) bad.push('status');
+  for (const m of items.filter(x => x && x.type === 'message')) {
+    for (const c of (m.content || [])) {
+      if (c && Object.keys(c).some(k => !CONTENT_PART_KEYS.has(k))) { bad.push('contentPart'); break; }
+    }
+  }
+  return bad;
+}
+
+/** 流式：只判事件家族是否齐全（sequence 单调性由 tap 顺带记录） */
+function fingerprintEvents(seen) {
+  const bad = [];
+  if (EVENT_FAMILY_REQUIRED.some(t => !seen.has(t))) bad.push('eventFamily');
+  if (!EVENT_TERMINAL.some(t => seen.has(t))) bad.push('eventTerminal');
+  return bad;
+}
+
+/**
+ * 流式旁路采样器：**不缓冲、不改字节**，只记录事件名与 sequence 单调性。
+ * 风险控制：任何异常都 swallow，绝不让它影响数据透传。
+ */
+function makeEventTap(reqId, model, seedChunks = []) {
+  const seen = new Set();
+  let lastSeq = null, seqOk = true;
+  // 2026-10-29 修正：SSE 的 `data: {...}` 行会被 TCP 分片在任意位置切开。
+  // 上一版直接在单个 chunk 里正则 → 跨片的行解析失败 → 事件名丢失 → 误报 FP_MISMATCH（实测 38 次假警报）。
+  // 现在只保留"最后一行残片"作为 carry（有界），**仍然逐 chunk 立即 push，不延迟客户端**。
+  let carry = '';
+  const MAX_CARRY = 65536;
+  const scan = (text) => {
+    if (!text) return;
+    const s = carry + text;
+    const nl = s.lastIndexOf('\n');
+    const complete = nl >= 0 ? s.slice(0, nl) : '';
+    carry = nl >= 0 ? s.slice(nl + 1) : s;
+    if (carry.length > MAX_CARRY) carry = '';
+    if (!complete) return;
+    for (const m of complete.matchAll(/^data:\s*(\{.*)$/gm)) {
+      try {
+        const j = JSON.parse(m[1]);
+        if (j && j.type) seen.add(j.type);
+        if (j && typeof j.sequence_number === 'number') {
+          if (lastSeq !== null && j.sequence_number <= lastSeq) seqOk = false;
+          lastSeq = j.sequence_number;
+        }
+      } catch {}
+    }
+  };
+  // ★ 关键修正：流的第一段已经被 peekBody 读走并缓存到 r.buffered，
+  // deliver 会先把 buffered 直接写给客户端（不经过 tap）。因此必须把 buffered 也扫一遍，
+  // 否则 `response.created` 永远缺失 → eventFamily 恒误报。
+  try { for (const c of seedChunks) scan(Buffer.isBuffer(c) ? c.toString('utf8') : String(c)); } catch {}
+  const tap = new Transform({
+    transform(chunk, _enc, cb) {
+      try { scan(chunk.toString('utf8')); } catch {}
+      this.push(chunk); cb();
+    },
+    flush(cb) {
+      try {
+        // 流结束时补解析可能残留的最后一行
+        if (carry) { scan('\n'); }
+        const miss = fingerprintEvents(seen);
+        if (miss.length) {
+          metrics.fpMismatch = (metrics.fpMismatch || 0) + 1;
+          for (const k of miss) fpMissing.set(k, (fpMissing.get(k) || 0) + 1);
+          log({ ts: new Date().toISOString(), reqId, result: 'FP_MISMATCH', model,
+                stream: true, missing: miss, events: [...seen].sort() });
+          pushAlert('FP_MISMATCH', { reqId, model, stream: true, missing: miss });
+        } else {
+          log({ ts: new Date().toISOString(), reqId, result: 'FP_OK', model, stream: true,
+                seqMonotonic: seqOk, eventCount: seen.size });
+        }
+      } catch {}
+      cb();
+    },
+  });
+  return tap;
+}
+
 function runShapeProbe() {
   return new Promise((resolve) => {
     const t0 = Date.now();
@@ -2159,6 +2283,15 @@ async function handle(req, res) {
       // 实现指纹向量（仅观测）：与基线不一致 → IMPL_VECTOR_DRIFT 告警，不影响放行
       implVector: implVector || null, implVectorBaseline: IMPL_VECTOR_2026_10_27,
       usageKeysRequired: USAGE_KEYS_REQUIRED,
+      // ★ 2026-10-29：每响应指纹（提高拒答率的主闸）
+      fingerprint: {
+        policy: FP_POLICY, retries: FP_RETRIES,
+        checks: ['keys', 'usage', 'arithmetic', 'itemId', 'status', 'contentPart', 'eventFamily'],
+        mismatches: metrics.fpMismatch || 0, retried: metrics.fpRetries || 0,
+        blocked: metrics.fpBlocked || 0,
+        topMissing: [...fpMissing.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+          .map(([k, v]) => ({ check: k, count: v })),
+      },
       // 保护状态可见性（对外信任设计的核心）：判据最近一次成功距今多久、当前连的是哪
       judgeAgeMs: lastPc ? Date.now() - lastPc.at : null,
       lastJudgeOk: !!lastPc && lastPc.verdict === 'pass',
@@ -2364,12 +2497,13 @@ async function handle(req, res) {
     idShape: r.idShape, votes: r.votes, signals: r.signals, endpoint: r.endpoint, upstreamModel: r.upstreamModel, ms: r.ms, error: r.error });
 
   let currentTrust = null;
-  const deliver = (model, r, attemptNo) => {
+  const deliver = async (model, r, attemptNo, fpRetriesLeft = FP_RETRIES) => {
     // ★ 2026-10-27 冻结版：结构闸放在**所有计数之前**。
     // 早期版本把它接在 metrics.pass++ 之后，导致「被判 pass 但实际返回 503」的台账/指标不一致
     // （实测 10 次请求里 1 次被拦，却显示 passByProof=10）。
     // 目的：拦掉「只有思考、没有正文」的响应；放行工具调用；body 解析失败时不判定（避免误杀大响应）。
     let truncatedFlag = '';
+    let fpDegraded = '';    // '1' = 指纹不完整但仍交付（retry 用尽 / warn 模式）
     if (proto === 'responses' && !String(r.ctype || '').includes('event-stream')) {
       let sbody = null;
       try { sbody = JSON.parse(Buffer.concat(r.buffered).toString('utf8')); } catch {}
@@ -2403,6 +2537,62 @@ async function handle(req, res) {
         }
         // 只要是被 max_output_tokens 截断就统一打标（有正文也打：调用方需要知道"没答完"）
         if (incReason === 'max_output_tokens') truncatedFlag = '1';
+      }
+    }
+    // ★ 2026-10-29：每响应指纹（只对非流式 responses —— 流式要等流结束才能判，见 makeEventTap）
+    // 目的：把"只查 id 形态"升级为 8 项必要条件，提高对第三方/自部署实现的拒答率。
+    // 策略：retry（默认）不匹配就丢弃重发；block 直接 503；warn 只记录。
+    if (proto === 'responses' && !String(r.ctype || '').includes('event-stream')) {
+      let fbody = null;
+      try { fbody = JSON.parse(Buffer.concat(r.buffered).toString('utf8')); } catch {}
+      if (fbody) {
+        const miss = fingerprint(fbody, body);
+        if (miss.length) {
+          metrics.fpMismatch = (metrics.fpMismatch || 0) + 1;
+          for (const k of miss) fpMissing.set(k, (fpMissing.get(k) || 0) + 1);
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_MISMATCH', model,
+                missing: miss, keyCount: Object.keys(fbody).length, idShape: r.idShape });
+          pushAlert('FP_MISMATCH', { reqId, model, missing: miss });
+          if (FP_POLICY !== 'warn') {
+            // 丢弃本次响应（尚未写出任何字节），重新发一次；仍不匹配则退回本次响应
+            if (fpRetriesLeft > 0 && remainMs() > 3000) {
+              try { r.stream && r.stream.destroy(); } catch {}
+              metrics.fpRetries = (metrics.fpRetries || 0) + 1;
+              let rr = null;
+              try {
+                rr = await withSlot(() => realRequest({
+                  pathName, body, incoming: req.headers, model,
+                  signal: clientGone.signal, payloadFactory,
+                  timeoutMs: Math.max(1500, Math.min(UPSTREAM_TIMEOUT_MS, remainMs())),
+                }), clientGone.signal);
+              } catch { rr = null; }
+              if (rr && rr.status >= 200 && rr.status < 300) {
+                return deliver(model, rr, attemptNo + 1, fpRetriesLeft - 1);
+              }
+              // 重发失败：无法再交付本次响应（流已被销毁），走 fail-closed
+              res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
+                'x-gate-result': 'blocked', 'x-gate-reason': 'fp_mismatch',
+                'x-gate-trust': trustLevel(), 'x-gate-req-id': reqId });
+              return res.end(JSON.stringify({ error: { type: 'gate_response_fingerprint',
+                message: '上游响应的形态与基线不符，且重发未成功；已 fail-closed，未交付任何内容。',
+                missing: miss, request_id: reqId } }));
+            }
+            if (FP_POLICY === 'block') {
+              metrics.fpBlocked = (metrics.fpBlocked || 0) + 1;
+              try { r.stream && r.stream.destroy(); } catch {}
+              res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
+                'x-gate-result': 'blocked', 'x-gate-reason': 'fp_mismatch',
+                'x-gate-trust': trustLevel(), 'x-gate-req-id': reqId });
+              return res.end(JSON.stringify({ error: { type: 'gate_response_fingerprint',
+                message: '上游响应的形态与基线不符；已 fail-closed，未交付任何内容。',
+                missing: miss, request_id: reqId } }));
+            }
+          }
+          fpDegraded = '1';
+        } else {
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_OK', model,
+                keyCount: Object.keys(fbody).length });
+        }
       }
     }
     // 判定分级：id 形态为 official 直接算 pass；
@@ -2464,13 +2654,30 @@ async function handle(req, res) {
       // 2026-10-27：被上游 max_output_tokens 截断的响应打标记，客户端/人可以区分"模型没答完"
       ...(truncatedFlag ? { 'x-gate-truncated': '1' } : {}),
       'x-gate-trust': trustLevel(),
+      // 2026-10-29：每响应指纹结果（ok / degraded）
+      'x-gate-fp': fpDegraded ? 'degraded' : 'ok',
     });
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
     if (r.stream.readableEnded || r.stream.destroyed) { try { res.end(); } catch {} return; }
-    r.stream.pipe(res);
-    r.stream.on('end', () => { try { res.end(); } catch {} });
-    r.stream.on('error', () => { try { res.end(); } catch {} });
+    // ★ 2026-10-29：流式旁路采样（只记录事件名/sequence，不改字节、不缓冲）。
+    // 流式无法在发送前判定（事件家族要等流结束），所以这里只产生 FP_OK / FP_MISMATCH 台账与告警。
+    //
+    // ★ 2026-10-29 修正（实测踩到）：挂了 Transform 之后**不能**再监听 source 的 'end' 去 res.end()。
+    // 那会在 tap 还在 flush 时就把响应结束掉 → 客户端丢失末尾的 `response.completed`（5 次里丢 4 次），
+    // 同时 tap 也判定"事件家族不全"→ 假 FP_MISMATCH。
+    // 正确做法：让 tap.pipe(res) 自己负责结束；source 的 'end' 只在**未挂 tap**的分支里兜底。
+    if (proto === 'responses') {
+      const tap = makeEventTap(reqId, model, r.buffered);
+      tap.on('error', () => { try { res.end(); } catch {} });
+      tap.pipe(res);
+      r.stream.pipe(tap);
+      r.stream.on('error', () => { try { tap.destroy(); } catch {} try { res.end(); } catch {} });
+    } else {
+      r.stream.pipe(res);
+      r.stream.on('end', () => { try { res.end(); } catch {} });
+      r.stream.on('error', () => { try { res.end(); } catch {} });
+    }
   };
 
   let idx = 0;
