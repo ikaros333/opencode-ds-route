@@ -1,4 +1,4 @@
-# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
+﻿# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\regress.ps1
