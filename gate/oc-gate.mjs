@@ -68,6 +68,11 @@ const KEY = process.env.OPENCODE_GO_API_KEY || '';
 // GATE_TOKEN 非空时，/v1/* 代理请求必须带 x-gate-token；/gate/* 只读观测端点不受影响。
 // 留空 = 关闭（手工路径的默认），install.ps1 会生成并默认开启。
 const GATE_TOKEN = process.env.GATE_TOKEN || '';
+// ★ 2026-10-30：/gate/* 观测端点的独立可选 token（与 /v1/* 的 GATE_TOKEN 解耦）。
+// 留空 = 观测端点不需要鉴权（保持既有脚本兼容）。设了以后所有 /gate/* 必须带 x-gate-token。
+// 意义：health/metrics/proof/matrix/latency 会暴露用量、车道、判据状态与本机安装根，
+// 同用户下任何进程可读；Host 校验只挡浏览器 rebinding，不挡本机进程。
+const OBS_TOKEN = process.env.GATE_OBS_TOKEN || '';
 /**
  * 常量时间比较：本地回环上时序攻击不现实，但比较逻辑本身不该随内容提前返回。
  * 长度不同直接 false（timingSafeEqual 要求等长）。
@@ -76,6 +81,13 @@ const tokenMatches = (got) => {
   if (!GATE_TOKEN) return true;
   const a = Buffer.from(String(got ?? ''));
   const b = Buffer.from(GATE_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+/** 通用：与任意期望值做常量时间比较（GATE_OBS_TOKEN 用） */
+const tokenOk = (got, expected) => {
+  if (!expected) return true;
+  const a = Buffer.from(String(got ?? ''));
+  const b = Buffer.from(String(expected));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 // 2026-10-27：deepseek-flash 被上游下线（410 ModelDeprecated，官方替代 = deepseek-v4.1-flash）。
@@ -2244,6 +2256,22 @@ async function handle(req, res) {
     res.on('close', recordOnce);
   }
 
+  // ★ 2026-10-30：/gate/* 观测端点的**可选**本地鉴权。
+  // 默认关闭（保持既有工具/脚本兼容）；设了 GATE_OBS_TOKEN 后，/gate/* 必须带 x-gate-token。
+  // 动机：/gate/health|metrics|proof|matrix|latency|alerts 会暴露用量、模型、判据状态与本机路径，
+  // 同用户下任何进程都能读。Host 校验已挡浏览器 rebinding，但挡不住本机进程。
+  // 与 /v1/* 的 GATE_TOKEN 相互独立：可以只开观测鉴权，不影响 dsh。
+  if (OBS_TOKEN && String(req.url || '').startsWith('/gate/')) {
+    if (!tokenOk(req.headers['x-gate-token'], OBS_TOKEN)) {
+      const oid = Math.random().toString(16).slice(2, 10);
+      recordFailure({ kind: 'client', type: 'gate_obs_unauthorized', status: 401,
+        path: String(req.url).split('?')[0], elapsedMs: Date.now() - startedAt });
+      res.writeHead(401, { 'content-type': 'application/json', 'x-gate-result': 'blocked' });
+      return res.end(JSON.stringify({ error: { type: 'gate_obs_unauthorized',
+        message: '观测端点已启用 GATE_OBS_TOKEN：/gate/* 必须带请求头 x-gate-token。', request_id: oid } }));
+    }
+  }
+
   if (req.method === 'GET' && req.url === '/gate/health') {
     // 第 17 轮：health 不再只是「进程活着」，要把「能不能真服务」也暴露出来，
     // 否则 watchdog 只能看到 ok=true，发现不了「端口通但上游全 503」的假活状态。
@@ -2297,6 +2325,7 @@ async function handle(req, res) {
       lastJudgeOk: !!lastPc && lastPc.verdict === 'pass',
       egressHost: `${HOST}:${HOST_PORT}`,
       tokenRequired: !!GATE_TOKEN,
+      obsTokenRequired: !!OBS_TOKEN,
       // R1 可观测：客户端是否曾把真 key 送到本机端口（true = 配置该改成占位 key）
       clientKeyFromEnv: clientSentRealKey.flag,
       baselineObservedAt: OBSERVED_AT,

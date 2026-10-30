@@ -521,6 +521,18 @@ has('Z10 响应头暴露指纹结论', "'x-gate-fp': fpDegraded ? 'degraded' : '
 has('Z11 health 暴露 fingerprint', 'fingerprint: {');
 has('Z12 预检窗口默认 15s', "num('GATE_PRECHECK_TTL_MS', 15000");
 
+// ===== 2026-10-30：/gate/* 观测端点可选鉴权（GATE_OBS_TOKEN）=====
+// 动机：health/metrics/proof/matrix 会暴露用量、车道、判据状态与本机安装根；
+// Host 校验只挡浏览器 rebinding，挡不住同用户的本机进程。默认关闭以保持脚本兼容。
+console.log('\n=== AA. 观测端点鉴权 ===');
+has('AA1 观测 token 配置存在', "const OBS_TOKEN = process.env.GATE_OBS_TOKEN || '';");
+has('AA2 通用常量时间比较存在', 'const tokenOk = (got, expected) =>');
+has('AA3 /gate/* 前置拦截存在', "String(req.url || '').startsWith('/gate/')");
+has('AA4 401 类型可读', "type: 'gate_obs_unauthorized'");
+has('AA5 health 暴露 obsTokenRequired', 'obsTokenRequired: !!OBS_TOKEN,');
+hasIn(cliLines, 'AA6 ocg 客户端携带观测 token', 'const OBS_HEADERS = () =>');
+has('AA7 观测鉴权与代理鉴权解耦', 'OBS_TOKEN && String(req.url');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

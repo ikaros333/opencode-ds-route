@@ -61,16 +61,21 @@ const line = (mark, label, detail = '') => {
 const die = msg => { console.error(`[ocg] ${msg}`); process.exit(1); };
 
 // ---------------- 通用探测 ----------------
+// ★ 2026-10-30：/gate/* 可选鉴权（GATE_OBS_TOKEN）。设了就必须带 token，否则 401。
+const OBS_HEADERS = () => {
+  const t = process.env.GATE_OBS_TOKEN;
+  return t ? { 'x-gate-token': t } : undefined;
+};
 async function health(timeoutMs = 5000) {
   try {
-    const r = await fetch(`${BASE}/gate/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetch(`${BASE}/gate/health`, { headers: OBS_HEADERS(), signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
 }
 async function getJson(p, timeoutMs = 5000) {
   try {
-    const r = await fetch(BASE + p, { signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetch(BASE + p, { headers: OBS_HEADERS(), signal: AbortSignal.timeout(timeoutMs) });
     return await r.json();
   } catch { return null; }
 }

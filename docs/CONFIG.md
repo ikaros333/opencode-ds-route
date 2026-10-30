@@ -120,6 +120,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PRECHECK` | 1 | `0` = 全断（没有判据就不交付） |
 | `GATE_PRECHECK_TTL_MS` | 15000 | 预检复用窗口（responses）。2026-10-29 由 90000 收紧：池切换是分钟级，90s 窗口会让预检结论与交付时刻错位 |
 | `GATE_PRECHECK_TTL_MS_MESSAGES` | 90000 | messages 窗口（协议已封禁） |
+| `GATE_OBS_TOKEN` | 空（关闭） | `/gate/*` 观测端点的独立鉴权 token；设了以后必须带 `x-gate-token`。与 `GATE_TOKEN` 解耦 |
 | `GATE_FP_POLICY` | retry | 每响应指纹策略：`retry` 不匹配就丢弃重发，`block` 直接 503 `gate_response_fingerprint`，`warn` 只记录 |
 | `GATE_FP_RETRIES` | 2 | `retry` 模式下的最大重发次数 |
 | `GATE_PRECHECK_TTL_MS_CHAT` | 15000 | chat 窗口（已封禁，实际不起作用） |

@@ -511,6 +511,34 @@ try {
       `missing=${JSON.stringify(r3.j?.error?.missing)}`);
     g2.child.kill('SIGKILL');
   }
+  // ★ 2026-10-30：/gate/* 观测端点可选鉴权（GATE_OBS_TOKEN）
+  console.log('\n=== G16 观测端点鉴权（GATE_OBS_TOKEN）===');
+  {
+    const g3 = await startGate(P0 + 13, { GATE_OBS_TOKEN: 'obs-secret-123' });
+    // startGate 的就绪探测不带 token → 开观测鉴权后必然 401，所以这里自己带 token 轮询
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) {
+      await sleep(150);
+      try {
+        const r = await fetch(`http://127.0.0.1:${P0 + 13}/gate/health`, { headers: { 'x-gate-token': 'obs-secret-123' } });
+        if (r.ok) up = true;
+      } catch {}
+    }
+    check('G16 实例启动（带观测 token 探活）', up, up ? 'ok' : g3.stderr().slice(0, 120));
+    const noTok = await fetch(`http://127.0.0.1:${P0 + 13}/gate/health`);
+    check('G16 无 token → 401', noTok.status === 401, `status=${noTok.status}`);
+    const badTok = await fetch(`http://127.0.0.1:${P0 + 13}/gate/health`, { headers: { 'x-gate-token': 'wrong' } });
+    check('G16 错误 token → 401', badTok.status === 401, `status=${badTok.status}`);
+    const okTok = await fetch(`http://127.0.0.1:${P0 + 13}/gate/health`, { headers: { 'x-gate-token': 'obs-secret-123' } });
+    check('G16 正确 token → 200', okTok.status === 200, `status=${okTok.status}`);
+    const hj = okTok.status === 200 ? await okTok.json() : {};
+    check('G16 health 暴露 obsTokenRequired', hj.obsTokenRequired === true, `obsTokenRequired=${hj.obsTokenRequired}`);
+    // 代理端点不受观测 token 影响（两者解耦）
+    const px = await fetch(`http://127.0.0.1:${P0 + 13}/v1/responses`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+    check('G16 代理端点不受观测 token 影响', px.status !== 401, `status=${px.status}`);
+    g3.child.kill('SIGKILL');
+  }
 } finally {
   stopAll();
   mock.close();

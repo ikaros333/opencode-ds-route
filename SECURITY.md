@@ -37,3 +37,18 @@
 
 个人项目，不承诺 SLA。收到报告后会尽快确认；修复会在
 [docs/CHANGELOG.md](docs/CHANGELOG.md) 中标注是否触碰网络 / 文件 / 环境变量。
+
+## 不要直接运行别人分支里的脚本
+
+本仓库的 `install.ps1` / `scripts\*.ps1` 会写 User 级环境变量、注册计划任务。
+如果直接对 **PR / 别人 fork** 里的脚本执行 `powershell -ExecutionPolicy Bypass -File ...`，
+等于以你的身份运行任意代码（可能改写或外传你的 key）。
+
+- 只有**合并进 `main`** 的脚本才可按文档执行；
+- 审 diff 时优先看：`SetEnvironmentVariable`、`Set-ItemProperty`、`Register-ScheduledTask`、`Invoke-WebRequest`、`Start-Process`；
+- CI 侧是安全的：`permissions: contents: read`、不使用 `secrets.*`、不使用 `pull_request_target`。
+
+## 仓库侧保护（当前状态）
+
+- `main`：禁止强推、禁止删除、对管理员同样生效；
+- 标签 `v*`：ruleset 禁止删除与改指向（发布产物因此不可被静默替换）。

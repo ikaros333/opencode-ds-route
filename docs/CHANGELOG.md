@@ -1,3 +1,46 @@
+## v0.1.4 — 2026-10-30
+
+### 安全加固（发布卫生 + 本机攻击面）
+
+起因：对已发布仓库做了一次自查（密钥/历史/攻击面）。结论：**无密钥泄漏、无远程可利用面**，
+但有三项值得收紧，本版处理其中可代码化的两项。
+
+**1. `/gate/*` 观测端点可选鉴权（`GATE_OBS_TOKEN`）**
+`health|metrics|proof|matrix|latency|alerts` 会暴露用量、车道、判据状态与本机安装根。
+此前只靠「绑回环 + Host 校验」——能挡浏览器 DNS rebinding，**挡不住同用户的本机进程**。
+设 `GATE_OBS_TOKEN` 后必须带 `x-gate-token`；与 `/v1/*` 的 `GATE_TOKEN` 解耦；默认关闭以保持脚本兼容。
+`ocg health/metrics/...` 自动携带该头。
+
+**2. README 明确「本项目不在 npm 发布」**
+`package.json` 是 `private: true`（不会被误发），但 `opencode-ds-route` 这个**名字**若被第三方
+在 npm 抢注，任何 `npm i` 都会装到别人的包。README 顶部加声明。
+
+**3. SECURITY.md 补充「不要运行别人分支里的脚本」**
+`install.ps1` / `scripts\*.ps1` 会写 User 级环境变量、注册计划任务；对 PR 分支直接
+`-ExecutionPolicy Bypass -File` 等于以你的身份执行任意代码。同时记录仓库侧保护状态。
+
+### 仓库侧保护（非代码，已启用）
+
+- `main`：禁强推、禁删除、对管理员同样生效；
+- 标签 `v*`：ruleset `protect-release-tags` 禁止删除与改指向（发布产物不可被静默替换）。
+
+### 复核后纠正的一条结论
+
+此前怀疑 `ocg` 里 `TASK_NAME` 拼接 PowerShell 存在命令注入 —— **不成立**：
+`TASK_NAME` 是常量，`install-service.ps1` 通过 **参数绑定** 传给 `Register-ScheduledTask`，
+`-Argument` 用 `-f` 格式化且 `$Port` 是 `[int]`。无拼接注入面。
+
+### 未做（明确记录，不假装已完成）
+
+- **Release 产物仍无签名**：sha256 与 zip 同渠道，仓库被入侵时可同时替换。需 GPG/cosign 治本；
+- **key/token 仍明文存于 `HKCU\Environment`**：同用户进程可读，需改 DPAPI/ACL 文件。
+
+### 测试
+
+```
+verify-patch  332 / 0   （+7 条 AA 段断言）
+test-coverage  84 / 0   （+6 条 G16 用例）
+```
 ## v0.1.3 — 2026-10-29
 
 ### 新增：每响应指纹（交付侧 8 项必要条件）
