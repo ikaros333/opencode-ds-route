@@ -533,6 +533,23 @@ has('AA5 health 暴露 obsTokenRequired', 'obsTokenRequired: !!OBS_TOKEN,');
 hasIn(cliLines, 'AA6 ocg 客户端携带观测 token', 'const OBS_HEADERS = () =>');
 has('AA7 观测鉴权与代理鉴权解耦', 'OBS_TOKEN && String(req.url');
 
+// ===== 2026-10-30：优雅停止（drain）+ ocg stop/restart =====
+// 动机：Stop-Process -Force 会 RST 在途连接，客户端只看到 Connection error；
+// dsh 只重试 1 次(800ms)，落不到新实例窗口。drain 用 server.close + 等在途收尾解决。
+console.log('\n=== AB. 优雅停止与重启 ===');
+has('AB1 drain 端点存在', "'/gate/admin/drain'");
+has('AB2 未配 token 时禁用（禁本机任意进程停门控）', "type: 'gate_drain_disabled'");
+has('AB3 未授权分类可读', "type: 'gate_drain_unauthorized'");
+has('AB4 在途计数与并发闸门分离', 'let gateInflight = 0;');
+has('AB5 排空期快速 503 + retry-after', "type: 'gate_draining'");
+has('AB6 drain 上限可配', "num('GATE_DRAIN_MAX_MS', 15000");
+has('AB7 drain 后写快照并退出', 'try { writeSnapshot(); } catch {}');
+hasIn(cliLines, 'AB8 ocg 有 stop 子命令', "case 'stop': return cmdStop();");
+hasIn(cliLines, 'AB9 ocg 有 restart 子命令', "case 'restart': return cmdRestart();");
+hasIn(cliLines, 'AB10 ocg 调 drain 端点', 'gate/admin/drain');
+hasIn(cliLines, 'AB11 stop.flag 与监护一致', "const STOP_FLAG = path.join(ROOT, 'stop.flag');");
+hasIn(cliLines, 'AB12 start 会清除 stop.flag', 'fs.unlinkSync(STOP_FLAG)');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

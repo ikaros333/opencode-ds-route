@@ -52,6 +52,8 @@ const rest = argv[0] && !argv[0].startsWith('-') ? argv.slice(1) : argv;
 const PORT = Number(process.env.GATE_PORT || 8787);
 const BASE = `http://127.0.0.1:${PORT}`;
 const TASK_NAME = 'OpenCodeDS Route Gate';
+// 与 bin/ocg-supervise.mjs 的 STOP_FLAG 必须一致：存在即不重启。
+const STOP_FLAG = path.join(ROOT, 'stop.flag');
 
 const C = { ok: '\x1b[32m', bad: '\x1b[31m', warn: '\x1b[33m', dim: '\x1b[2m', off: '\x1b[0m' };
 const line = (mark, label, detail = '') => {
@@ -150,7 +152,60 @@ async function promptKey() {
 }
 
 // ---------------- 命令实现 ----------------
+/**
+ * 2026-10-30：优雅停止（drain）——解决「重启时在途请求被 RST」。
+ * Windows 没有可用 SIGTERM：Stop-Process / taskkill /F 都是强杀，客户端只会看到 Connection error。
+ * 因此走门控的 /gate/admin/drain 端点：停接新连接 → 等在途请求收尾（≤5s）→ 退出，由监护进程拉起。
+ */
+async function postDrain(timeoutMs = 8000) {
+  const token = process.env.GATE_TOKEN || process.env.GATE_OBS_TOKEN || '';
+  if (!token) die('未配置 GATE_TOKEN / GATE_OBS_TOKEN，drain 端点默认禁用（安全考虑）。');
+  try {
+    const r = await fetch(`${BASE}/gate/admin/drain`, {
+      method: 'POST', headers: { 'x-gate-token': token },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await r.text();
+    if (!r.ok) die(`drain 被拒（${r.status}）：${body.slice(0, 200)}`);
+    try { return JSON.parse(body); } catch { return { ok: true }; }
+  } catch (e) {
+    die(`drain 请求失败：${e.message}（门控没在跑？）`);
+  }
+}
+async function waitDown(maxMs = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) { if (!(await health(1200))) return Date.now() - t0; await new Promise(r => setTimeout(r, 200)); }
+  return -1;
+}
+async function waitUp(maxMs = 30000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) { const h = await health(1500); if (h?.ok) return Date.now() - t0; await new Promise(r => setTimeout(r, 250)); }
+  return -1;
+}
+async function cmdStop() {
+  const info = await postDrain();
+  console.log(`[ocg] drain 已受理（在途请求 ${info.inflight ?? '?'} 个），等待门控退出…`);
+  try { fs.writeFileSync(STOP_FLAG, new Date().toISOString() + '\n'); } catch {}
+  const down = await waitDown();
+  if (down < 0) die('门控在 20 秒内没有退出，请检查 gate/logs');
+  console.log(`${C.ok}已停止${C.off}（${down}ms）。监护进程看到 stop.flag，不会再拉起。`);
+  console.log(`${C.dim}恢复：ocg start（会自动删除 stop.flag）${C.off}`);
+}
+async function cmdRestart() {
+  const before = await health(1500);
+  if (!before) die(`门控没在跑（${BASE}/gate/health 无响应）。直接 ocg start 即可。`);
+  const info = await postDrain();
+  console.log(`[ocg] drain 已受理（pid=${before.pid}，在途请求 ${info.inflight ?? '?'} 个）`);
+  const down = await waitDown();
+  if (down < 0) die('门控在 20 秒内没有退出，请检查 gate/logs');
+  const up = await waitUp();
+  if (up < 0) die('门控已退出但 30 秒内没起来 —— 检查计划任务/监护进程：ocg doctor');
+  const after = await health(2000);
+  console.log(`${C.ok}已重启${C.off}  pid ${before.pid} → ${after?.pid ?? '?'}  中断 ${down + up}ms（其中等待新实例 ${up}ms）`);
+  if (down + up > 3000) console.log(`${C.warn}中断超过 3 秒：客户端单次重试（约 800ms）可能落不进来，建议把 dsh retryPolicy.maxRetries 提到 2${C.off}`);
+}
 async function cmdStart() {
+  try { if (fs.existsSync(STOP_FLAG)) { fs.unlinkSync(STOP_FLAG); console.log('[ocg] 已清除 stop.flag'); } } catch {}
   if (!process.env.OPENCODE_GO_API_KEY) await promptKey();
   const h = await health(800);
   if (h?.ok) die(`端口 ${PORT} 上已经有一个门控在跑（/gate/health ok=true）。先结束它再启动（ocg doctor 可查 PID），换端口请设 GATE_PORT。`);
@@ -544,6 +599,8 @@ async function cmdHelp() {
     '  ocg setup dsh [--apply]  打印 dsh 配置片段',
     '  ocg probe [--lite]   跑一次官方性探针',
     '  ocg check            源码自检（273 条断言，不需要 key）',
+    '  ocg stop             优雅停止（drain 在途请求后退出；写 stop.flag 阻止监护拉起）',
+    '  ocg restart          优雅重启（drain → 等退出 → 等新实例 health=200，打印中断时长）',
     '  ocg health [--json]  读取 /gate/health',
     '',
     '环境变量：OPENCODE_GO_API_KEY（必填）、GATE_PORT（默认 8787）、GATE_TOKEN（可选本地鉴权）',
@@ -555,6 +612,8 @@ async function cmdHelp() {
 async function main() {
   switch (cmd) {
     case 'start': return cmdStart();
+    case 'stop': return cmdStop();
+    case 'restart': return cmdRestart();
     case 'probe': {
       if (!process.env.OPENCODE_GO_API_KEY) await promptKey();
       process.env.OCG_ROOT ||= ROOT;

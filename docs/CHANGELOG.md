@@ -1,3 +1,47 @@
+## v0.1.5 — 2026-10-31
+
+### 优雅停止（drain）+ `ocg stop` / `ocg restart`
+
+**问题**（2026-10-30 17:07 实测丢请求）：`Stop-Process -Force` 强杀门控 → 在途连接被 RST →
+客户端只看到 `Connection error / Terminated`；客户端 `retryPolicy.maxRetries=1`、退避 800ms，
+落不到新实例起来的窗口里，于是整轮失败。**Windows 上 `SIGTERM` 不成立**（Node 映射为强制终止），
+信号式 drain 不可行。
+
+**方案**：门控新增 `POST /gate/admin/drain`（需 `GATE_TOKEN` 或 `GATE_OBS_TOKEN`；
+两者都没配则 403 禁用，防止本机任意进程停门控）：
+
+1. `server.close()` 停接新连接（顺带 `closeIdleConnections`）；
+2. 等在途响应写完（`gateInflight` 计数，上限 `GATE_DRAIN_MAX_MS`，默认 15s）；
+3. 写快照 → `exit(0)`；监护进程 1.5s 内拉起。
+
+排空期间到达的新请求快速返回 `503 gate_draining` + `retry-after: 2`，让客户端重试落到新实例。
+
+配套 CLI：
+- `ocg restart`：drain → 等退出 → 等新实例 health=200，打印中断时长；>3s 时提示提高 `maxRetries`；
+- `ocg stop`：drain + 写 `stop.flag`（与 `ocg-supervise.mjs` 的 `STOP_FLAG` 同路径），监护不再拉起；
+- `ocg start`：自动清除 `stop.flag`。
+
+实测（真实上游，在途请求 1 个）：**中断 258ms，在途请求正常 200 完成**。
+
+### 修复：测试门控污染生产台账
+
+`gate/test-coverage.mjs` 启动的子门控此前不设 `GATE_LOG_FILE`，所有 `STARTUP_SELFTEST`、
+`FP_MISMATCH`、`PASS_BY_PROOF` 都写进了生产的 `gate/logs/gate.jsonl` —— 历史累计 **248 条
+`STARTUP_SELFTEST`、240 个不同 pid**，导致基于台账的日常统计（我给你的那些数字）不可信。
+现在测试实例写 `gate/logs/cov-<port>.jsonl`。
+
+### 客户端重试（P1，非仓库改动）
+
+两台 profile（web / desktop）的 `retryPolicy.maxRetries` 由 `1` 提到 `2`
+（重试点 ≈0.8s / 4.8s，覆盖约 5 秒的中断窗口）。备份：`cordis.patch.yml.bak-retry2-<时间戳>`。
+**需重启 dsh 生效。**
+
+### 测试
+
+```
+verify-patch  344 / 0   （+12 条 AB 段断言）
+test-coverage  90 / 0   （+6 条 G17：drain 禁用/未授权/受理/在途不丢/进程退出）
+```
 ## v0.1.4 — 2026-10-30
 
 ### 安全加固（发布卫生 + 本机攻击面）

@@ -197,6 +197,10 @@ let lastShape = null;      // { at, verdict, idShape, detail }
 let implVector = '';       // 例如 '422,422,200,503,503'
 // 2026-10-29：指纹缺失项分布（health 用，回答"最常缺哪一项"）
 const fpMissing = new Map();
+// 2026-10-30：优雅停止状态（gateInflight 与并发闸门的 inflight 是两回事：
+// 后者在上游响应头返回时就释放，流式响应体还在写时它已经是 0，不能用来判「有没有在途响应」）
+let draining = false;
+let gateInflight = 0;
 
 // 客户端是否曾把真 key 送到本机端口（R1 的可观测信号：health 暴露，doctor 也会查配置）
 const clientSentRealKey = { flag: false };
@@ -371,6 +375,10 @@ const TOTAL_BUDGET_MS = num('GATE_TOTAL_BUDGET_MS', 90000, { min: 5000, max: 600
 // 流式无法在发送前判定（事件家族要等流结束），因此流式一律只记录 + 告警。
 const FP_POLICY = (process.env.GATE_FP_POLICY || 'retry').toLowerCase();
 const FP_RETRIES = num('GATE_FP_RETRIES', 2, { min: 0, max: 5 });
+// 2026-10-30：优雅停止（drain）的最长等待，以及当前在途请求计数。
+// 15s：只有真的还有在途请求时才会等；空闲时 drain 立即完成，所以放大上限几乎不增加重启耗时。
+// 超过 15s 强制退出，避免升级卡死（实测 p99 单请求 54s，但那种请求本来就该被客户端重试）。
+const DRAIN_MAX_MS = num('GATE_DRAIN_MAX_MS', 15000, { min: 500, max: 120000 });
 // 单个探针的超时；必须远小于总预算，否则上游 hang 时探针会把预算吃光
 const PROBE_TIMEOUT_MS = num('GATE_PROBE_TIMEOUT_MS', 5000, { min: 500, max: 60000 });
 // ★ 探针「总时长」上限（覆盖 DNS/连接/TLS/滴流）。实测 2026-10-22 上游慢时 m1=3919ms、m8=3452ms，
@@ -2211,6 +2219,54 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ error: { type: 'gate_bad_host', message: '只接受指向 127.0.0.1 / localhost 的请求（Host 头不符）。', request_id: hid } }));
     }
   }
+  // ★ 2026-10-30：优雅停止端点（Windows 没有可用的 SIGTERM，信号式 drain 不可行）。
+  // 为什么需要它：`Stop-Process -Force` / `taskkill /F` 会直接 RST 在途连接，
+  // 客户端只看到一个 "Connection error / Terminated"，而 dsh 的 retryPolicy 只重试 1 次（800ms），
+  // 落不到新实例起来的窗口里 —— 2026-10-30 17:07 那次就是这么丢的请求。
+  // 行为：停接新连接 → 等在途请求结束（≤5s）→ 写快照 → exit(0)；监护进程 1.5s 后拉起。
+  // 鉴权：必须匹配 GATE_TOKEN 或 GATE_OBS_TOKEN；两者都没配 → 403（禁用，防本机任意进程停门控）。
+  if (req.method === 'POST' && String(req.url || '').split('?')[0] === '/gate/admin/drain') {
+    const authed = (GATE_TOKEN && tokenOk(req.headers['x-gate-token'], GATE_TOKEN))
+      || (OBS_TOKEN && tokenOk(req.headers['x-gate-token'], OBS_TOKEN));
+    if (!GATE_TOKEN && !OBS_TOKEN) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { type: 'gate_drain_disabled',
+        message: '未配置 GATE_TOKEN / GATE_OBS_TOKEN，drain 端点出于安全默认禁用。' } }));
+    }
+    if (!authed) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { type: 'gate_drain_unauthorized',
+        message: 'drain 需要 x-gate-token（GATE_TOKEN 或 GATE_OBS_TOKEN）。' } }));
+    }
+    draining = true;
+    const inflightAtAsk = gateInflight;
+    log({ ts: new Date().toISOString(), result: 'DRAIN_REQUESTED', inflight: inflightAtAsk });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, draining: true, inflight: inflightAtAsk }));
+    try {
+      server.close();                                  // 停接新连接（已有的 keep-alive 也收尾）
+      try { server.closeIdleConnections?.(); } catch {}
+    } catch {}
+    const deadline = Date.now() + DRAIN_MAX_MS;
+    const wait = setInterval(() => {
+      if (gateInflight <= 0 || Date.now() >= deadline) {
+        clearInterval(wait);
+        log({ ts: new Date().toISOString(), result: 'DRAIN_DONE',
+              inflight: gateInflight, ms: DRAIN_MAX_MS - Math.max(0, deadline - Date.now()) });
+        try { writeSnapshot(); } catch {}
+        process.exit(0);
+      }
+    }, 100);
+    return;
+  }
+  // 排空期间的新请求：快速 503 + retry-after，让客户端重试落到新实例上（而不是干等）
+  if (draining && isProxy) {
+    res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '2',
+      'x-gate-result': 'blocked', 'x-gate-reason': 'draining' });
+    return res.end(JSON.stringify({ error: { type: 'gate_draining',
+      message: '门控正在优雅停止（升级/重启），请 2 秒后重试；在途请求会正常完成。' } }));
+  }
+  if (isProxy) { gateInflight++; res.on('close', () => { gateInflight = Math.max(0, gateInflight - 1); }); }
   // ★ 2026-10-26（R1）：客户端把**真 key**递过来了 —— 说明它还在用 OPENCODE_GO_API_KEY 直连门控。
   // 不拒绝（兼容老配置），但记一次：这把 key 本来不必经过任何 socket（门控只用自己的环境变量）。
   // 风险背景：同机其它账户可以先抢占 8787，把 dsh 发来的明文 key 收走；GATE_TOKEN 挡不住这个
@@ -2326,6 +2382,7 @@ async function handle(req, res) {
       egressHost: `${HOST}:${HOST_PORT}`,
       tokenRequired: !!GATE_TOKEN,
       obsTokenRequired: !!OBS_TOKEN,
+      draining, inflight: gateInflight, drainMaxMs: DRAIN_MAX_MS,
       // R1 可观测：客户端是否曾把真 key 送到本机端口（true = 配置该改成占位 key）
       clientKeyFromEnv: clientSentRealKey.flag,
       baselineObservedAt: OBSERVED_AT,

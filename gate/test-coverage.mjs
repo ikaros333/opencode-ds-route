@@ -129,6 +129,8 @@ const mock = http.createServer((req, res) => {
     if (probeFail && isProbe) { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"probe":"fail"}'); }
 
     if (mode === 'hang') { res.writeHead(200, { 'content-type': 'application/json' }); return; }   // 永不响应
+    // 2026-10-30：慢响应，用于验证 drain 不会切断在途请求
+    if (mode === 'slow') { return setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(fullBody(UUID4))); }, 1200); }
     if (mode === 'third') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ id: HEX32 })); }
     if (mode === 'noid') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ object: 'response' })); }
     if (mode === 'empty') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(''); }
@@ -169,7 +171,10 @@ async function startGate(port, env = {}) {
     env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: 'test-key', GATE_PORT: String(port),
            GATE_HOST: '127.0.0.1', GATE_HOST_PORT: String(MP), GATE_HOST_SCHEME: 'http',
            GATE_REFRESH_MS: '0', GATE_PRECHECK_TTL_MS: '0',   // 测试要每请求实测，不吃生产 TTL
-           GATE_SNAPSHOT: path.join(import.meta.dirname, 'logs', `cov-${port}.json`), ...env },
+           GATE_SNAPSHOT: path.join(import.meta.dirname, 'logs', `cov-${port}.json`),
+           // 2026-10-30：测试门控必须写自己的台账，否则会把 STARTUP_SELFTEST/FP_MISMATCH
+           // 之类记录混进生产 gate/logs/gate.jsonl，污染日常统计与告警复盘。
+           GATE_LOG_FILE: path.join(import.meta.dirname, 'logs', `cov-${port}.jsonl`), ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -290,7 +295,8 @@ try {
   console.log('\n=== G5 缺 KEY 时拒绝启动 ===');
   {
     const child = spawn(process.execPath, [GATE], {
-      env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4) },
+      env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4),
+             GATE_LOG_FILE: path.join(import.meta.dirname, 'logs', 'cov-missing-key.jsonl') },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let err = '';
@@ -538,6 +544,50 @@ try {
       headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
     check('G16 代理端点不受观测 token 影响', px.status !== 401, `status=${px.status}`);
     g3.child.kill('SIGKILL');
+  }
+  // ★ 2026-10-30：优雅停止（drain）——验证「重启不丢在途请求」
+  // 背景：Stop-Process -Force 会 RST 在途连接，客户端只看到 Connection error；
+  //       dsh 的重试（800ms/1 次）落不到新实例窗口里。drain 用 server.close + 等在途收尾解决。
+  console.log('\n=== G17 优雅停止（drain）===');
+  {
+    const TOK = 'drain-test-token';
+    // 先确认：没有配 token 时 drain 必须禁用（防本机任意进程停门控）
+    const gNo = await startGate(P0 + 14, {});
+    let upNo = false;
+    for (let i = 0; i < 40 && !upNo; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 14}/gate/health`); if (r.ok) upNo = true; } catch {} }
+    const dis = await fetch(`http://127.0.0.1:${P0 + 14}/gate/admin/drain`, { method: 'POST' });
+    check('G17 未配 token → drain 禁用（403）', dis.status === 403, `status=${dis.status}`);
+    gNo.child.kill('SIGKILL');
+    await sleep(300);
+
+    await fetch(`http://127.0.0.1:${MP}/mode/slow`);
+    const g = await startGate(P0 + 14, { GATE_TOKEN: TOK });
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 14}/gate/health`, { headers: { 'x-gate-token': TOK } }); if (r.ok) up = true; } catch {} }
+    check('G17 实例启动', up, up ? 'ok' : g.stderr().slice(0, 120));
+
+    const bad = await fetch(`http://127.0.0.1:${P0 + 14}/gate/admin/drain`, { method: 'POST', headers: { 'x-gate-token': 'wrong' } });
+    check('G17 错误 token → 403', bad.status === 403, `status=${bad.status}`);
+
+    // 在途请求（mock 延迟 1200ms）+ 300ms 后触发 drain
+    const flight = fetch(`http://127.0.0.1:${P0 + 14}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-gate-token': TOK },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }),
+    });
+    await sleep(300);
+    const dr = await fetch(`http://127.0.0.1:${P0 + 14}/gate/admin/drain`, { method: 'POST', headers: { 'x-gate-token': TOK } });
+    check('G17 drain 受理 200', dr.status === 200, `status=${dr.status}`);
+    const fr = await flight;
+    const fj = await fr.json().catch(() => ({}));
+    check('G17 在途请求未被切断（200 + 有 id）', fr.status === 200 && !!fj.id, `status=${fr.status} id=${(fj.id || '').slice(0, 8)}`);
+
+    // drain 之后进程应自行退出
+    const exited = await Promise.race([
+      new Promise(r => g.child.on('exit', c => r(c))),
+      sleep(6000).then(() => 'timeout'),
+    ]);
+    check('G17 drain 后进程退出', exited !== 'timeout', `exit=${exited}`);
+    try { g.child.kill('SIGKILL'); } catch {}
   }
 } finally {
   stopAll();

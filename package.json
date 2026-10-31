@@ -1,6 +1,6 @@
 {
   "name": "opencode-ds-route",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Fail-closed local gate in front of OpenCode Go: only delivers a response when it can be proven to come from the official DeepSeek backend. Zero dependencies.",
   "keywords": [
     "deepseek",
