@@ -19,7 +19,7 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 > **本项目不在 npm 发布。**`package.json` 是 `private: true`，`opencode-ds-route` 这个包名在 npm 上没有对应本项目。
 > 任何 `npm i opencode-ds-route` 装到的都是**别人上传的包**，与这里无关。请只从
 > [Releases](https://github.com/ikaros333/opencode-ds-route/releases) 或 `git clone` 获取。
-`v0.1.5` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.6` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
 它不改变 OpenCode 的路由，只判断"这次响应是不是官方的"。
@@ -55,15 +55,15 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.2](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.5) 下载
-`opencode-ds-route-v0.1.5.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.2](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.6) 下载
+`opencode-ds-route-v0.1.6.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.5.zip -Algorithm SHA256
+Get-FileHash .\opencode-ds-route-v0.1.6.zip -Algorithm SHA256
 # 与 Release 附件里的 SHA256SUMS.txt 对照，必须完全一致
 ```
 

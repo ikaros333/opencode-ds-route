@@ -569,6 +569,26 @@ try {
     const bad = await fetch(`http://127.0.0.1:${P0 + 14}/gate/admin/drain`, { method: 'POST', headers: { 'x-gate-token': 'wrong' } });
     check('G17 错误 token → 403', bad.status === 403, `status=${bad.status}`);
 
+    // 2026-10-31：只配 GATE_OBS_TOKEN（只读观测凭据）时 drain 必须仍禁用
+    // —— 防止「读权限」被提权成「停门控」的拒绝服务能力。
+    {
+      const gObs = await startGate(P0 + 15, { GATE_TOKEN: '', GATE_OBS_TOKEN: 'obs-only-token' });
+      let upObs = false;
+      for (let i = 0; i < 40 && !upObs; i++) {
+        await sleep(150);
+        try {
+          const r = await fetch(`http://127.0.0.1:${P0 + 15}/gate/health`, { headers: { 'x-gate-token': 'obs-only-token' } });
+          if (r.ok) upObs = true;
+        } catch {}
+      }
+      check('G17 仅 OBS token 的实例启动', upObs, upObs ? 'ok' : gObs.stderr().slice(0, 120));
+      const obsDrain = await fetch(`http://127.0.0.1:${P0 + 15}/gate/admin/drain`,
+        { method: 'POST', headers: { 'x-gate-token': 'obs-only-token' } });
+      check('G17 只配 OBS token → drain 仍禁用（403）', obsDrain.status === 403, `status=${obsDrain.status}`);
+      try { gObs.child.kill('SIGKILL'); } catch {}
+      await sleep(300);
+    }
+
     // 在途请求（mock 延迟 1200ms）+ 300ms 后触发 drain
     const flight = fetch(`http://127.0.0.1:${P0 + 14}/v1/responses`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-gate-token': TOK },

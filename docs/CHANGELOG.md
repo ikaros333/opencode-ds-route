@@ -1,3 +1,37 @@
+## v0.1.6 — 2026-10-31
+
+### 安全修正：`/gate/admin/drain` 的最小权限（v0.1.5 引入的缺陷）
+
+自查发现：v0.1.5 的 drain 端点同时接受 `GATE_TOKEN` **和** `GATE_OBS_TOKEN`。
+`GATE_OBS_TOKEN` 的定位是**只读观测凭据**（脚本、面板可能共享），授予它停门控的能力
+等于把「读权限」提权成「拒绝服务权限」。
+
+收紧为**只认 `GATE_TOKEN`**：
+- 未配置 `GATE_TOKEN` → `403 gate_drain_disabled`（即使配了 `GATE_OBS_TOKEN` 也禁用）；
+- `ocg stop/restart` 同样只读 `GATE_TOKEN`，缺失时给出明确提示。
+
+### drain 端点防御实测（v0.1.6）
+
+| 场景 | 结果 |
+|---|---|
+| 无 token（模拟同机进程 / 网页表单） | **403** |
+| 错误 token | **403** |
+| 跨源 `Origin: https://evil.example`（无 token） | **403**，且无 `Access-Control-Allow-Origin` |
+| DNS rebinding 式 `Host: evil.example` | **421 gate_bad_host** |
+| `GET /gate/admin/drain` | **405** |
+| 门控存活 | ✅ |
+
+### 测试
+
+```
+verify-patch  345 / 0   （+1 条 AB2b：drain 只认 GATE_TOKEN）
+test-coverage  92 / 0   （+2 条 G17：仅 OBS token 时 drain 仍 403）
+```
+
+### 未做（与 v0.1.4 相同，仍是剩余两项治本工作）
+
+- Release 产物无签名（sha256 与 zip 同渠道）；
+- key/token 明文存于 `HKCU\Environment`。
 ## v0.1.5 — 2026-10-31
 
 ### 优雅停止（drain）+ `ocg stop` / `ocg restart`

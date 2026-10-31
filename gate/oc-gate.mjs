@@ -2226,17 +2226,18 @@ async function handle(req, res) {
   // 行为：停接新连接 → 等在途请求结束（≤5s）→ 写快照 → exit(0)；监护进程 1.5s 后拉起。
   // 鉴权：必须匹配 GATE_TOKEN 或 GATE_OBS_TOKEN；两者都没配 → 403（禁用，防本机任意进程停门控）。
   if (req.method === 'POST' && String(req.url || '').split('?')[0] === '/gate/admin/drain') {
-    const authed = (GATE_TOKEN && tokenOk(req.headers['x-gate-token'], GATE_TOKEN))
-      || (OBS_TOKEN && tokenOk(req.headers['x-gate-token'], OBS_TOKEN));
-    if (!GATE_TOKEN && !OBS_TOKEN) {
+    // ★ 2026-10-31 修正（自查发现的最小权限缺陷）：drain 只认 GATE_TOKEN。
+    // GATE_OBS_TOKEN 定位是「只读观测凭据」（脚本/面板可能共享），授予它停门控的能力
+    // 等于把读权限提权成拒绝服务权限 —— v0.1.5 一版曾同时接受两者，这里收紧。
+    if (!GATE_TOKEN) {
       res.writeHead(403, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { type: 'gate_drain_disabled',
-        message: '未配置 GATE_TOKEN / GATE_OBS_TOKEN，drain 端点出于安全默认禁用。' } }));
+        message: 'drain 仅在配置 GATE_TOKEN 时可用（GATE_OBS_TOKEN 是只读观测凭据，不能停门控）。' } }));
     }
-    if (!authed) {
+    if (!tokenOk(req.headers['x-gate-token'], GATE_TOKEN)) {
       res.writeHead(403, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { type: 'gate_drain_unauthorized',
-        message: 'drain 需要 x-gate-token（GATE_TOKEN 或 GATE_OBS_TOKEN）。' } }));
+        message: 'drain 需要 x-gate-token（必须匹配 GATE_TOKEN）。' } }));
     }
     draining = true;
     const inflightAtAsk = gateInflight;

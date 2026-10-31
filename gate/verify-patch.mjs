@@ -539,6 +539,7 @@ has('AA7 观测鉴权与代理鉴权解耦', 'OBS_TOKEN && String(req.url');
 console.log('\n=== AB. 优雅停止与重启 ===');
 has('AB1 drain 端点存在', "'/gate/admin/drain'");
 has('AB2 未配 token 时禁用（禁本机任意进程停门控）', "type: 'gate_drain_disabled'");
+has('AB2b drain 只认 GATE_TOKEN（OBS token 不得提权）', 'drain 只认 GATE_TOKEN');
 has('AB3 未授权分类可读', "type: 'gate_drain_unauthorized'");
 has('AB4 在途计数与并发闸门分离', 'let gateInflight = 0;');
 has('AB5 排空期快速 503 + retry-after', "type: 'gate_draining'");

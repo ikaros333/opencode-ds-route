@@ -158,8 +158,12 @@ async function promptKey() {
  * 因此走门控的 /gate/admin/drain 端点：停接新连接 → 等在途请求收尾（≤5s）→ 退出，由监护进程拉起。
  */
 async function postDrain(timeoutMs = 8000) {
-  const token = process.env.GATE_TOKEN || process.env.GATE_OBS_TOKEN || '';
-  if (!token) die('未配置 GATE_TOKEN / GATE_OBS_TOKEN，drain 端点默认禁用（安全考虑）。');
+  // 2026-10-31：drain 只认 GATE_TOKEN（GATE_OBS_TOKEN 是只读观测凭据，不得提权为停门控）
+  const token = process.env.GATE_TOKEN || '';
+  if (!token) {
+    die('未设置 GATE_TOKEN：drain/stop/restart 需要它；GATE_OBS_TOKEN 只能读观测端点。'
+      + '\n     设置：setx GATE_TOKEN "随机串"，然后重启门控一次。');
+  }
   try {
     const r = await fetch(`${BASE}/gate/admin/drain`, {
       method: 'POST', headers: { 'x-gate-token': token },
