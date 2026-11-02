@@ -617,6 +617,16 @@ has('AF25 模型族闸只认 official', "fam === 'deepseek-official'");
 has('AF26 health 分开暴露两闸策略', 'modelPolicy: MODEL_EVIDENCE_POLICY');
 hasIn(evLines, 'AF27 权重永远 unproven', "weights: 'unproven'");
 
+// ===== 2026-11-02：请求体上限与 big-body 观测 =====
+console.log('\n=== AG. 请求体上限 ===');
+has('AG28 big-body 阈值常量', "const BIG_BODY_BYTES = num('GATE_BIG_BODY_BYTES'");
+has('AG29 413 报错体带 actual_bytes', 'actual_bytes: bodySize');
+has('AG30 413 标记不可重试', "res.setHeader('x-gate-fatal', '1')");
+has('AG31 big-body 响应头', "res.setHeader('x-gate-big-body', '1')");
+has('AG32 大 body 台账', "result: 'BIG_BODY'");
+has('AG33 health 暴露 bodyLimit', 'bodyLimit: { maxBodyBytes: MAX_BODY');
+has('AG34 413 计数', 'metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

@@ -969,6 +969,39 @@ try {
       e3.health?.evidence?.modelFamily === 'deepseek-thirdparty' && e3.health?.evidence?.modelPolicy === 'label',
       `family=${e3.health?.evidence?.modelFamily} modelPolicy=${e3.health?.evidence?.modelPolicy}`);
   }
+  // ★ 2026-11-02：请求体上限（24 MiB 改造配套）
+  console.log('\n=== G23 请求体上限与 big-body 观测 ===');
+  {
+    const big = await startGate(P0 + 40, { GATE_MAX_BODY: '2621440', GATE_BIG_BODY_BYTES: '1048576' }); // 2.5MiB / 1MiB，便于测试
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 40}/gate/health`); if (r.ok) up = true; } catch {} }
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+
+    const send = (bytes) => fetch(`http://127.0.0.1:${P0 + 40}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, _pad: 'x'.repeat(bytes) }) }).then(async r => ({ status: r.status, h: r.headers, body: await r.text() }));
+
+    const under = await send(1024 * 1024);   // 1MiB + 开销 < 2.5MiB
+    check('G23 未超上限 → 200', under.status === 200, `status=${under.status}`);
+
+    const bigBody = await send(1536 * 1024); // >1MiB 阈值 → 应打 x-gate-big-body
+    check('G23 超过 big-body 阈值 → 打 x-gate-big-body 头', bigBody.h.get('x-gate-big-body') === '1',
+      `hdr=${bigBody.h.get('x-gate-big-body')}`);
+
+    const over = await send(3 * 1024 * 1024);
+    check('G23 超上限 → 413 且带 actual_bytes',
+      over.status === 413 && /actual_bytes/.test(over.body), `status=${over.status} body=${over.body.slice(0, 80)}`);
+    check('G23 413 带 x-gate-fatal（重试无意义）', over.h.get('x-gate-fatal') === '1', `hdr=${over.h.get('x-gate-fatal')}`);
+
+    const m = await met(P0 + 40);
+    check('G23 计数：bigBody ≥1 且 bodyTooLarge ≥1', (m.bigBody || 0) >= 1 && (m.bodyTooLarge || 0) >= 1,
+      `bigBody=${m.bigBody} bodyTooLarge=${m.bodyTooLarge}`);
+
+    const h = await fetch(`http://127.0.0.1:${P0 + 40}/gate/health`).then(r => r.json()).catch(() => null);
+    check('G23 health 暴露 bodyLimit', h?.bodyLimit?.maxBodyBytes === 2621440,
+      `maxBody=${h?.bodyLimit?.maxBodyBytes} peak=${h?.bodyLimit?.estPeakMemMB}MB`);
+    try { big.child.kill('SIGKILL'); } catch {}
+  }
 } finally {
   stopAll();
   mock.close();

@@ -289,3 +289,24 @@ GATE_MODEL_EVIDENCE_POLICY=label
 # 只放行官方提供（会让第三方通道 503）
 GATE_MODEL_EVIDENCE_POLICY=require
 ```
+
+## 请求体上限与大 body 观测（2026-11-03）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATE_MAX_BODY` | 16 MiB | 超过直接 413（fail-closed），报错体带 `actual_bytes`，响应头带 `x-gate-fatal: 1`（提示重试无意义） |
+| `GATE_BIG_BODY_BYTES` | 12 MiB | 超过即打 `x-gate-big-body: 1` + 台账 `BIG_BODY`，用于提前发现上下文膨胀 |
+| `GATE_UPSTREAM_TIMEOUT_MS` | 60 s | 单次上游超时 |
+| `GATE_TOTAL_BUDGET_MS` | 90 s | 单请求总预算 |
+| `GATE_ATTEMPT_HARD_CAP_MS` | 180 s | 单次尝试硬上限，**必须 > 上游超时**，否则会先被它掐断 |
+
+### 改动上限时必须四个一起动
+
+```powershell
+setx GATE_MAX_BODY 25165824            # 24 MiB
+setx GATE_UPSTREAM_TIMEOUT_MS 120000   # 120 s
+setx GATE_TOTAL_BUDGET_MS 150000       # 150 s
+setx GATE_ATTEMPT_HARD_CAP_MS 180000   # 保持 > 上游超时
+```
+
+> 注意：**计划任务/监护进程启动的门控不会继承当前终端的环境变量**。改完 `setx` 后需要重启监护进程（`ocg stop` → 重新拉起 supervise），否则 health 里 `bodyLimit.maxBodyBytes` 仍是旧值。

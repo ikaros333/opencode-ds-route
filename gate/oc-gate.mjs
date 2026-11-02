@@ -211,7 +211,7 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 2026-10-29：每响应指纹
   fpMismatch: 0, fpRetries: 0, fpBlocked: 0,
   // 2026-11-02：软判据（未知字段等）与熔断计数
-  fpSoft: 0, streamSoft: 0, breakerOpenCount: 0,
+  fpSoft: 0, streamSoft: 0, breakerOpenCount: 0, bigBody: 0, bodyTooLarge: 0,
   // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
   profiles: { official: 0, opencode: 0, unknown: 0 },
   cache: { samples: 0, hits: 0 } };
@@ -473,7 +473,9 @@ const RATE_LIMIT_MAX_WAIT_MS = num('GATE_RATE_LIMIT_MAX_WAIT_MS', 5000, { min: 0
 // UUID4 / UUID_ANY 来自 baseline.mjs（判据常量唯一来源），此处不再本地定义
 const PEEK_CAP = 96 * 1024;      // 流式：读到这么多还没 id 就放弃判定（SSE 的 id 在头部）
 const PEEK_HARD_CAP = 2 * 1024 * 1024; // 非流式：硬上限，防止异常大的响应吃内存
-const MAX_BODY = num('GATE_MAX_BODY', 16 * 1024 * 1024, { min: 1024, max: 512 * 1024 * 1024 }); // 单请求体上限 16MB（dsh 实测 <2MB，留足余量）
+const MAX_BODY = num('GATE_MAX_BODY', 16 * 1024 * 1024, { min: 1024, max: 512 * 1024 * 1024 });
+// 2026-11-02：大 body 观测阈值。撞 413 之前就能发现"上下文在膨胀"（实测 >12MB 请求中位 21.8s）
+const BIG_BODY_BYTES = num('GATE_BIG_BODY_BYTES', 12 * 1024 * 1024, { min: 0, max: 512 * 1024 * 1024 }); // 单请求体上限 16MB（dsh 实测 <2MB，留足余量）
 
 const LOG_DIR = path.join(import.meta.dirname, 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -2677,6 +2679,9 @@ async function handle(req, res) {
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };
       })(),
+      bodyLimit: { maxBodyBytes: MAX_BODY, bigBodyBytes: BIG_BODY_BYTES,
+        bigBodyCount: metrics.bigBody || 0, bodyTooLargeCount: metrics.bodyTooLarge || 0,
+        maxConcurrency: MAX_CONC, estPeakMemMB: Math.round(MAX_BODY * MAX_CONC / 1048576 * 2) },
       usageKeysRequired: USAGE_KEYS_REQUIRED,
       // ★ 2026-10-29：每响应指纹（提高拒答率的主闸）
       fingerprint: {
@@ -2819,7 +2824,15 @@ async function handle(req, res) {
   for await (const c of req) {
     bodySize += c.length;
     if (bodySize > MAX_BODY) {
-      return replyEarly(req, res, 413, { error: { type: 'gate_body_too_large', message: '请求体超过上限 ' + MAX_BODY + ' 字节' } });
+      // 2026-11-02：报错体带上实际字节，便于判断"超了一点"还是"超了一倍"；
+      // x-gate-fatal 告诉客户端重试无意义（dsh 侧 maxRetries=2，否则会白重试两轮）。
+      log({ ts: new Date().toISOString(), reqId: 'pre-parse', result: 'BODY_TOO_LARGE',
+            actualBytes: bodySize, limitBytes: MAX_BODY, proto: protoOf('/zen/go/v1' + (url.pathname || '').replace(/^\/v1/, '')) });
+      metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1;
+      res.setHeader('x-gate-fatal', '1');
+      return replyEarly(req, res, 413, { error: { type: 'gate_body_too_large',
+        message: '请求体 ' + bodySize + ' 字节超过上限 ' + MAX_BODY + ' 字节；已 fail-closed，重试无意义',
+        actual_bytes: bodySize, limit_bytes: MAX_BODY } });
     }
     chunks.push(c);
   }
@@ -2841,6 +2854,15 @@ async function handle(req, res) {
   }
   const requestedModel = String(body.model || '');
   metrics.requests++;
+
+  // 2026-11-02：大 body 观测（不改行为，只记录 + 打标）
+  if (BIG_BODY_BYTES > 0 && bodyBuf.length >= BIG_BODY_BYTES) {
+    metrics.bigBody = (metrics.bigBody || 0) + 1;
+    log({ ts: new Date().toISOString(), reqId: '', result: 'BIG_BODY', reqBytes: bodyBuf.length,
+          limitBytes: MAX_BODY, bigBodyBytes: BIG_BODY_BYTES, model: requestedModel,
+          items: Array.isArray(body.input) ? body.input.length : 0 });
+    try { res.setHeader('x-gate-big-body', '1'); } catch {}
+  }
 
   // 2026-11-02：正向证据链前置闸。仅在「策略 require + 声明期望 official」时生效——
   // 否则在第三方车道上等于自断服务（这一点在实现前已明确）。
