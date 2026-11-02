@@ -41,25 +41,62 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const UUID4 = '01234567-89ab-4cde-8f01-23456789abcd';
 const HEX32 = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+// 2026-11-01：item id 需带 UUID4 位（第12位=4，第16位∈89ab），供 P4 判据使用
+const UUID4HEX = '0123456789ab4cde8f0123456789abcd';
 
 /**
  * 2026-10-29：完整的 18 字段成功体（与 flash 车道实测形态一致）。
  * slim=true 时只给 8 个字段 → 用于验证「每响应指纹」的 FP_MISMATCH 分支。
  */
-function fullBody(id, slim = false) {
+function fullBody(id, variant = 'ok') {
   const usage = { cost: 0, input_tokens: 1, input_tokens_details: { cached_tokens: 0 },
                   opencode: {}, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 },
                   total_tokens: 2 };
-  const output = [{ id: 'msg_' + HEX32, type: 'message', role: 'assistant', status: 'completed',
+  const output = [{ id: 'msg_' + UUID4HEX, type: 'message', role: 'assistant', status: 'completed',
                     content: [{ type: 'output_text', text: 'ok', annotations: [], logprobs: null }] }];
-  if (slim) return { id, object: 'response', status: 'completed', incomplete_details: null,
-                     output, usage };
-  return {
+  if (variant === 'fpbad') return { id, object: 'response', status: 'completed', incomplete_details: null, output, usage };
+  const body = {
     created_at: 1793000000, error: null, id, incomplete_details: null, instructions: null,
     max_output_tokens: 8, metadata: {}, model: 'deepseek-v4.1-flash', object: 'response',
     output, parallel_tool_calls: true, reasoning: { effort: null, summary: null },
     status: 'completed', temperature: 1, tool_choice: 'auto', tools: [], top_p: 1, usage,
   };
+  if (variant === 'official') {
+    // 2026-11-02：官方 /v1/responses 实测形态（35 字段、裸 UUID4 id、usage 5 键）
+    const oid = '6736ec44-8321-4a99-869c-684707ad4b79';
+    return {
+      background: false, completed_at: 1793581734, content_filters: null, created_at: 1793581734,
+      error: null, frequency_penalty: 0, id: oid, incomplete_details: null, instructions: null,
+      max_output_tokens: 8, max_tool_calls: null, metadata: {}, model: 'deepseek-flash',
+      moderation: null, object: 'response',
+      output: [{ content: [], encrypted_content: null, id: '3025ef5f-d246-480a-8729-df670cbe4e86', status: 'completed', summary: [], type: 'reasoning' },
+               { content: [{ type: 'output_text', text: 'ok', annotations: [], logprobs: null }], id: '93c057bc-d5f8-4c0c-843c-757e5835231f', phase: null, role: 'assistant', status: 'completed', type: 'message' }],
+      parallel_tool_calls: true, presence_penalty: 0, previous_response_id: null, prompt_cache_key: null,
+      prompt_cache_retention: null, reasoning: { effort: 'none', summary: null }, safety_identifier: null,
+      service_tier: 'default', status: 'completed', store: false, temperature: 1, text: {},
+      tool_choice: 'auto', tools: [], top_logprobs: 0, top_p: 1, truncation: 'disabled',
+      usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1,
+               output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 },
+      user: null,
+    };
+  }
+  // 2026-11-01：v4 判据的针对性变种
+  if (variant === 'unknown') { delete body.temperature; delete body.usage.opencode; }  // 既不像官方也不像 opencode → unknown 剖面
+  if (variant === 'extra') body.service_tier = 'default';            // 未知字段 → 只 soft
+  if (variant === 'missing') delete body.temperature;                 // 缺必需字段 → hard
+  if (variant === 'badid') body.output[0].id = 'msg_' + 'ff'.repeat(16);   // 无 UUID4 位 → hard
+  if (variant === 'badbill') {                                        // 计费偏差 1% → hard
+    body.usage.opencode = { billing_source: 'go', list_cost: 0.0001, allowance: 0.00006,
+      tokens: { input: 1, output: 1, reasoning: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 } };
+  }
+  if (variant === 'okbill') {                                         // 正确计费 → 通过
+    // 响应体里的 model 是 deepseek-v4.1-flash → 单价为 flash 的 2 倍
+    const c = 2 * (1 * 1.5e-7 + 1 * 6.0e-7);
+    body.usage.opencode = { billing_source: 'go', list_cost: c, allowance: 0.6 * c,
+      tokens: { input: 1, output: 1, reasoning: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 } };
+  }
+  if (variant === 'badusage') body.usage.input_tokens_details = { cached_tokens: 0, extra_field: 1 }; // 未知明细键 → soft
+  return body;
 }
 
 // ---------- 可控假上游 ----------
@@ -132,6 +169,20 @@ const mock = http.createServer((req, res) => {
     // 2026-10-30：慢响应，用于验证 drain 不会切断在途请求
     if (mode === 'slow') { return setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(fullBody(UUID4))); }, 1200); }
     if (mode === 'third') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ id: HEX32 })); }
+    // 2026-11-01：流式 mock（验证「流式检查不喂断路器」与「流式不发 x-gate-fp」）
+    if (String(b).includes('"stream":true')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const sid = 'resp_0123456789ab4cde8f0123456789abcd';
+      const frame = (t, obj) => 'event: ' + t + '\ndata: ' + JSON.stringify(Object.assign({ type: t }, obj)) + '\n\n';
+      let seq = 0;
+      res.write(frame('response.created', { response: { id: sid, object: 'response', status: 'in_progress', created_at: 1, model: 'deepseek-v4.1-flash', output: [], usage: null }, sequence_number: seq++ }));
+      res.write(frame('response.output_item.added', { output_index: 0, item: { id: 'msg_' + UUID4HEX, type: 'message', role: 'assistant', status: 'completed', content: [] }, sequence_number: seq++ }));
+      if (mode !== 'streambad') {
+        res.write(frame('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'ok', sequence_number: seq++ }));
+        res.write(frame('response.completed', { response: { id: sid, object: 'response', status: 'completed', created_at: 1, model: 'deepseek-v4.1-flash', output: [{ id: 'msg_' + UUID4HEX, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok', annotations: [], logprobs: null }] }], usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2, cost: 0, opencode: {} } }, sequence_number: seq++ }));
+      }
+      return res.end();
+    }
     if (mode === 'noid') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ object: 'response' })); }
     if (mode === 'empty') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(''); }
     // 2026-10-27：结构闸的两类被测形态
@@ -159,7 +210,7 @@ const mock = http.createServer((req, res) => {
     // 2026-10-27：默认成功体必须带 message + usage 七键 —— 结构闸（deliver 前）会检查，
     // 否则「只有 id 的假成功体」会被判 gate_structure_bad（这正是新闸门的预期行为）。
     // 2026-10-29：再补齐「每响应指纹」要求的 18 个顶层字段，否则会被判 FP 不一致并触发重发。
-    res.end(JSON.stringify(fullBody(UUID4, mode === 'fpbad')));
+    res.end(JSON.stringify(fullBody(UUID4, mode)));
   });
 });
 await new Promise(r => mock.listen(MP, '127.0.0.1', r));
@@ -513,7 +564,7 @@ try {
     check('G14 block 模式下缺字段 → 503', r3.status === 503, `status=${r3.status}`);
     check('G14 归类 gate_response_fingerprint', r3.j?.error?.type === 'gate_response_fingerprint',
       `type=${r3.j?.error?.type}`);
-    check('G14 报错体带缺失项', Array.isArray(r3.j?.error?.missing) && r3.j.error.missing.includes('keys'),
+    check('G14 报错体带缺失项', Array.isArray(r3.j?.error?.missing) && r3.j.error.missing.some(x => x.startsWith('keys')),
       `missing=${JSON.stringify(r3.j?.error?.missing)}`);
     g2.child.kill('SIGKILL');
   }
@@ -608,6 +659,315 @@ try {
     ]);
     check('G17 drain 后进程退出', exited !== 'timeout', `exit=${exited}`);
     try { g.child.kill('SIGKILL'); } catch {}
+  }
+  // ★ 2026-11-01：v4 判据（hard/soft 分离 + 断路器）
+  console.log('\n=== G18 v4 判据：未知字段只告警 / 缺项必重发 / 计费 / 熔断 ===');
+  {
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const g = await startGate(P0 + 16, {});
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 16}/gate/health`); if (r.ok) up = true; } catch {} }
+    check('G18 实例启动', up, up ? 'ok' : g.stderr().slice(0, 120));
+
+    // 1) 未知字段 → 只 soft，不重发，仍 200/ok
+    await fetch(`http://127.0.0.1:${MP}/mode/extra`);
+    const r1 = await gate(P0 + 16);
+    check('G18 未知字段 → 200 且 fp=ok（不重发）', r1.status === 200 && r1.h.get('x-gate-fp') === 'ok',
+      `status=${r1.status} fp=${r1.h.get('x-gate-fp')}`);
+    let m = await met(P0 + 16);
+    check('G18 未知字段只记 soft，不计 mismatch', (m.fpSoft || 0) >= 1 && (m.fpMismatch || 0) === 0,
+      `soft=${m.fpSoft} mismatch=${m.fpMismatch}`);
+
+    // 2) 缺必需字段 → hard → 重发 → 仍缺 → degraded
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    const r2 = await gate(P0 + 16);
+    check('G18 缺必需字段 → 重发后 200 + degraded', r2.status === 200 && r2.h.get('x-gate-fp') === 'degraded',
+      `status=${r2.status} fp=${r2.h.get('x-gate-fp')}`);
+    m = await met(P0 + 16);
+    check('G18 缺必需字段计入 mismatch 与重发', (m.fpMismatch || 0) >= 1 && (m.fpRetries || 0) >= 1,
+      `mismatch=${m.fpMismatch} retries=${m.fpRetries}`);
+
+    // 3) item id 无 UUID4 位 → hard
+    await fetch(`http://127.0.0.1:${MP}/mode/badid`);
+    const before = (await met(P0 + 16)).fpMismatch || 0;
+    await gate(P0 + 16);
+    const after = (await met(P0 + 16)).fpMismatch || 0;
+    check('G18 非 UUID4 的 item id 被计入 mismatch', after > before, `${before} → ${after}`);
+
+    // 4) 计费偏差 1% → hard；正确计费 → 通过
+    await fetch(`http://127.0.0.1:${MP}/mode/badbill`);
+    // 2026-11-02 实测：单价随实例轮换而变动（同形态 01:0x 是 2×，04:1x 变 1×）
+    // → 计费类判据默认只告警（soft），不再当硬判据；需要严格执行时设 GATE_BILLING_POLICY=retry。
+    const mb1 = await met(P0 + 16);
+    await gate(P0 + 16);
+    const mb2 = await met(P0 + 16);
+    check('G18 计费偏差默认只告警（soft 增 / mismatch 不增）',
+      (mb2.fpSoft || 0) > (mb1.fpSoft || 0) && (mb2.fpMismatch || 0) === (mb1.fpMismatch || 0),
+      `soft ${mb1.fpSoft}->${mb2.fpSoft} mismatch ${mb1.fpMismatch}->${mb2.fpMismatch}`);
+    await fetch(`http://127.0.0.1:${MP}/mode/okbill`);
+    const okb = await gate(P0 + 16);
+    check('G18 正确计费 → fp=ok', okb.status === 200 && okb.h.get('x-gate-fp') === 'ok',
+      `status=${okb.status} fp=${okb.h.get('x-gate-fp')}`);
+
+    // 5) 断路器：alert 模式下连续失败只告警，不开 503
+    const g2 = await startGate(P0 + 17, { GATE_BREAKER_POLICY: 'alert', GATE_BREAKER_N: '3', GATE_BREAKER_MIN_SAMPLES: '3' });
+    let up2 = false;
+    for (let i = 0; i < 40 && !up2; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 17}/gate/health`); if (r.ok) up2 = true; } catch {} }
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    for (let i = 0; i < 4; i++) await gate(P0 + 17);
+    const h2 = await (await fetch(`http://127.0.0.1:${P0 + 17}/gate/health`)).json();
+    check('G18 断路器在 alert 模式下打开但请求仍 200',
+      h2?.fingerprint?.breaker?.json?.state === 'open' && (await gate(P0 + 17)).status === 200,
+      `state=${h2?.fingerprint?.breaker?.json?.state}`);
+
+    // 6) fp-reset 复位（需要 token）
+    const g3 = await startGate(P0 + 18, { GATE_TOKEN: 'tok-x', GATE_BREAKER_POLICY: 'block', GATE_BREAKER_N: '2', GATE_BREAKER_MIN_SAMPLES: '2' });
+    let up3 = false;
+    for (let i = 0; i < 40 && !up3; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 18}/gate/health`, { headers: { 'x-gate-token': 'tok-x' } }); if (r.ok) up3 = true; } catch {} }
+    for (let i = 0; i < 3; i++) await fetch(`http://127.0.0.1:${P0 + 18}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-gate-token': 'tok-x' },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+    const h3 = await (await fetch(`http://127.0.0.1:${P0 + 18}/gate/health`, { headers: { 'x-gate-token': 'tok-x' } })).json();
+    check('G18 block 模式断路器打开', h3?.fingerprint?.breaker?.json?.state === 'open', `state=${h3?.fingerprint?.breaker?.json?.state}`);
+    const blocked = await fetch(`http://127.0.0.1:${P0 + 18}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-gate-token': 'tok-x' },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+    check('G18 block 模式下熔断返回 503', blocked.status === 503, `status=${blocked.status}`);
+    const reset = await fetch(`http://127.0.0.1:${P0 + 18}/gate/admin/fp-reset`, { method: 'POST', headers: { 'x-gate-token': 'tok-x' } });
+    check('G18 fp-reset 复位成功', reset.status === 200, `status=${reset.status}`);
+    const h4 = await (await fetch(`http://127.0.0.1:${P0 + 18}/gate/health`, { headers: { 'x-gate-token': 'tok-x' } })).json();
+    check('G18 复位后状态 closed', h4?.fingerprint?.breaker?.json?.state === 'closed', `state=${h4?.fingerprint?.breaker?.json?.state}`);
+    try { g3.child.kill('SIGKILL'); } catch {}
+    g.child.kill('SIGKILL'); try { g2.child.kill('SIGKILL'); } catch {}
+  }
+  // ★ 2026-11-01（第二轮实测）：五条只会在运行时暴露的缺陷的回归用例
+  console.log('\n=== G19 流式/熔断/大包 回归 ===');
+  {
+    // 1) 流式响应不应发送 x-gate-fp（否则是伪 ok 信号）
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const g1 = await startGate(P0 + 19, { GATE_BREAKER_N: '3', GATE_BREAKER_MIN_SAMPLES: '3' });
+    let up1 = false;
+    for (let i = 0; i < 40 && !up1; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 19}/gate/health`); if (r.ok) up1 = true; } catch {} }
+    const sres = await fetch(`http://127.0.0.1:${P0 + 19}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, stream: true }) });
+    await sres.text();
+    check('G19 流式响应不带 x-gate-fp', sres.headers.get('x-gate-fp') === null, `fp=${sres.headers.get('x-gate-fp')}`);
+
+    // 2) 流式缺终止事件 → 只告警，不喂断路器
+    await fetch(`http://127.0.0.1:${MP}/mode/streambad`);
+    for (let i = 0; i < 6; i++) {
+      const r = await fetch(`http://127.0.0.1:${P0 + 19}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, stream: true }) });
+      await r.text();
+    }
+    const h1 = await (await fetch(`http://127.0.0.1:${P0 + 19}/gate/health`)).json();
+    // 2026-11-02：改为按模式隔离验证——流式坏流必须能被**流式**断路器看到，
+    // 但不得污染 json 断路器（否则单份状态会让熔断对真实流量失效或误伤非流式）。
+    check('G19 流式坏流只打流式断路器（json 仍 closed）',
+      h1?.fingerprint?.breaker?.stream?.state === 'open' && h1?.fingerprint?.breaker?.json?.state === 'closed',
+      `stream=${h1?.fingerprint?.breaker?.stream?.state}(${h1?.fingerprint?.breaker?.stream?.samples}) json=${h1?.fingerprint?.breaker?.json?.state}`);
+    check('G19 流式断路器计量流式样本', (h1?.fingerprint?.breaker?.stream?.samples || 0) >= 6,
+      `samples=${h1?.fingerprint?.breaker?.stream?.samples}`);
+
+    // 3) warn 模式：即使连续 hard 失败也不熔断、不 503
+    const g2 = await startGate(P0 + 20, { GATE_FP_POLICY: 'warn', GATE_BREAKER_POLICY: 'block', GATE_BREAKER_N: '2', GATE_BREAKER_MIN_SAMPLES: '2' });
+    let up2 = false;
+    for (let i = 0; i < 40 && !up2; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 20}/gate/health`); if (r.ok) up2 = true; } catch {} }
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    let last = null;
+    for (let i = 0; i < 5; i++) last = await gate(P0 + 20);
+    const h2 = await (await fetch(`http://127.0.0.1:${P0 + 20}/gate/health`)).json();
+    check('G19 warn 模式不熔断且请求仍 200', h2?.fingerprint?.breaker?.json?.state === 'closed' && last.status === 200,
+      `state=${h2?.fingerprint?.breaker?.json?.state} status=${last.status}`);
+
+    // 4) 大包（>1MB）指纹不符 → 不重发（served 只 +1）
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    const g3 = await startGate(P0 + 21, { GATE_FP_RETRY_MAX_BYTES: '1048576' });
+    let up3 = false;
+    for (let i = 0; i < 40 && !up3; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 21}/gate/health`); if (r.ok) up3 = true; } catch {} }
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    const bigInput = 'x'.repeat(1200000);
+    const br = await gate(P0 + 21, { model: 'deepseek-flash', input: bigInput, max_output_tokens: 8 });
+    // served 会把预检探针也算进去，所以用 fpRetries 断言"没有重发"才准确
+    const mm21 = await met(P0 + 21);
+    check('G19 大包指纹失败不重发（fpRetries=0）', br.status === 200 && (mm21.fpRetries || 0) === 0,
+      `status=${br.status} retries=${mm21.fpRetries} mismatch=${mm21.fpMismatch}`);
+
+    // 5) 半开恢复：block + 短窗口 → 打开后经过窗口，下一次请求被放行并复位
+    await fetch(`http://127.0.0.1:${MP}/mode/missing`);
+    const g4 = await startGate(P0 + 22, { GATE_BREAKER_POLICY: 'block', GATE_BREAKER_N: '2', GATE_BREAKER_MIN_SAMPLES: '2', GATE_BREAKER_WINDOW_MS: '1500' });
+    let up4 = false;
+    for (let i = 0; i < 40 && !up4; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 22}/gate/health`); if (r.ok) up4 = true; } catch {} }
+    for (let i = 0; i < 3; i++) await gate(P0 + 22);
+    const blockedNow = await gate(P0 + 22);
+    await sleep(1800);
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const after = await gate(P0 + 22);
+    check('G19 熔断后窗口到期放行并复位', blockedNow.status === 503 && after.status === 200, `blocked=${blockedNow.status} after=${after.status}`);
+
+    // 6) block 模式：流式熔断只拦流式，非流式不受影响（本轮缺陷的核心回归）
+    const g5 = await startGate(P0 + 23, { GATE_BREAKER_POLICY: 'block', GATE_BREAKER_N: '2', GATE_BREAKER_MIN_SAMPLES: '2' });
+    let up5 = false;
+    for (let i = 0; i < 40 && !up5; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 23}/gate/health`); if (r.ok) up5 = true; } catch {} }
+    await fetch(`http://127.0.0.1:${MP}/mode/streambad`);
+    for (let i = 0; i < 3; i++) {
+      const r = await fetch(`http://127.0.0.1:${P0 + 23}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, stream: true }) });
+      await r.text();
+    }
+    const streamBlocked = await fetch(`http://127.0.0.1:${P0 + 23}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, stream: true }) });
+    const blockedBody = await streamBlocked.text();
+    check('G19 流式熔断后流式请求 503', streamBlocked.status === 503 && blockedBody.includes('gate_stream_breaker_open'),
+      `status=${streamBlocked.status} type=${(blockedBody.match(/"type":"([^"]+)"/) || [])[1]}`);
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const jsonStill = await gate(P0 + 23);
+    check('G19 流式熔断不误伤非流式', jsonStill.status === 200, `status=${jsonStill.status}`);
+    try { g5.child.kill('SIGKILL'); } catch {}
+    for (const gg of [g1, g2, g3, g4]) { try { gg.child.kill('SIGKILL'); } catch {} }
+  }
+  // ★ 2026-11-02：双车道剖面（官方 / opencode）—— 用一条车道去卡另一条是最典型的误杀来源
+  console.log('\n=== G20 车道剖面自适配 ===');
+  {
+    const g = await startGate(P0 + 24, {});
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 24}/gate/health`); if (r.ok) up = true; } catch {} }
+    check('G20 实例启动', up, up ? 'ok' : '');
+
+    await fetch(`http://127.0.0.1:${MP}/mode/official`);
+    const ro = await gate(P0 + 24);
+    check('G20 官方形态 → fp=ok（不再因裸 UUID4 id 误判）', ro.status === 200 && ro.h.get('x-gate-fp') === 'ok',
+      `status=${ro.status} fp=${ro.h.get('x-gate-fp')}`);
+
+    await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+    const rc = await gate(P0 + 24);
+    check('G20 opencode 形态 → fp=ok', rc.status === 200 && rc.h.get('x-gate-fp') === 'ok',
+      `status=${rc.status} fp=${rc.h.get('x-gate-fp')}`);
+
+    await fetch(`http://127.0.0.1:${MP}/mode/unknown`);
+    const ru = await gate(P0 + 24);
+    const mu = await met(P0 + 24);
+    check('G20 未知形态 → 不拒（hard 降级）', ru.status === 200 && (mu.fpRetries || 0) === 0,
+      `status=${ru.status} retries=${mu.fpRetries}`);
+
+    const h = await (await fetch(`http://127.0.0.1:${P0 + 24}/gate/health`)).json();
+    check('G20 health 暴露剖面计数与缓存观测',
+      h?.fingerprint?.profiles?.official >= 1 && h?.fingerprint?.cache && typeof h.fingerprint.cache.samples === 'number',
+      `profiles=${JSON.stringify(h?.fingerprint?.profiles)} cache=${JSON.stringify(h?.fingerprint?.cache)}`);
+    try { g.child.kill('SIGKILL'); } catch {}
+  }
+  // ★ 2026-11-02：正向证据链（EV1–EV9）策略
+  console.log('\n=== G21 证据链策略（label / require）===');
+  {
+    const fs2 = await import('node:fs');
+    const path2 = await import('node:path');
+    const dir = path2.join(process.env.TEMP || '.', 'ocg-ev-' + Date.now());
+    fs2.mkdirSync(dir, { recursive: true });
+    const mk = (name, verdict, ageMs) => {
+      const f = path2.join(dir, name);
+      const at = new Date(Date.now() - ageMs).toISOString();
+      fs2.writeFileSync(f, JSON.stringify({ at, version: 1,
+        upstream: { host: 'mock', prefix: '' },
+        endpoint: { verdict, score: verdict === 'official' ? 6 : 1, max: 6, items: [] },
+        impl: { score: 0, max: 3, profile: 'compat', items: [] },
+        model: { claim: 'unproven' } }));
+      return f;
+    };
+    const officialFresh = mk('official.json', 'official', 1000);
+    const nonOfficial = mk('non-official.json', 'non-official', 1000);
+    const staleOfficial = mk('stale.json', 'official', 10 * 86400000);
+
+    const run = async (snapFile, env) => {
+      const port = P0 + 30 + Math.floor(Math.random() * 200);
+      const g = await startGate(port, env);
+      let up = false;
+      for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+      await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+      const body = await res.text();
+      const h = await fetch(`http://127.0.0.1:${port}/gate/health`).then(r => r.json()).catch(() => null);
+      try { g.child.kill('SIGKILL'); } catch {}
+      return { status: res.status, body, health: h };
+    };
+
+    const need = { GATE_EVIDENCE_POLICY: 'require', GATE_EVIDENCE_EXPECT: 'official' };
+
+    const a = await run(officialFresh, { ...need, GATE_EVIDENCE_FILE: officialFresh });
+    check('G21 require + 官方证据 → 200', a.status === 200, `status=${a.status}`);
+
+    const b = await run(nonOfficial, { ...need, GATE_EVIDENCE_FILE: nonOfficial });
+    check('G21 require + 非官方证据 → 503 gate_evidence_unmet',
+      b.status === 503 && b.body.includes('gate_evidence_unmet'), `status=${b.status}`);
+
+    const c2 = await run(staleOfficial, { ...need, GATE_EVIDENCE_FILE: staleOfficial });
+    check('G21 require + 过期证据 → 503', c2.status === 503, `status=${c2.status}`);
+
+    const d = await run(path2.join(dir, 'missing.json'), { ...need, GATE_EVIDENCE_FILE: path2.join(dir, 'missing.json') });
+    check('G21 require + 缺快照 → 503（fail-closed）', d.status === 503, `status=${d.status}`);
+
+    const e = await run(nonOfficial, { GATE_EVIDENCE_POLICY: 'label', GATE_EVIDENCE_FILE: nonOfficial });
+    check('G21 label + 非官方证据 → 仍 200', e.status === 200, `status=${e.status}`);
+    check('G21 health 暴露证据链', e.health?.evidence?.verdict === 'non-official',
+      `verdict=${e.health?.evidence?.verdict}`);
+  }
+  // ★ 2026-11-02：模型族闸（EV10/EV11）—— 判正放行 / 判否拒答
+  console.log('\n=== G22 模型族闸（deepseek-official vs thirdparty）===');
+  {
+    const fs3 = await import('node:fs');
+    const path3 = await import('node:path');
+    const dir3 = path3.join(process.env.TEMP || '.', 'ocg-fam-' + Date.now());
+    fs3.mkdirSync(dir3, { recursive: true });
+    const mk = (name, family, ageMs) => {
+      const f = path3.join(dir3, name);
+      const at = new Date(Date.now() - ageMs).toISOString();
+      fs3.writeFileSync(f, JSON.stringify({ at, version: 1,
+        upstream: { host: 'mock', prefix: '' },
+        endpoint: { verdict: 'non-official', score: 1, max: 6, items: [] },
+        impl: { score: 0, max: 2, profile: 'compat', items: [] },
+        model: { family, familyScore: family === 'deepseek-official' ? 2 : 1, familyMax: 2, claim: 'unproven', weights: 'unproven', items: [] } }));
+      return f;
+    };
+    const runFam = async (snapFile, env) => {
+      const port = P0 + 300 + Math.floor(Math.random() * 200);
+      const g = await startGate(port, { ...env, GATE_EVIDENCE_FILE: snapFile });
+      let up = false;
+      for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+      await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+      const body = await res.text();
+      const h = await fetch(`http://127.0.0.1:${port}/gate/health`).then(r => r.json()).catch(() => null);
+      try { g.child.kill('SIGKILL'); } catch {}
+      return { status: res.status, body, health: h };
+    };
+
+    const req = { GATE_MODEL_EVIDENCE_POLICY: 'require' };
+
+    const a = await runFam(mk('official.json', 'deepseek-official', 1000), { ...req });
+    check('G22 official 族 + require → 200', a.status === 200, `status=${a.status}`);
+
+    const b = await runFam(mk('thirdparty.json', 'deepseek-thirdparty', 1000), { ...req });
+    check('G22 thirdparty 族 + require → 503 gate_modelfamily_unmet',
+      b.status === 503 && b.body.includes('gate_modelfamily_unmet'), `status=${b.status}`);
+
+    const c3 = await runFam(mk('mismatch.json', 'mismatch', 1000), { ...req });
+    check('G22 mismatch 族 + require → 503', c3.status === 503, `status=${c3.status}`);
+
+    const d3 = await runFam(mk('stale.json', 'deepseek-official', 13 * 3600000), { ...req });
+    check('G22 过期快照 + require → 503', d3.status === 503, `status=${d3.status}`);
+
+    const e3 = await runFam(mk('tp-label.json', 'deepseek-thirdparty', 1000), { GATE_MODEL_EVIDENCE_POLICY: 'label' });
+    check('G22 thirdparty + label → 200（只标注）', e3.status === 200, `status=${e3.status}`);
+    check('G22 health 暴露 modelFamily 与 modelPolicy',
+      e3.health?.evidence?.modelFamily === 'deepseek-thirdparty' && e3.health?.evidence?.modelPolicy === 'label',
+      `family=${e3.health?.evidence?.modelFamily} modelPolicy=${e3.health?.evidence?.modelPolicy}`);
   }
 } finally {
   stopAll();

@@ -149,3 +149,94 @@ export const EVENT_TERMINAL = ['response.completed', 'response.incomplete'];
 
 /** logprob 判据阈值（已退役，chat 协议无判据被默认封禁） */
 export const P1_TOP1_MAX = -0.01;
+
+// ---------- 2026-11-01：缺陷类判据（全部经真实上游实测）----------
+// item id 必须 rs_/msg_/fc_ + 32hex 且带 UUID4 位（实测 12/12，22 次）
+export const ITEM_ID_UUID4 = /^(rs|msg|fc)_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$/i;
+// 各 item 类型的**必需键**（多出字段只告警，不算失败 —— 上游一周改过 3 次）
+export const ITEM_KEYS_REQUIRED = {
+  reasoning: ['id', 'summary', 'type'],
+  message: ['content', 'id', 'role', 'status', 'type'],
+  function_call: ['arguments', 'call_id', 'id', 'name', 'status', 'type'],
+};
+// usage 明细必需键（实测 12/12）
+export const USAGE_DETAILS_REQUIRED = { input: ['cached_tokens'], output: ['reasoning_tokens'] };
+// incomplete 合法原因（其它值只告警）
+export const INCOMPLETE_REASONS_KNOWN = new Set(['max_output_tokens']);
+// 计费恒等式（4 样本反解，Δ≤4e-19）：cost = in*1.5e-7 + out*6e-7 + cache_read*3e-9
+export const BILLING = { input: 1.5e-7, output: 6.0e-7, cacheRead: 3.0e-9, allowanceRatio: 0.6 };
+
+// ---------- 2026-11-02：按车道剖面区分（官方 / opencode 车道）----------
+// 实测（官方 api.deepseek.com/v1/responses）：
+//   35 个顶层字段、response.id 与 item.id 都是裸 UUID4、usage 只有 5 键（无 opencode 块）
+// 实测（opencode 车道）：
+//   18 个顶层字段、id 形如 rs_/msg_/fc_ + 32hex 且带 UUID4 位、usage 7 键（含 opencode 块）
+//
+// 结论：用一条车道的形状去卡另一条车道，是最典型的误杀来源。判据必须按剖面自适配。
+export const LANE_PROFILES = ['official', 'opencode', 'unknown'];
+
+export const ITEM_ID_VARIANTS = [
+  // opencode 车道
+  /^(rs|msg|fc)_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$/i,
+  // 官方：裸 UUID4
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+];
+
+// usage 必需键：按剖面
+export const USAGE_KEYS_BY_PROFILE = {
+  official: ['input_tokens', 'input_tokens_details', 'output_tokens', 'output_tokens_details', 'total_tokens'],
+  opencode: USAGE_KEYS_REQUIRED,
+};
+
+// 顶层字段已知集合：按剖面（多出字段只告警，不算失败）
+export const RESP_KEYS_BY_PROFILE = {
+  official: new Set(['background', 'completed_at', 'content_filters', 'created_at', 'error',
+    'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens',
+    'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output',
+    'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key',
+    'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status',
+    'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p',
+    'truncation', 'usage', 'user']),
+  opencode: RESP_KEYS_COMPAT,
+};
+
+// ---------- 2026-11-02（P0-4）：预检按车道剖面识别 serde 文案 ----------
+// 实测差异（同一个非法请求：max_output_tokens 传字符串 "abc"）：
+//   opencode 车道（Go 层，做过 responses→chat 字段映射）：
+//     "Failed to deserialize the JSON body into the target type: max_completion_tokens: invalid type: ..."
+//   官方 api.deepseek.com（Rust 层，字段名原样）：
+//     "Failed to deserialize the JSON body into the target type: max_output_tokens: invalid type: string "abc", expected u32 at line 1 column 66"
+// 结论：字段名是否被改写（max_output_tokens → max_completion_tokens）本身就是一条强判别特征。
+export const E_SERDE_TYPE_MSG_OFFICIAL =
+  /Failed to deserialize the JSON body into the target type:\s*max_output_tokens:\s*invalid type/i;
+
+/** 两条车道的预检期望集合：命中任意一条即 pass，并记录命中的家族 */
+export const SERDE_FAMILIES = [
+  { family: 'opencode-mapped', expect: E_SERDE_TYPE_MSG, extras: E_SERDE_TYPE_EXTRAS },
+  { family: 'official-rust',   expect: E_SERDE_TYPE_MSG_OFFICIAL, extras: E_SERDE_TYPE_EXTRAS },
+];
+
+// ---------- 2026-11-02：模型族证据（EV10 分词一致性 / EV11 官方校验器模板）----------
+// EV10：同一批 prompt 的 usage.input_tokens 若与官方逐条一致 → 同一分词器 → 同一模型族。
+//   基线由官方 api.deepseek.com（deepseek-flash）实测采集，字符类覆盖中/英/码/数字/空白/emoji/长文/重复/JSON。
+//   换模型（Qwen/Llama/自研）几乎必然改变分词 → 这条判据能排除"模型被换掉"。
+export const TOKENIZER_CORPUS = [
+  { id: 'cjk',    text: '这是一段用于分词器比对的纯中文文本，包含常见汉字与标点。', expect: 22 },
+  { id: 'en',     text: 'The quick brown fox jumps over the lazy dog, repeatedly and deliberately.', expect: 18 },
+  { id: 'mixed',  text: 'Hello 世界，this is 混排 test 123。', expect: 17 },
+  { id: 'code',   text: 'function f(a,b){return a.map(x=>x*b).filter(Boolean)}\n', expect: 21 },
+  { id: 'digit',  text: '1234567890 9876543210 31415926535897932384626', expect: 22 },
+  { id: 'space',  text: 'a          b\n\n\n\tc', expect: 9 },
+  { id: 'emoji',  text: '完成✅ 失败❌ 警告⚠️ 🚀🎯', expect: 19 },
+  { id: 'longZh', text: '背景资料：这是一段较长的中文文本，用于验证分词一致性。'.repeat(40), expect: 604 },
+  { id: 'repeat', text: 'x'.repeat(3000), expect: 379 },
+  { id: 'json',   text: '{"a":1,"b":[1,2,3],"c":{"d":"中文"}}', expect: 24 },
+];
+
+// EV11：官方校验器模板（逐字）。命中且带 UUID4 request_id → 请求确实到达了官方实现。
+export const OFFICIAL_ERR_TEMPLATES = [
+  { id: 'temperature', body: { temperature: 9 }, re: /Invalid temperature value, the valid range of temperature is \[0, 2\]/ },
+  { id: 'top_p',       body: { top_p: 2 },       re: /Invalid top_p value, the valid range of top_p is \(0, 1\.0\]/ },
+  { id: 'max_tokens',  body: { max_output_tokens: 393217 }, re: /Invalid max_tokens value, the valid range of max_tokens is \[1, 393216\]/ },
+];
+export const UUID4_REQUEST_ID = /request_id:\s*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;

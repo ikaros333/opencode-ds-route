@@ -229,3 +229,63 @@ git checkout <上一个可用版本> -- gate\oc-gate.mjs gate\verify-patch.mjs
 | 改了代码但行为没变 | `doctor` 看「门控归属」：`health.root` 指向另一个目录说明 8787 上跑的是**另一份安装**（同名计划任务被覆盖过） |
 | 第二个实例起来就没了、无日志 | 单实例锁：同端口第二个监护 exit 3，提示里带占用者 pid/root；锁文件 `supervise-<port>.lock`。要并存就换端口（`--port 8888`） |
 | 监护反复拉起、门控秒退 | 端口被占用：门控 exit 4 并打印占用者（会探测对端 `/gate/health`）。看 `supervise` 的 stderr；旧版会 15s 退避无限重启，新版直接停 |
+
+## 证据链（2026-11-02）
+
+正向证据链（EV1–EV9）用于回答「我连的是不是官方 API 端点」，与「判负」互补。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATE_EVIDENCE_POLICY` | `label` | `off` / `label`（只记录+漂移告警）/ `require`（未达成则 503） |
+| `GATE_EVIDENCE_EXPECT` | `any` | 本车道声明期望；只有设 `official` 时 `require` 才生效（否则等于自断服务） |
+| `GATE_EVIDENCE_FILE` | `gate/logs/lane-evidence.json` | 证据快照路径 |
+| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed |
+| `GATE_EVIDENCE_KEY_ENV` | 空 | 强制指定探针使用的 key 环境变量（默认按 host 自动选择） |
+
+生成/查看证据：
+
+```bash
+node bin/ocg.mjs audit-lane            # 只跑零成本探针（EV1–EV8）
+node bin/ocg.mjs audit-lane --gen      # 追加能力探针 EV9（会真实生成）
+node bin/ocg.mjs audit-lane --write    # 写快照供门控读取
+```
+
+判定口径：
+
+- **L1 端点身份（可证）**：EV1 余额端点 / EV2 FIM beta 引导 / EV3 温度范围 / EV4 top_p 范围 / EV5 证书 / EV6 ALPN。≥5/6 → `official`；≤2 → `non-official`；其余 `unknown`。
+- **L2 实现身份（高置信）**：EV7 响应形态（35 字段 + 裸 UUID4 + 5 键 usage）/ EV8 Rust serde 文案 / EV9 能力探针。
+- **L3 模型身份**：永远 `unproven`（同权重自部署不可区分）。
+
+## 模型族证据（2026-11-02）
+
+正向证据链的第三层：判断「服务你的是不是 DeepSeek 模型、且请求是否到达官方校验器」。
+与端点证据（EV1–EV6）互补——端点证明"连的是谁"，模型族证明"是不是 DS、经不经官方"。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATE_MODEL_EVIDENCE_POLICY` | `label` | `label` 只记录；`require` = `model.family` 必须为 `deepseek-official`，否则 503 `gate_modelfamily_unmet` |
+| `GATE_EVIDENCE_FILE` | `gate/logs/lane-evidence.json` | 证据快照路径（CLI `--write` 也写这里） |
+| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed |
+| `GATE_EVIDENCE_KEY_ENV` | 空 | 强制指定探针用的 key 环境变量（默认按 host 自动选：`*.deepseek.com` → `DEEPSEEK_API_KEY`，其它 → `OPENCODE_GO_API_KEY`） |
+
+### 三档判定
+
+| family | 条件 | 含义 |
+|---|---|---|
+| `deepseek-official` | EV10 分词 10/10 **且** EV11 官方校验器 3/3 | 是 DS 模型，且请求到达官方实现 |
+| `deepseek-thirdparty` | EV10 通过、EV11 不通过 | 是 DS 模型，但由第三方/自部署提供 |
+| `mismatch` | EV10 命中 ≤4/10 | 模型被换成非 DS 家族 |
+| `unknown` | 探针失败 / 快照缺失 | 不下结论 |
+
+`model.weights` 永远为 `unproven`——权重托管方不可证。
+
+### 典型用法
+
+```bash
+# 只观测（默认，零风险）
+node bin/ocg.mjs audit-lane --write      # 采集证据写快照
+GATE_MODEL_EVIDENCE_POLICY=label
+
+# 只放行官方提供（会让第三方通道 503）
+GATE_MODEL_EVIDENCE_POLICY=require
+```

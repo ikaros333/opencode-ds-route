@@ -151,6 +151,114 @@ async function promptKey() {
   return key;
 }
 
+// ---------------- 正向证据链：ocg audit-lane（2026-11-02）----------------
+// 用法：node bin/ocg.mjs audit-lane [--json] [--gen] [--write]
+//   --gen    同时跑能力探针 EV9（会真实生成，成本极低）
+//   --write  把结果写入 gate/logs/lane-evidence.json（供门控 require 策略读取）
+function pickEvidenceKey(host) {
+  const forced = process.env.GATE_EVIDENCE_KEY_ENV;
+  if (forced && process.env[forced]) return process.env[forced];
+  if (/deepseek\.com$/i.test(host)) return process.env.DEEPSEEK_API_KEY || process.env.OPENCODE_GO_API_KEY || '';
+  return process.env.OPENCODE_GO_API_KEY || process.env.DEEPSEEK_API_KEY || '';
+}
+
+async function cmdAuditLane(rest) {
+  const { runEvidence, scoreEvidence, writeSnapshot } = await import('../gate/evidence.mjs');
+  const has = (k) => rest.includes('--' + k);
+  const ev = await runEvidence({
+    host: process.env.GATE_HOST || 'opencode.ai',
+    port: Number(process.env.GATE_HOST_PORT || 443),
+    scheme: process.env.GATE_HOST_SCHEME || 'https',
+    prefix: process.env.GATE_UPSTREAM_PREFIX ?? '/zen/go',
+    // 2026-11-02：按 host 选 key（否则拿 opencode 的 key 打官方会全量 401）
+    key: pickEvidenceKey((process.env.GATE_HOST || 'opencode.ai')),
+    model: (process.env.GATE_CHAIN || 'deepseek-flash').split(',')[0],
+    session: (process.env.GATE_UPSTREAM_PREFIX ?? '/zen/go') !== '',
+    allowGen: has('gen'),
+  });
+  const scored = scoreEvidence(ev);
+  if (has('json')) {
+    console.log(JSON.stringify(scored, null, 2));
+  } else {
+    console.log(`[ocg] audit-lane  上游=${scored.upstream.host}${scored.upstream.prefix}  模型=${scored.upstream.model}`);
+    console.log(`\n  L1 端点身份（可证）：${scored.endpoint.score}/${scored.endpoint.max}  → ${scored.endpoint.verdict}`);
+    for (const it of scored.endpoint.items) {
+      const m = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
+      console.log(`    ${m} ${it.id}  ${it.detail}`);
+    }
+    console.log(`\n  L2 实现身份（高置信）：${scored.impl.score}/${scored.impl.max}  → ${scored.impl.profile}`);
+    for (const it of scored.impl.items) {
+      const m = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
+      console.log(`    ${m} ${it.id}  ${it.detail}`);
+    }
+    console.log(`\n  L3 模型族：${scored.model.family}  ${scored.model.familyScore}/${scored.model.familyMax}（权重:${scored.model.weights}）`);
+  }
+  if (has('write')) {
+    const out = process.env.GATE_EVIDENCE_FILE || path.join(ROOT, 'gate', 'logs', 'lane-evidence.json');
+    writeSnapshot(out, scored);
+    console.log(`\n[ocg] 快照已写入 ${out}`);
+  }
+  process.exitCode = scored.endpoint.verdict === 'official' ? 0 : 2;
+}
+// ---------------- N12 离线模型审计（2026-11-02）----------------
+// 目的：不绑定单条交付，用可校验题库与长上下文针做**趋势**审计。
+// 用法：node bin/ocg.mjs audit-model [--base URL] [--model M] [--token-env NAME]
+async function cmdAuditModel(rest) {
+  const get = (k, d) => { const i = rest.indexOf('--' + k); return i >= 0 ? rest[i + 1] : d; };
+  const base = get('base', `${BASE}/v1`);
+  const model = get('model', process.env.GATE_CHAIN?.split(',')[0] || 'deepseek-flash');
+  const tokenEnv = get('token-env', 'GATE_TOKEN');
+  const token = process.env[tokenEnv] || '';
+  // 门控用 x-gate-token；官方 API 用 Bearer。两边都带，避免互相不认。
+  const H = { 'content-type': 'application/json',
+    ...(token ? { authorization: 'Bearer ' + token, 'x-gate-token': token } : {}) };
+  const ask = async (text, opts = {}) => {
+    const body = { model, input: text, max_output_tokens: opts.max || 32, reasoning: { effort: opts.effort || 'none' } };
+    const r = await fetch(`${base}/responses`, { method: 'POST', headers: H, body: JSON.stringify(body), signal: AbortSignal.timeout(opts.timeout || 120000) });
+    if (!r.ok) return { ok: false, status: r.status, text: '' };
+    const j = await r.json();
+    const t = (j.output || []).filter(x => x.type === 'message').flatMap(x => x.content || []).map(x => x.text || '').join('').trim();
+    return { ok: true, text: t, usage: j.usage, profile: Object.keys(j).length >= 30 ? 'official' : 'opencode' };
+  };
+
+  console.log(`[ocg] audit-model  base=${base}  model=${model}`);
+  const report = { at: new Date().toISOString(), base, model, checks: [] };
+  const rec = (name, pass, detail) => { report.checks.push({ name, pass, detail }); line(pass ? 'ok' : 'bad', name, detail); };
+
+  // 1) 温度 0 决定性
+  const p = '请只输出这四个字：结果是七';
+  const a1 = await ask(p, { max: 16 }), a2 = await ask(p, { max: 16 });
+  rec('决定性(t=0)', a1.ok && a2.ok && a1.text === a2.text, `${a1.text.slice(0, 12)} | ${a2.text.slice(0, 12)}`);
+
+  // 2) 长上下文针（约 40k 字符）
+  const needle = '针脚编号-ZXCV-7788';
+  const filler = '背景资料：这是一段用于长上下文审计的中性文本。'.repeat(1600);
+  const la = await ask(`${needle}\n${filler}\n只回答：针脚编号是什么？`, { max: 32, timeout: 240000 });
+  rec('长上下文针(40k)', la.ok && la.text.includes('ZXCV-7788'), la.text.slice(0, 40) || `st=${la.status}`);
+
+  // 3) 可校验题库（12 题，确定性答案）
+  const bank = [
+    ['17*23=?', '391'], ['1234+8766=?', '10000'], ['2^10=?', '1024'],
+    ['"abcdef" 反转', 'fedcba'], ['2026 是闰年吗', '否'],
+    ['1..10 求和', '55'], ['100/4=?', '25'], ['9*9=?', '81'],
+    ['"abc" 长度', '3'], ['16 进制 FF = 十进制?', '255'],
+    ['5! =?', '120'], ['圆周率前三位', '3.14'],
+  ];
+  let hit = 0;
+  for (const [q, ans] of bank) {
+    const r = await ask(`只回答答案，不要解释：${q}`, { max: 24 });
+    const ok = r.ok && r.text.replace(/\s/g, '').includes(ans.replace(/\s/g, ''));
+    if (ok) hit++;
+  }
+  rec('题库通过率', hit >= 11, `${hit}/12`);
+
+  report.score = { determinism: a1.text === a2.text, longCtx: la.ok && la.text.includes('ZXCV-7788'), bank: hit };
+  const out = path.join(ROOT, 'gate', 'logs', `model-audit-${report.at.replace(/[:.]/g, '-')}.json`);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, JSON.stringify(report, null, 2));
+  console.log(`[ocg] 报告已写入 ${out}`);
+  process.exitCode = report.checks.every(c => c.pass) ? 0 : 2;
+}
 // ---------------- 命令实现 ----------------
 /**
  * 2026-10-30：优雅停止（drain）——解决「重启时在途请求被 RST」。
@@ -641,6 +749,8 @@ async function main() {
     }
     case 'doctor': return cmdDoctor();
     case 'audit': return cmdAudit();
+  case 'audit-model': return cmdAuditModel(rest);
+  case 'audit-lane': return cmdAuditLane(rest);
     case 'diag': return cmdDiag(rest.find(a => a.startsWith('--out='))?.slice(6) || (rest[0] === '--out' ? rest[1] : null));
     case 'setup': return cmdSetup(rest);
     case 'help': case '--help': case '-h': return cmdHelp();

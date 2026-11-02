@@ -23,6 +23,10 @@ const cliLines = fs.readFileSync(CLI_SRC, 'utf8').split('\n');
 // 监护也要断言：它是「重复部署 → 隐形重启循环」那条故障链的入口
 const SUP_SRC = path.join(import.meta.dirname, '..', 'bin', 'ocg-supervise.mjs');
 const supLines = fs.readFileSync(SUP_SRC, 'utf8').split('\n');
+// 2026-11-02：证据链模块源码（EV1–EV9）
+const EV_SRC = path.join(import.meta.dirname, 'evidence.mjs');
+const evSrc = fs.readFileSync(EV_SRC, 'utf8');
+const evLines = evSrc.split('\n');
 let pass = 0, fail = 0;
 const failures = [];
 
@@ -482,7 +486,7 @@ has('X1 默认车道改为官方在售别名', "process.env.GATE_CHAIN || 'deeps
 has('X2 已下线的旧默认链不再存在', "'deepseek-flash,deepseek-v4.1-flash'", { count: 0 });
 has('X3 messages 无条件封禁（除显式白名单开关）', "process.env.GATE_ALLOW_MESSAGES === '1' ? [] : ['messages']");
 has('X4 responses 主判据改用类型层 serde 文案', 'expect: E_SERDE_TYPE_MSG');
-has('X5 serde 伴生特征参与判定', 'c.expectExtra.every(re => re.test(msg))');
+has('X5 serde 伴生特征参与判定（按家族）', 'hitFam.extras.every(re => re.test(msg))');
 has('X5b request_id 证据永久失效后不再强制 UUID4', 'requestIdUuid: false');
 hasIn(baseLines, 'X6 baseline 定义类型层 serde 判据', 'export const E_SERDE_TYPE_MSG =');
 hasIn(baseLines, 'X7 baseline 留档 messages 漂移指纹', 'export const MSG_FINGERPRINT_2026_10_27');
@@ -495,7 +499,7 @@ hasIn(baseLines, 'X8 旧枚举判据标记退役', '已退役（2026-10-27 晚�
 console.log('\n=== Y. 判据冻结版（形态探针 + 结构闸 + 信任分级）===');
 has('Y1 形态探针存在', 'function runShapeProbe()');
 has('Y2 responses 走形态策略', "responses: 'shape',");
-has('Y3 形态判据校验 usage 键集', 'USAGE_KEYS_REQUIRED.filter(k => !(k in usage))');
+has('Y3 形态判据校验 usage 键集（按剖面）', 'const need = hasOpc ? USAGE_KEYS_REQUIRED : OFFICIAL_USAGE_KEYS;');
 has('Y4 结构闸拒绝无正文', "result: 'STRUCTURE_BAD'");
 has('Y5 结构闸错误类型可读', "type: 'gate_structure_bad'");
 has('Y6 截断响应打标', "'x-gate-truncated'");
@@ -510,9 +514,9 @@ console.log('\n=== Z. 每响应指纹 ===');
 hasIn(baseLines, 'Z1 baseline 定义 18 字段集', 'export const RESP_KEYS_COMPAT =');
 hasIn(baseLines, 'Z2 baseline 定义 item id 正则', 'export const ITEM_ID_RE =');
 hasIn(baseLines, 'Z3 baseline 定义流式事件家族', 'export const EVENT_FAMILY_REQUIRED =');
-has('Z4 指纹函数存在（含请求侧条件校验）', 'function fingerprint(body, reqBody)');
-has('Z4b reasoning 条件回显校验', "bad.push('reasoningEcho')");
-has('Z5 六项结构检查齐全', "bad.push('arithmetic')");
+has('Z4 指纹函数存在（含请求侧条件校验与模型定价）', 'function fingerprint(body, reqBody, model)');
+has('Z4b reasoning 条件回显校验', "pushHard('reasoningEcho')");
+has('Z5 算术校验存在（total=in+out）', "pushHard('arithmeticTotal')");
 has('Z6 流式旁路采样器存在', 'function makeEventTap(');
 has('Z7 旁路不缓冲（原样透传同一 chunk）', 'this.push(chunk); cb();');
 has('Z8 默认策略 retry', "process.env.GATE_FP_POLICY || 'retry'");
@@ -550,6 +554,68 @@ hasIn(cliLines, 'AB9 ocg 有 restart 子命令', "case 'restart': return cmdRest
 hasIn(cliLines, 'AB10 ocg 调 drain 端点', 'gate/admin/drain');
 hasIn(cliLines, 'AB11 stop.flag 与监护一致', "const STOP_FLAG = path.join(ROOT, 'stop.flag');");
 hasIn(cliLines, 'AB12 start 会清除 stop.flag', 'fs.unlinkSync(STOP_FLAG)');
+
+// ===== 2026-11-01：v4 判据（hard/soft 分离 + 断路器）=====
+console.log('\n=== AC. v4 判据与断路器 ===');
+hasIn(baseLines, 'AC1 item id UUID4 正则单源', 'export const ITEM_ID_UUID4 =');
+hasIn(baseLines, 'AC2 item 必需键白名单', 'export const ITEM_KEYS_REQUIRED =');
+hasIn(baseLines, 'AC3 usage 明细必需键', 'export const USAGE_DETAILS_REQUIRED =');
+hasIn(baseLines, 'AC4 计费单价单源', 'export const BILLING =');
+has('AC5 指纹返回 hard/soft 两档', 'const hard = [], soft = [];');
+has('AC6 未知字段只进 soft', "soft.push('keysUnknown')");
+has('AC7 缺必需项进 hard（unknown 剖面降级）', "pushHard('keysRequired')");
+has('AC8 计费相对容差（0.1%）', 'const tol = Math.max(1e-9, 1e-3 * Math.abs(o.list_cost));');
+has('AC9 cache_write 时跳过计费校验', "soft.push('billingSkippedCacheWrite')");
+has('AC10 大包不重发', 'const FP_RETRY_MAX_BYTES = num(');
+has('AC11 断路器实现（带模式）', "function noteFingerprint(ok, detail, mode = 'json')");
+has('AC12 断路器 blocking 判定（带模式）', "function breakerBlocking(mode = 'json')");
+has('AC13 断路器 503 分类', "type: 'gate_fp_breaker_open'");
+has('AC14 手动复位端点', "'/gate/admin/fp-reset'");
+has('AC15 health 暴露断路器（json+stream）', "json: breakerView('json'), stream: breakerView('stream')");
+has('AC16 重发失败透传上游错误', "type: 'gate_fp_retry_upstream_error'");
+
+// ===== 2026-11-01（第二轮实测修复）=====
+console.log('\n=== AD. 运行时缺陷修复回归 ===');
+has('AD1 断路器按模式分别计数（noteFingerprint 5 处）', 'noteFingerprint', { count: 5 });
+has('AD2 warn 模式不参与熔断', "if (FP_POLICY === 'warn') return;                  // warn 模式完全不参与熔断");
+has('AD3 流式与 json 模式隔离', "noteFingerprint(false, miss.join(','), 'stream')");
+has('AD4 半开探针 30s 自动释放', 'setTimeout(() => { b.probeInFlight = false; }, 30000)');
+has('AD5 流式不发 x-gate-fp', "String(r.ctype || '').includes('event-stream') ? {} : { 'x-gate-fp'");
+has('AD6 分账仅在 tokens 有值时校验', "const hasTok = ['input', 'cache_read'].some");
+has('AD7 alert 模式不阻断', "if (BREAKER_POLICY !== 'block') return false;");
+
+// ===== 2026-11-02：正向证据链（EV1–EV9）=====
+console.log('\n=== AE. 证据链实现 ===');
+hasIn(evLines, 'AE1 证据模块存在', 'export async function runEvidence');
+hasIn(evLines, 'AE2 打分函数存在', 'export function scoreEvidence');
+
+hasIn(evLines, 'AE4 FIM beta 引导 EV2', 'beta api');
+hasIn(evLines, 'AE5 温度范围校验 EV3', 'valid range of temperature');
+hasIn(evLines, 'AE6 top_p 范围校验 EV4', 'valid range of top_p');
+hasIn(evLines, 'AE7 TLS 证书探针 EV5', 'tlsProbe');
+hasIn(evLines, 'AE8 ALPN 探针 EV6', 'ALPNProtocols');
+hasIn(evLines, 'AE9 模型层永不可证', 'unproven');
+has('AE10 门控 require 前置闸', "type: 'gate_evidence_unmet'");
+has('AE11 证据漂移告警', "pushAlert('EVIDENCE_DRIFT'");
+has('AE12 health 暴露证据链', 'evidence: (() => {');
+hasIn(cliLines, 'AE13 CLI 命令 audit-lane', 'cmdAuditLane');
+hasIn(cliLines, 'AE14 按 host 选 key', 'pickEvidenceKey');
+
+// ===== 2026-11-02：模型族证据（EV10/EV11 + 策略）=====
+console.log('\n=== AF. 模型族证据与闸门 ===');
+hasIn(baseLines, 'AF15 分词基线语料存在', 'export const TOKENIZER_CORPUS =');
+hasIn(baseLines, 'AF16 官方错误模板存在', 'export const OFFICIAL_ERR_TEMPLATES =');
+hasIn(baseLines, 'AF17 UUID4 请求号正则单源', 'export const UUID4_REQUEST_ID =');
+hasIn(evLines, 'AF18 EV10 分词一致性探针', "add('EV10'");
+hasIn(evLines, 'AF19 EV11 官方校验器探针', "add('EV11'");
+hasIn(evLines, 'AF20 三档 family：official', "return 'deepseek-official'");
+hasIn(evLines, 'AF21 三档 family：thirdparty', "return 'deepseek-thirdparty'");
+hasIn(evLines, 'AF22 三档 family：mismatch', "return 'mismatch'");
+has('AF23 模型族策略常量', "const MODEL_EVIDENCE_POLICY =");
+has('AF24 模型族闸 503', "type: 'gate_modelfamily_unmet'");
+has('AF25 模型族闸只认 official', "fam === 'deepseek-official'");
+has('AF26 health 分开暴露两闸策略', 'modelPolicy: MODEL_EVIDENCE_POLICY');
+hasIn(evLines, 'AF27 权重永远 unproven', "weights: 'unproven'");
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

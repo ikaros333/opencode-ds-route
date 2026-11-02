@@ -53,3 +53,45 @@ node probe\official-detect.mjs --lite    # 只跑 E 类，0 token
 1. 改任何常量 → 同步更新本表日期与 `baseline.mjs` 的 `OBSERVED_AT`；
 2. 改判据属于 **minor** 版本变更，CHANGELOG 要单独置顶写清"可能影响交付率"；
 3. 不改架构的前提下，先改常量；改架构要先写清为什么常量方案不成立。
+
+## B16 证据链标定（2026-11-02 实测）
+
+| 项 | 官方 api.deepseek.com | opencode 车道 |
+|---|---|---|
+| EV1 `GET /v1/user/balance` | 200（`balance_infos`） | 404 |
+| EV2 `POST /v1/completions` | 400 指向 `beta api` | 404 |
+| EV3 `temperature:9` | 400 `valid range of temperature is [0, 2]` | 400（非范围文案） |
+| EV4 `top_p:2` | 400 `valid range of top_p is (0, 1.0]` | 200 |
+| EV5 证书 | subject=api.deepseek.com，issuer=TrustAsia，SAN 单域名 | subject=opencode.ai，issuer=Google Trust Services，SAN 含 wildcard |
+| EV6 ALPN | h2 | http/1.1 |
+| EV7 形态 | 35 字段 / 裸 UUID4 / usage 5 键 / 无 opencode 块 | 18 字段 / `resp_` 前缀 / 7 键 / 有 opencode 块 |
+| EV8 serde | Rust：`max_output_tokens ... expected u32` | Go：`max_completion_tokens` |
+| EV9 能力（background/top_logprobs/store/max_tool_calls） | 全部 200 | 全部 503 |
+
+实测结论：官方 6/6（L1）+ 3/3（L2）；opencode 1/6 + 0/3。**L3（模型身份）两侧均为 `unproven`。**
+
+## B17 模型族标定（2026-11-02 实测）
+
+判据：EV10 分词一致性（10 类文本的 `usage.input_tokens` 与官方基线逐条比对）+ EV11 官方校验器模板（3 条错误文案 + UUID4 `request_id`）。
+
+| 类别 | 官方 `input_tokens` | v4.1-flash | v4-pro |
+|---|---|---|---|
+| 纯中文 | 22 | 22 | 22 |
+| 纯英文 | 18 | 18 | 18 |
+| 中英混排 | 17 | — | 17 |
+| 代码 | 21 | — | 21 |
+| 数字 | 22 | — | 22 |
+| 空白 | 9 | — | 9 |
+| emoji | 19 | 19 | 19 |
+| 长中文(40×) | 604 | — | 604 |
+| 重复字符(3000×) | 379 | — | 379 |
+| JSON | 24 | 24 | 24 |
+| **EV10 一致率** | — | **10/10** | **10/10** |
+| **EV11 校验器** | 3/3 | **0/3** | **3/3** |
+| **family 判定** | `deepseek-official` | `deepseek-thirdparty` | `deepseek-official` |
+
+结论：
+1. 分词逐条一致 → 三条车道**都是 DeepSeek 模型族**（换 Qwen/Llama 必变分词）。
+2. EV11 只有官方与 v4-pro 命中 → 说明请求**确实到达官方校验器**；flash 车道是本地/兼容层自行处理。
+3. `v4.1-flash` 仍是兼容层形态（18 字段 / Go serde / 能力 503），但其分词一致，说明**它背后跑的也是 DS 权重**。
+4. 权重托管方（官方 vs 自部署）**响应侧不可证**，`model.weights` 恒为 `unproven`。

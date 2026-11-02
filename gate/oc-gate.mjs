@@ -30,17 +30,28 @@ import {
   DELIVERABLE_SHAPES,
   MSG_FINGERPRINT,
   E_SERDE_TYPE_MSG,
+  E_SERDE_TYPE_MSG_OFFICIAL,
+  SERDE_FAMILIES,
   E_SERDE_TYPE_EXTRAS,
   USAGE_KEYS_REQUIRED,
   IMPL_VECTOR_2026_10_27,
   RESP_KEYS_COMPAT,
   RESP_KEYS_REQUIRED,
   ITEM_ID_RE,
+  ITEM_ID_UUID4,
+  ITEM_ID_VARIANTS,
+  USAGE_KEYS_BY_PROFILE,
+  RESP_KEYS_BY_PROFILE,
+  ITEM_KEYS_REQUIRED,
+  USAGE_DETAILS_REQUIRED,
+  INCOMPLETE_REASONS_KNOWN,
+  BILLING,
   CONTENT_PART_KEYS,
   EVENT_FAMILY_REQUIRED,
   EVENT_TERMINAL,
   OBSERVED_AT,
 } from './baseline.mjs';
+import { readSnapshot as readEvidenceSnapshot } from './evidence.mjs';
 
 // ---------- 配置安全解析 ----------
 // 直接 Number(process.env.X) 在值是 "abc"/空串时会得到 NaN，而 NaN 参与比较永远为 false，
@@ -64,6 +75,9 @@ const INSTALL_ROOT = path.resolve(import.meta.dirname, '..');
 // 端口被占用是「重复部署」信号，不是可恢复故障：给专用退出码，让监护不要重启（见下方 server.on('error')）。
 const EXIT_PORT_IN_USE = 4;
 const KEY = process.env.OPENCODE_GO_API_KEY || '';
+// 2026-11-02：上游路径前缀可配置。默认 /zen/go（opencode 车道）；
+// 指向官方 api.deepseek.com 时设 GATE_UPSTREAM_PREFIX=''（否则探针会 404 → 预检 fail → 全量 503）。
+const UPSTREAM_PREFIX = process.env.GATE_UPSTREAM_PREFIX ?? '/zen/go';
 // 可选本地鉴权。绑回环 ≠ 安全：本机任何进程都能直接 POST 8787，白嫖你的 key 配额。
 // GATE_TOKEN 非空时，/v1/* 代理请求必须带 x-gate-token；/gate/* 只读观测端点不受影响。
 // 留空 = 关闭（手工路径的默认），install.ps1 会生成并默认开启。
@@ -146,6 +160,11 @@ function preferHealthyLanes(list, p, bytes = 0) {
   return good.concat(bad);   // 稳定：冷却中的车道保留在后备位置，不剔除
 }
 const PROBE_TTL = num('GATE_PROBE_TTL_MS', 120000, { min: 0, max: 86400000 });
+// 2026-11-02（P0-4）：最近一次预检命中的 serde 家族（official-rust / opencode-mapped）
+let lastSerdeFamily = null;
+// 2026-11-02（P0-4）：最近一次形状预检推断出的上游剖面（official / opencode）
+let lastUpstreamProfile = null;
+const OFFICIAL_USAGE_KEYS = ['input_tokens', 'input_tokens_details', 'output_tokens', 'output_tokens_details', 'total_tokens'];
 const USE_PROBE = (process.env.GATE_PROBE ?? '1') === '1';
 const FORCE_THIRD = process.env.GATE_FORCE_THIRD === '1';
 // 自检：只把「主请求」的结论强制成 third，不影响预检/探测。
@@ -190,7 +209,12 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 2026-10-27：结构闸拒绝次数（响应没有正文、也没有工具调用）
   structureBad: 0,
   // 2026-10-29：每响应指纹
-  fpMismatch: 0, fpRetries: 0, fpBlocked: 0 };
+  fpMismatch: 0, fpRetries: 0, fpBlocked: 0,
+  // 2026-11-02：软判据（未知字段等）与熔断计数
+  fpSoft: 0, streamSoft: 0, breakerOpenCount: 0,
+  // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
+  profiles: { official: 0, opencode: 0, unknown: 0 },
+  cache: { samples: 0, hits: 0 } };
 
 // 2026-10-27 冻结版：形态探针的最近结论 / 实现指纹向量（仅观测）
 let lastShape = null;      // { at, verdict, idShape, detail }
@@ -375,6 +399,29 @@ const TOTAL_BUDGET_MS = num('GATE_TOTAL_BUDGET_MS', 90000, { min: 5000, max: 600
 // 流式无法在发送前判定（事件家族要等流结束），因此流式一律只记录 + 告警。
 const FP_POLICY = (process.env.GATE_FP_POLICY || 'retry').toLowerCase();
 const FP_RETRIES = num('GATE_FP_RETRIES', 2, { min: 0, max: 5 });
+// 2026-11-02：大包不重发（1MB 请求上传三次 = 3× 成本与延迟）
+const FP_RETRY_MAX_BYTES = num('GATE_FP_RETRY_MAX_BYTES', 1048576, { min: 0, max: 64 * 1024 * 1024 });
+// 2026-11-02 实测：opencode 车道的计费单价会在同一模型上来回变动（同一请求形态 01:0x 是 2×，
+// 04:1x 变成 1×，与实例轮换一致）。因此计费类判据默认只告警，不当硬判据。
+const BILLING_POLICY = (process.env.GATE_BILLING_POLICY || 'warn').toLowerCase();
+// 2026-11-02：正向证据链策略（EV1–EV9）。默认 label：只记录 + 漂移告警，不阻断。
+const EVIDENCE_POLICY = (process.env.GATE_EVIDENCE_POLICY || 'label').toLowerCase();
+const EVIDENCE_EXPECT = (process.env.GATE_EVIDENCE_EXPECT || 'any').toLowerCase();
+const EVIDENCE_FILE = process.env.GATE_EVIDENCE_FILE || path.join(process.cwd(), 'gate', 'logs', 'lane-evidence.json');
+const EVIDENCE_MAX_AGE_MS = num('GATE_EVIDENCE_MAX_AGE_MS', 43200000, { min: 60000, max: 604800000 });
+// 2026-11-02：模型族证据策略。require = 快照里的 model.family 必须为 deepseek-consistent，否则 503。
+// 注意：证明的是「模型族」（分词一致性 + 官方校验器模板），不是权重托管方。
+const MODEL_EVIDENCE_POLICY = (process.env.GATE_MODEL_EVIDENCE_POLICY || 'label').toLowerCase();
+let lastEvidenceVerdict = null;
+// 断路器：按模式分开（json / stream）。实测用户 100% 流式流量，单份状态会让熔断对真实流量失效。
+const BREAKER_POLICY = (process.env.GATE_BREAKER_POLICY || 'alert').toLowerCase();
+const BREAKER_N = num('GATE_BREAKER_N', 5, { min: 2, max: 100 });
+const BREAKER_WINDOW_MS = num('GATE_BREAKER_WINDOW_MS', 600000, { min: 10000, max: 86400000 });
+const BREAKER_MIN_SAMPLES = num('GATE_BREAKER_MIN_SAMPLES', 10, { min: 2, max: 1000 });
+const breakerModes = {
+  json: { state: 'closed', openedAt: 0, events: [], probeInFlight: false },
+  stream: { state: 'closed', openedAt: 0, events: [], probeInFlight: false },
+};
 // 2026-10-30：优雅停止（drain）的最长等待，以及当前在途请求计数。
 // 15s：只有真的还有在途请求时才会等；空闲时 drain 立即完成，所以放大上限几乎不增加重启耗时。
 // 超过 15s 强制退出，避免升级卡死（实测 p99 单请求 54s，但那种请求本来就该被客户端重试）。
@@ -1050,12 +1097,16 @@ const PRECHECK_CASES_BY_PROTO = {
   // 类型校验比枚举校验稳定（枚举随版本增删，类型不会）。
   responses: [
     { id: 'e2s', name: '类型层非法（穿透到 serde）',
-      path: '/zen/go/v1/responses',
+      path: UPSTREAM_PREFIX + '/v1/responses',
       body: { model: ALLOWED[0], input: 'ping', max_output_tokens: 'abc' },
       // 2026-10-27 起上游不再返回官方 UUID4 request_id（改发 `gw-<hex>-<n>`），
       // 该证据永久失效，故关闭 requestIdUuid 校验（否则永远 fail）。
       requestIdUuid: false,
       expect: E_SERDE_TYPE_MSG,
+      // 2026-11-02（P0-4）：官方 api.deepseek.com 返回 Rust 文案且**不改写字段名**
+      // （max_output_tokens 原样、expected u32），命中即视为 official-rust 家族。
+      family: 'opencode-mapped',
+      expectAlt: [{ family: 'official-rust', expect: E_SERDE_TYPE_MSG_OFFICIAL, extras: E_SERDE_TYPE_EXTRAS }],
       // 除主体文案外还要求 serde 目标类型与行列位置，防止只回了半句话的转发层。
       expectExtra: E_SERDE_TYPE_EXTRAS },
   ],
@@ -1105,7 +1156,7 @@ function oneChatLogprob(prompt) {
     // 原来硬编码 https.request，导致故障注入/mock 上游（http）时本预检永远 net，
     // test-fault / test-bugfix 里「预检失败 → 确认重测 → 被 proof 覆盖」这些断言等于没被验证。
     const req = transport.request({
-      host: HOST, port: HOST_PORT, path: '/zen/go/v1/chat/completions', method: 'POST', timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/chat/completions', method: 'POST', timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
       headers: { 'content-type': 'application/json', 'content-length': payload.length,
                  authorization: `Bearer ${KEY}`,
                  'x-opencode-session': STABLE_SESSION, 'x-opencode-session-id': STABLE_SESSION },
@@ -1182,7 +1233,7 @@ function msgStatusProbe(p) {
     const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], ...p.body }), 'utf8');
     // ★ P1-2：走 transport（见 oneChatLogprob 处的说明）
     const req = transport.request({
-      host: HOST, port: HOST_PORT, path: '/zen/go/v1/messages', method: 'POST', timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/messages', method: 'POST', timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
       headers: { 'content-type': 'application/json', 'content-length': payload.length,
                  // messages 端点只认 x-api-key，用 Bearer 会 401
                  'x-api-key': KEY, 'anthropic-version': '2023-06-01',
@@ -1255,28 +1306,116 @@ async function runMsgFingerprint() {
  * 每响应指纹（2026-10-29）。返回"缺失项"数组，空数组 = 通过。
  * 只读交付响应的结构事实，不发额外请求；实测 flash 车道 10/10 全绿。
  */
-function fingerprint(body, reqBody) {
-  const bad = [];
+/**
+ * 2026-11-02：指纹分两档。
+ *   hard = 必须重发/拒绝（缺必需项、形态非法、算术/计费不成立）
+ *   soft = 只告警（出现未知字段/未知键/未知原因）——上游一周改过 3 次实现，
+ *          把"多出字段"当失败会导致全量重发（3× 成本 + 3× 延迟）。
+ */
+/**
+ * 2026-11-02：按响应形态推断车道剖面。
+ * 实测依据：官方 35 字段 + usage 无 opencode 块；opencode 车道 18 字段 + usage 含 opencode。
+ * 目的：让判据自适配，而不是用一条车道的形状去卡另一条（那是最典型的误杀来源）。
+ */
+/** 2026-11-02 实测：v4.1-flash 的单价恰好是 flash 的 2 倍（Δ=50%），必须按模型定价。
+ *  未知模型返回 null → 跳过计费校验（宁可漏，不可误杀）。 */
+function billingMul(model) {
+  const s = String(model || '').toLowerCase();
+  if (s.includes('v4.1')) return 2;
+  if (s.includes('flash')) return 1;
+  return null;
+}
+
+function profileOf(b) {
+  const u = (b && b.usage) || {};
+  const n = Object.keys(b || {}).length;
+  if ('opencode' in u) return 'opencode';
+  if (n >= 30) return 'official';
+  if (RESP_KEYS_REQUIRED.every(k => k in (b || {}))) return 'opencode';
+  return 'unknown';
+}
+
+function fingerprint(body, reqBody, model) {
+  const hard = [], soft = [];
   const b = body || {};
+  const profile = profileOf(b);
+  const known = RESP_KEYS_BY_PROFILE[profile];
+  const usageReq = USAGE_KEYS_BY_PROFILE[profile] || null;
+  // unknown 剖面：所有 hard 一律降级为 soft（只观察，不阻断）
+  const pushHard = (k) => (profile === 'unknown' ? soft.push(k + '@unknown') : hard.push(k));
+
   const keys = Object.keys(b);
-  // 2026-10-29 修正：网关偶尔只回 17 项（少 metadata），因此不比对"恰好 18 项"，
-  // 而是「必需项全在 + 不许出现未知字段」——既稳定又能挡住换了实现的响应。
-  if (RESP_KEYS_REQUIRED.some(k => !(k in b)) || keys.some(k => !RESP_KEYS_COMPAT.has(k))) bad.push('keys');
-  // 条件校验：请求里带了 reasoning，响应就必须回显 reasoning（否则说明实现没按官方语义处理）
-  if (reqBody && reqBody.reasoning && !('reasoning' in b)) bad.push('reasoningEcho');
+  if (RESP_KEYS_REQUIRED.some(k => !(k in b))) pushHard('keysRequired');
+  if (known && keys.some(k => !known.has(k))) soft.push('keysUnknown');
+  if (reqBody && reqBody.reasoning && !('reasoning' in b)) pushHard('reasoningEcho');
+
   const u = b.usage || {};
-  if (USAGE_KEYS_REQUIRED.some(k => !(k in u))) bad.push('usage');
+  if (usageReq) { if (usageReq.some(k => !(k in u))) pushHard('usageRequired'); }
+  else if (!Object.keys(u).length) pushHard('usageRequired');
   if (typeof u.total_tokens === 'number'
-      && u.total_tokens !== (u.input_tokens || 0) + (u.output_tokens || 0)) bad.push('arithmetic');
+      && u.total_tokens !== (u.input_tokens || 0) + (u.output_tokens || 0)) pushHard('arithmeticTotal');
+  const cin = (u.input_tokens_details || {}).cached_tokens;
+  if (typeof cin === 'number' && typeof u.input_tokens === 'number' && cin > u.input_tokens) pushHard('cacheGtInput');
+  const rOut = (u.output_tokens_details || {}).reasoning_tokens;
+  if (typeof rOut === 'number' && typeof u.output_tokens === 'number' && rOut > u.output_tokens) pushHard('reasoningGtOutput');
+  for (const [side, req] of [['input', USAGE_DETAILS_REQUIRED.input], ['output', USAGE_DETAILS_REQUIRED.output]]) {
+    const det = (side === 'input' ? u.input_tokens_details : u.output_tokens_details) || {};
+    if (req.some(k => !(k in det))) pushHard('usageDetails' + side);
+    if (Object.keys(det).some(k => !req.includes(k))) soft.push('usageDetailsUnknown' + side);
+  }
+
   const items = Array.isArray(b.output) ? b.output : [];
-  if (items.some(x => x && x.id && !ITEM_ID_RE.test(String(x.id)))) bad.push('itemId');
-  if (b.status === 'incomplete' && !(b.incomplete_details && b.incomplete_details.reason)) bad.push('status');
-  for (const m of items.filter(x => x && x.type === 'message')) {
-    for (const c of (m.content || [])) {
-      if (c && Object.keys(c).some(k => !CONTENT_PART_KEYS.has(k))) { bad.push('contentPart'); break; }
+  for (const it of items) {
+    if (!it || !it.type) { pushHard('itemType'); continue; }
+    // 2026-11-02：id 必须属于已知形态集合（官方裸 UUID4 / opencode 前缀+UUID4 位）
+    if (it.id && !ITEM_ID_VARIANTS.some(re => re.test(String(it.id)))) pushHard('itemId');
+    const need = ITEM_KEYS_REQUIRED[it.type];
+    if (need) {
+      const have = Object.keys(it);
+      if (need.some(k => !have.includes(k))) pushHard('itemKeys' + it.type);
+      if (have.some(k => !need.includes(k))) soft.push('itemKeysUnknown' + it.type);
+    } else {
+      soft.push('itemTypeUnknown');
+    }
+    if (it.type === 'message') {
+      // 实测：被 max_output_tokens 截断时 item.status='incomplete'（不是缺陷）
+      if (it.role !== 'assistant' || !['completed', 'incomplete'].includes(it.status)) pushHard('messageRoleStatus');
+      for (const c of (it.content || [])) {
+        if (!c) continue;
+        if (Object.keys(c).some(k => !CONTENT_PART_KEYS.has(k))) soft.push('contentPartUnknown');
+        if (c.type === 'output_text' && typeof c.text !== 'string') pushHard('contentText');
+      }
     }
   }
-  return bad;
+
+  if (b.status === 'incomplete') {
+    const reason = b.incomplete_details && b.incomplete_details.reason;
+    if (!reason) pushHard('incompleteReason');
+    else if (!INCOMPLETE_REASONS_KNOWN.has(reason)) soft.push('incompleteReasonUnknown');
+  }
+
+  // 计费恒等式：cache_write>0 时价格未知 → 跳过；tokens 缺失时跳过（避免 0!==N 误判）
+  const o = u.opencode || {}, tk = o.tokens || {};
+  const hasWrite = (tk.cache_write_5m || 0) > 0 || (tk.cache_write_1h || 0) > 0;
+  const hasTok = ['input', 'cache_read'].some(k => typeof tk[k] === 'number');
+  // 计费按上游**实际服务的模型**（响应里的 model 优先），而不是我们请求的名字
+  const billModel = String(b.model || model || '');
+  if (hasWrite) soft.push('billingSkippedCacheWrite');
+  else if (typeof o.list_cost === 'number' && billingMul(billModel) !== null) {
+    const mul = billingMul(billModel);
+    const pred = mul * ((tk.input || 0) * BILLING.input + (tk.output || 0) * BILLING.output + (tk.cache_read || 0) * BILLING.cacheRead);
+    // 实测相对偏差最大 8e-5（小额取整），取 1e-3（0.1%）留 12 倍余量
+    const tol = Math.max(1e-9, 1e-3 * Math.abs(o.list_cost));
+    const billFail = (k) => (BILLING_POLICY === 'retry' ? pushHard(k) : soft.push(k + '@warn'));
+    if (Math.abs(o.list_cost - pred) > tol) billFail('billingCost');
+    if (typeof o.allowance === 'number'
+        && Math.abs(o.allowance - BILLING.allowanceRatio * o.list_cost) > tol) billFail('billingAllowance');
+    if (hasTok && typeof u.input_tokens === 'number'
+        && (tk.input || 0) + (tk.cache_read || 0) !== u.input_tokens) billFail('billingInputSplit');
+  }
+  // 缓存观测量（N11）：只记录命中 token 数，不做任何判定
+  const cacheHit = typeof cin === 'number' ? cin : 0;
+  return { hard, soft, profile, cache: { hit: cacheHit } };
 }
 
 /** 流式：只判事件家族是否齐全（sequence 单调性由 tap 顺带记录） */
@@ -1291,37 +1430,130 @@ function fingerprintEvents(seen) {
  * 流式旁路采样器：**不缓冲、不改字节**，只记录事件名与 sequence 单调性。
  * 风险控制：任何异常都 swallow，绝不让它影响数据透传。
  */
+/**
+ * 2026-11-02：按模式独立的指纹断路器（json / stream）。
+ * 动机（实测）：用户 100% 流式流量，单份状态会让熔断对真实流量完全失效（samples 恒为 0）。
+ * 规则：只统计被强制执行的判据；warn 模式完全不参与；alert 模式只告警不阻断。
+ * 半开用单飞令牌 + 30s 超时，且请求结束会主动 releaseProbe（避免流式探针把闸门卡死）。
+ */
+function breakerPrune(mode) {
+  const b = breakerModes[mode] || breakerModes.json;
+  const now = Date.now();
+  b.events = b.events.filter(e => now - e.t < BREAKER_WINDOW_MS);
+}
+function noteFingerprint(ok, detail, mode = 'json') {
+  if (FP_POLICY === 'warn') return;                  // warn 模式完全不参与熔断
+  const b = breakerModes[mode] || breakerModes.json;
+  breakerPrune(mode);
+  b.events.push({ t: Date.now(), ok });
+  const samples = b.events.length;
+  const fails = b.events.filter(e => !e.ok).length;
+  if (b.state === 'half_open') {
+    b.probeInFlight = false;
+    if (ok) {
+      b.state = 'closed';
+      log({ ts: new Date().toISOString(), result: 'FP_BREAKER_CLOSED', mode, samples, fails });
+      pushAlert('FP_BREAKER_CLOSED', { mode, samples, fails });
+    } else {
+      b.state = 'open'; b.openedAt = Date.now();
+    }
+    return;
+  }
+  if (b.state === 'closed' && samples >= BREAKER_MIN_SAMPLES && fails >= BREAKER_N) {
+    b.state = 'open'; b.openedAt = Date.now();
+    metrics.breakerOpenCount = (metrics.breakerOpenCount || 0) + 1;
+    log({ ts: new Date().toISOString(), result: 'FP_BREAKER_OPEN',
+          mode, samples, fails, windowMs: BREAKER_WINDOW_MS, policy: BREAKER_POLICY, detail });
+    pushAlert('FP_BREAKER_OPEN', { mode, samples, fails, policy: BREAKER_POLICY, detail });
+  }
+}
+/** 请求结束时释放半开探针 */
+function releaseProbe(mode) {
+  const b = breakerModes[mode] || breakerModes.json;
+  if (b.state === 'half_open') b.probeInFlight = false;
+}
+/** health 用的只读视图 */
+function breakerView(mode) {
+  const b = breakerModes[mode] || breakerModes.json;
+  return { state: b.state, openedAt: b.openedAt || null,
+           samples: b.events.length, fails: b.events.filter(e => !e.ok).length,
+           probeInFlight: !!b.probeInFlight };
+}
+function breakerBlocking(mode = 'json') {
+  const b = breakerModes[mode] || breakerModes.json;
+  if (FP_POLICY === 'warn') return false;
+  if (BREAKER_POLICY !== 'block') return false;
+  if (b.state === 'open' && Date.now() - b.openedAt >= BREAKER_WINDOW_MS) {
+    b.state = 'half_open'; b.probeInFlight = false;
+  }
+  if (b.state === 'open') return true;
+  if (b.state === 'half_open') {
+    if (b.probeInFlight) return true;
+    b.probeInFlight = true;
+    setTimeout(() => { b.probeInFlight = false; }, 30000).unref();
+    return false;
+  }
+  return false;
+}
 function makeEventTap(reqId, model, seedChunks = []) {
   const seen = new Set();
-  let lastSeq = null, seqOk = true;
+  let lastSeq = null, seqOk = true, seqStrict = null, seqMonotonic = true;
+  let eventNameMismatch = false, doneSeen = false;
   // 2026-10-29 修正：SSE 的 `data: {...}` 行会被 TCP 分片在任意位置切开。
   // 上一版直接在单个 chunk 里正则 → 跨片的行解析失败 → 事件名丢失 → 误报 FP_MISMATCH（实测 38 次假警报）。
   // 现在只保留"最后一行残片"作为 carry（有界），**仍然逐 chunk 立即 push，不延迟客户端**。
   let carry = '';
   const MAX_CARRY = 65536;
+  // 2026-11-02 诊断：官方车道出现过 events:[]（客户端却收到完整 SSE）
+  let seenBytes = 0, seenChunks = 0, seedBytes = 0, seedHead = '';
   const scan = (text) => {
     if (!text) return;
+    seenBytes += text.length; seenChunks++;
     const s = carry + text;
     const nl = s.lastIndexOf('\n');
     const complete = nl >= 0 ? s.slice(0, nl) : '';
     carry = nl >= 0 ? s.slice(nl + 1) : s;
     if (carry.length > MAX_CARRY) carry = '';
     if (!complete) return;
-    for (const m of complete.matchAll(/^data:\s*(\{.*)$/gm)) {
+    // 2026-11-02：流式严格判据（只告警 + 喂 stream 断路器，不阻断已发出的字节）
+    //   W4-1 sequence_number 必须从 0 起严格 +1（实测官方 598 事件、opencode 40 事件均满足）
+    //   W4-2 SSE 的 event: 名必须等于帧内 JSON 的 type（实测 6/6）
+    //   W4-3 不出现 data: [DONE]（实测两侧都没有）
+    let pendingEvent = null;
+    for (const line of complete.split('\n')) {
+      const ev = line.match(/^event:\s*(\S+)/);
+      if (ev) { pendingEvent = ev[1]; continue; }
+      const dm = line.match(/^data:\s*(.*)$/);
+      if (!dm) continue;
+      const payload = dm[1].trim();
+      if (payload === '[DONE]') { doneSeen = true; continue; }
+      if (!payload.startsWith('{')) continue;
       try {
-        const j = JSON.parse(m[1]);
-        if (j && j.type) seen.add(j.type);
+        const j = JSON.parse(payload);
+        if (j && j.type) {
+          seen.add(j.type);
+          if (pendingEvent && pendingEvent !== j.type) eventNameMismatch = true;
+        }
         if (j && typeof j.sequence_number === 'number') {
-          if (lastSeq !== null && j.sequence_number <= lastSeq) seqOk = false;
+          if (seqStrict === null) { if (j.sequence_number !== 0) seqOk = false; }
+          else if (j.sequence_number !== seqStrict + 1) seqOk = false;
+          if (lastSeq !== null && j.sequence_number <= lastSeq) seqMonotonic = false;
+          seqStrict = j.sequence_number;
           lastSeq = j.sequence_number;
         }
       } catch {}
+      pendingEvent = null;
     }
   };
   // ★ 关键修正：流的第一段已经被 peekBody 读走并缓存到 r.buffered，
   // deliver 会先把 buffered 直接写给客户端（不经过 tap）。因此必须把 buffered 也扫一遍，
   // 否则 `response.created` 永远缺失 → eventFamily 恒误报。
-  try { for (const c of seedChunks) scan(Buffer.isBuffer(c) ? c.toString('utf8') : String(c)); } catch {}
+  try {
+    for (const c of seedChunks) {
+      const txt = Buffer.isBuffer(c) ? c.toString('utf8') : (c instanceof Uint8Array ? Buffer.from(c).toString('utf8') : String(c));
+      seedBytes += txt.length; if (!seedHead) seedHead = txt.slice(0, 80); scan(txt);
+    }
+  } catch {}
   const tap = new Transform({
     transform(chunk, _enc, cb) {
       try { scan(chunk.toString('utf8')); } catch {}
@@ -1332,15 +1564,40 @@ function makeEventTap(reqId, model, seedChunks = []) {
         // 流结束时补解析可能残留的最后一行
         if (carry) { scan('\n'); }
         const miss = fingerprintEvents(seen);
+        // 2026-11-02：空流守卫。tap 一个字节都没收到（seedBytes+seenBytes===0）时，
+        // "事件家族不全"不是指纹信号（多半是对冲败者被 abort / 连接被提前销毁），
+        // 记为 FP_TAP_EMPTY 软信号，不计 mismatch、不喂断路器。实测官方车道上曾因此产生假 FP_MISMATCH。
+        if (miss.length && seedBytes + seenBytes === 0) {
+          metrics.streamSoft = (metrics.streamSoft || 0) + 1;
+          fpMissing.set('soft:tapEmpty', (fpMissing.get('soft:tapEmpty') || 0) + 1);
+          log({ ts: new Date().toISOString(), reqId, result: 'FP_TAP_EMPTY', model, missing: miss });
+          try { cb(); } catch {}
+          return;
+        }
+        // 严格判据仅告警（不改变 miss、不阻断）
+        const w4 = [];
+        if (!seqOk) w4.push('seqStrict');
+        if (!seqMonotonic) w4.push('seqMonotonic');
+        if (eventNameMismatch) w4.push('eventNameMismatch');
+        if (doneSeen) w4.push('doneMarker');
+        if (w4.length) {
+          metrics.streamSoft = (metrics.streamSoft || 0) + 1;
+          for (const k of w4) fpMissing.set('soft:' + k, (fpMissing.get('soft:' + k) || 0) + 1);
+          log({ ts: new Date().toISOString(), reqId, result: 'FP_STREAM_SOFT', model, soft: w4, eventCount: seen.size });
+        }
         if (miss.length) {
           metrics.fpMismatch = (metrics.fpMismatch || 0) + 1;
           for (const k of miss) fpMissing.set(k, (fpMissing.get(k) || 0) + 1);
           log({ ts: new Date().toISOString(), reqId, result: 'FP_MISMATCH', model,
-                stream: true, missing: miss, events: [...seen].sort() });
+                stream: true, missing: miss, events: [...seen].sort(),
+                seedBytes, seenBytes, seenChunks, carryLen: carry.length, seedHead });
           pushAlert('FP_MISMATCH', { reqId, model, stream: true, missing: miss });
+          // 2026-11-02：流式单独一份熔断状态（实测用户 100% 流式，混用会让熔断失效/误伤）
+          noteFingerprint(false, miss.join(','), 'stream');
         } else {
+          noteFingerprint(true, '', 'stream');
           log({ ts: new Date().toISOString(), reqId, result: 'FP_OK', model, stream: true,
-                seqMonotonic: seqOk, eventCount: seen.size });
+                seqMonotonic: seqOk, eventCount: seen.size, seedBytes, seenBytes, seenChunks });
         }
       } catch {}
       cb();
@@ -1353,10 +1610,10 @@ function runShapeProbe() {
   return new Promise((resolve) => {
     const t0 = Date.now();
     // 所有出口都记一次 lastShape：health 的 trustLevel 依赖它
-    const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '' }; resolve(o); };
+    const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '', profile: o.profile || '' }; resolve(o); };
     const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], input: 'ping', max_output_tokens: 1 }), 'utf8');
     const req = transport.request({
-      host: HOST, port: HOST_PORT, path: '/zen/go/v1/responses', method: 'POST',
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST',
       timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
       headers: { 'content-type': 'application/json', 'content-length': payload.length,
                  authorization: `Bearer ${KEY}`,
@@ -1377,12 +1634,21 @@ function runShapeProbe() {
         if (shape !== 'resp_uuid4' && shape !== 'UUID4') {
           return finish({ id: 'shape', verdict: 'fail', detail: `idShape=${shape} id=${id.slice(0, 28)}` });
         }
+        // 2026-11-02（P0-4）：usage 必需键按剖面判定。
+        //   官方 api.deepseek.com：5 键（无 opencode 块）
+        //   opencode 车道       ：7 键（含 opencode 块）
+        // 少这层适配时，指向官方会让预检恒 fail → 全量 503（已实测）。
         const usage = j.usage || {};
-        const missing = USAGE_KEYS_REQUIRED.filter(k => !(k in usage));
+        const hasOpc = 'opencode' in usage;
+        const need = hasOpc ? USAGE_KEYS_REQUIRED : OFFICIAL_USAGE_KEYS;
+        const missing = need.filter(k => !(k in usage));
         if (missing.length) {
           return finish({ id: 'shape', verdict: 'fail', detail: `usage 缺键 ${missing.join(',')}`, idShape: shape });
         }
-        return finish({ id: 'shape', verdict: 'pass', detail: `${shape} usage ok ${ms}ms`, idShape: shape });
+        const upProfile = hasOpc ? 'opencode' : 'official';
+        lastUpstreamProfile = upProfile;
+        return finish({ id: 'shape', verdict: 'pass',
+          detail: `${shape} usage ok ${ms}ms profile=${upProfile}`, idShape: shape, profile: upProfile });
       });
     });
     req.on('error', (e) => finish({ id: 'shape', verdict: 'net', detail: 'err=' + (e?.code || e?.name || String(e?.message || e)) }));
@@ -1424,7 +1690,7 @@ function implProbeOnce(c) {
   return new Promise((resolve) => {
     const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], input: 'ping', ...c.extra }), 'utf8');
     const req = transport.request({
-      host: HOST, port: HOST_PORT, path: '/zen/go/v1/responses', method: 'POST',
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST',
       timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
       headers: { 'content-type': 'application/json', 'content-length': payload.length,
                  authorization: `Bearer ${KEY}`, 'x-opencode-session': STABLE_SESSION },
@@ -1483,10 +1749,16 @@ function runOnePrecheckCase(c) {
       res.on('end', () => {
         let msg = '';
         try { msg = JSON.parse(buf)?.error?.message || ''; } catch {}
-        if (c.expect.test(msg)) {
+        // 2026-11-02（P0-4）：按 serde 家族匹配。
+        // 实测两条车道的错误文案不同（字段名是否被改写成 max_completion_tokens），
+        // 命中任意已知家族即 pass，并记录家族名，便于台账区分"官方 API / opencode 网关"。
+        const fams = c.expectAlt ? [{ family: c.family || 'primary', expect: c.expect, extras: c.expectExtra },
+                                    ...c.expectAlt] : [{ family: c.family || 'primary', expect: c.expect, extras: c.expectExtra }];
+        const hitFam = fams.find(x => x.expect && x.expect.test(msg));
+        if (hitFam) {
           // 2026-10-27：主体文案之外还要求伴随特征（unknown variant / 枚举里的 xhigh）。
           // 只回了半句话的转发层/被截断的错误页不构成官方证据 → 记 drift（参与 fail 判定）。
-          if (c.expectExtra && !c.expectExtra.every(re => re.test(msg))) {
+          if (hitFam.extras && !hitFam.extras.every(re => re.test(msg))) {
             return resolve({ id: c.id, verdict: 'drift',
               detail: 'serde 伴生特征缺失: ' + msg.slice(0, 100) });
           }
@@ -1500,7 +1772,7 @@ function runOnePrecheckCase(c) {
                 detail: 'request_id 缺失或非 UUID4: ' + msg.slice(0, 100) });
             }
           }
-          return resolve({ id: c.id, verdict: 'pass' });
+          return resolve({ id: c.id, verdict: 'pass', serdeFamily: hitFam.family });
         }
         if (/Upstream request failed|Endpoint is unavailable|Model is unavailable/i.test(msg)) {
           return resolve({ id: c.id, verdict: 'gateway' });
@@ -1649,13 +1921,16 @@ function precheck(proto = 'responses', opts = {}) {
     // ★ 探针被上限截断时 tookMs≈deadline（abort），必须显式告知 EWMA 以触发跳档
     const probeTimedOut = tookMs >= deadlineAtStart - 100;
     probeEwmaUpdate(tookMs, probeTimedOut);
-    const rec = { at: Date.now(), proto, strategy, verdict, passCount, total, results, ms: tookMs };
+    // 2026-11-02（P0-4）：记录命中的 serde 家族（official-rust / opencode-mapped），用于区分上游实现
+    const serdeFamily = (results.find(r => r.serdeFamily) || {}).serdeFamily || null;
+    lastSerdeFamily = serdeFamily;
+    const rec = { at: Date.now(), proto, strategy, verdict, passCount, total, results, ms: tookMs, serdeFamily };
     precheckLastByProto.set(proto, rec);
     // ★ 只缓存 pass（见 precheckPassByProto 注释）
     if (verdict === 'pass') precheckPassByProto.set(proto, rec);
     log({ ts: new Date().toISOString(), result: 'PRECHECK', proto, strategy, verdict, passCount, ms: tookMs,
           deadlineMs: probeDeadlineMs(), ewmaMs: Math.round(precheckEwmaMs),
-          confirmed: confirmed > 0 ? confirmed : undefined, recovered: recovered || undefined,
+          confirmed: confirmed > 0 ? confirmed : undefined, recovered: recovered || undefined, serdeFamily,
           detail: results.map(r => `${r.id}:${r.verdict}${r.detail ? '(' + r.detail + ')' : ''}`).join(',') });
     // ★ 2026-10-23：判据漂移单独计量 + 进 /gate/alerts，避免「静默失效」。
     if (driftCount > 0) {
@@ -2225,6 +2500,22 @@ async function handle(req, res) {
   // 落不到新实例起来的窗口里 —— 2026-10-30 17:07 那次就是这么丢的请求。
   // 行为：停接新连接 → 等在途请求结束（≤5s）→ 写快照 → exit(0)；监护进程 1.5s 后拉起。
   // 鉴权：必须匹配 GATE_TOKEN 或 GATE_OBS_TOKEN；两者都没配 → 403（禁用，防本机任意进程停门控）。
+  // 2026-11-02：指纹断路器手动复位（需 GATE_TOKEN，与 drain 同一鉴权口径）
+  if (req.method === 'POST' && String(req.url || '').split('?')[0] === '/gate/admin/fp-reset') {
+    if (!GATE_TOKEN || !tokenOk(req.headers['x-gate-token'], GATE_TOKEN)) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { type: 'gate_fp_reset_unauthorized',
+        message: 'fp-reset 需要 x-gate-token（必须匹配 GATE_TOKEN）。' } }));
+    }
+    const prev = { json: breakerView('json'), stream: breakerView('stream') };
+    for (const m of ['json', 'stream']) {
+      const b = breakerModes[m];
+      b.state = 'closed'; b.openedAt = 0; b.events = []; b.probeInFlight = false;
+    }
+    log({ ts: new Date().toISOString(), result: 'FP_BREAKER_RESET', prev });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, reset: true, prev }));
+  }
   if (req.method === 'POST' && String(req.url || '').split('?')[0] === '/gate/admin/drain') {
     // ★ 2026-10-31 修正（自查发现的最小权限缺陷）：drain 只认 GATE_TOKEN。
     // GATE_OBS_TOKEN 定位是「只读观测凭据」（脚本/面板可能共享），授予它停门控的能力
@@ -2308,7 +2599,13 @@ async function handle(req, res) {
   // 改为一律记录一次（finish / close 谁先到算谁，同一请求只记一次）。
   if (isProxy) {
     let latDone = false;
-    const recordOnce = () => { if (!latDone) { latDone = true; recordLatency(Date.now() - startedAt); } };
+    const recordOnce = () => {
+      if (!latDone) {
+        latDone = true; recordLatency(Date.now() - startedAt);
+        // 2026-11-02：请求结束释放半开探针（否则流式探针会把闸门卡住 30s）
+        releaseProbe('json'); releaseProbe('stream');
+      }
+    };
     res.on('finish', recordOnce);
     res.on('close', recordOnce);
   }
@@ -2367,12 +2664,41 @@ async function handle(req, res) {
         idShape: lastShape.idShape || '', detail: lastShape.detail } : null,
       // 实现指纹向量（仅观测）：与基线不一致 → IMPL_VECTOR_DRIFT 告警，不影响放行
       implVector: implVector || null, implVectorBaseline: IMPL_VECTOR_2026_10_27,
+      serdeFamily: lastSerdeFamily, upstreamPrefix: UPSTREAM_PREFIX, precheckProfile: lastUpstreamProfile,
+      evidence: (() => {
+        const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+        // 2026-11-02：两个闸的策略分开暴露，避免"看 board 显示 label 实际已 require"的误判
+        const base = { modelPolicy: MODEL_EVIDENCE_POLICY };
+        if (!ev) return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: 'missing', snapshot: null };
+        const ageMs = Date.now() - Date.parse(ev.at || '');
+        return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: ev.endpoint?.verdict || 'unknown',
+                 score: ev.endpoint?.score, max: ev.endpoint?.max, ageMs, stale: ageMs > EVIDENCE_MAX_AGE_MS,
+                 impl: ev.impl?.profile || null, model: ev.model?.claim || 'unproven',
+                 modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
+                 familyMax: ev.model?.familyMax, at: ev.at };
+      })(),
       usageKeysRequired: USAGE_KEYS_REQUIRED,
       // ★ 2026-10-29：每响应指纹（提高拒答率的主闸）
       fingerprint: {
-        policy: FP_POLICY, retries: FP_RETRIES,
-        checks: ['keys', 'usage', 'arithmetic', 'itemId', 'status', 'contentPart', 'eventFamily'],
+        policy: FP_POLICY, retries: FP_RETRIES, billingPolicy: BILLING_POLICY,
+        checks: ['keysRequired','keysUnknown(soft)','usageRequired','usageDetailsIn/Out','arithmeticTotal',
+                 'cacheGtInput','reasoningGtOutput','itemId(uuid4)','itemKeys*','messageRoleStatus',
+                 'incompleteReason','billingCost','billingAllowance','billingInputSplit','eventFamily'],
         mismatches: metrics.fpMismatch || 0, retried: metrics.fpRetries || 0,
+        soft: metrics.fpSoft || 0, streamSoft: metrics.streamSoft || 0,
+        profiles: metrics.profiles,
+        // N11：纯观测量（官方实测：128 token 块，最小前缀≈256，TTL≥180s）
+        cache: {
+          samples: metrics.cache.samples, hits: metrics.cache.hits,
+          hitRate: metrics.cache.samples ? +(metrics.cache.hits / metrics.cache.samples).toFixed(3) : null,
+          expect: { block: 128, minPrefixTokens: 256, ttlSecAtLeast: 180 },
+          anomaly: metrics.cache.samples >= 20 && (metrics.cache.hits / metrics.cache.samples) < 0.3,
+        },
+        // 2026-11-02：按模式分开的熔断状态（json / stream）
+        breaker: {
+          policy: BREAKER_POLICY, n: BREAKER_N, windowMs: BREAKER_WINDOW_MS, minSamples: BREAKER_MIN_SAMPLES,
+          json: breakerView('json'), stream: breakerView('stream'),
+        },
         blocked: metrics.fpBlocked || 0,
         topMissing: [...fpMissing.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
           .map(([k, v]) => ({ check: k, count: v })),
@@ -2504,7 +2830,7 @@ async function handle(req, res) {
     return replyEarly(req, res, 400, { error: { type: 'gate_bad_body', message: e.message } });
   }
 
-  const pathName = '/zen/go/v1' + url.pathname.replace(/^\/v1/, '');
+  const pathName = UPSTREAM_PREFIX + '/v1' + url.pathname.replace(/^\/v1/, '');
   const proto = protoOf(pathName);
   const reqId = Math.random().toString(16).slice(2, 10);
   // 记下调用方请求的 model：门控只用 CHAIN 内的模型，不一致时要能被观察到
@@ -2515,6 +2841,54 @@ async function handle(req, res) {
   }
   const requestedModel = String(body.model || '');
   metrics.requests++;
+
+  // 2026-11-02：正向证据链前置闸。仅在「策略 require + 声明期望 official」时生效——
+  // 否则在第三方车道上等于自断服务（这一点在实现前已明确）。
+  // 2026-11-02：模型族闸（判正即放行 / 判否即拒答）
+  if (MODEL_EVIDENCE_POLICY === 'require') {
+    const evM = readEvidenceSnapshot(EVIDENCE_FILE);
+    const ageM = evM ? Date.now() - Date.parse(evM.at || '') : Infinity;
+    const fam = evM?.model?.family || 'missing';
+    const famOk = fam === 'deepseek-official' && ageM <= EVIDENCE_MAX_AGE_MS;
+    if (!famOk) {
+      log({ ts: new Date().toISOString(), reqId, result: 'MODEL_EVIDENCE_UNMET', family: fam,
+            ageMs: Number.isFinite(ageM) ? ageM : null });
+      return replyEarly(req, res, 503, { error: { type: 'gate_modelfamily_unmet',
+        message: '模型族证据未达成（分词一致性 / 官方校验器模板）或已过期；已 fail-closed。',
+        model_family: fam, evidence_age_ms: Number.isFinite(ageM) ? ageM : null,
+        request_id: reqId } });
+    }
+  }
+  if (EVIDENCE_POLICY === 'require' && EVIDENCE_EXPECT === 'official') {
+    const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+    const ageMs = ev ? Date.now() - Date.parse(ev.at || '') : Infinity;
+    const ok = ev && ev.endpoint && ev.endpoint.verdict === 'official' && ageMs <= EVIDENCE_MAX_AGE_MS;
+    if (ev && ev.endpoint) {
+      if (lastEvidenceVerdict === 'official' && ev.endpoint.verdict !== 'official') {
+        log({ ts: new Date().toISOString(), result: 'EVIDENCE_DRIFT', from: 'official', to: ev.endpoint.verdict, reqId });
+        pushAlert('EVIDENCE_DRIFT', { from: 'official', to: ev.endpoint.verdict });
+      }
+      lastEvidenceVerdict = ev.endpoint.verdict;
+    }
+    if (!ok) {
+      log({ ts: new Date().toISOString(), reqId, result: 'EVIDENCE_UNMET',
+            verdict: ev?.endpoint?.verdict || 'missing', ageMs: Number.isFinite(ageMs) ? ageMs : null });
+      return replyEarly(req, res, 503, { error: { type: 'gate_evidence_unmet',
+        message: '本车道声明应为官方 API，但证据链未达成或已过期；已 fail-closed。',
+        evidence_verdict: ev?.endpoint?.verdict || 'missing', evidence_age_ms: Number.isFinite(ageMs) ? ageMs : null,
+        request_id: reqId } });
+    }
+  }
+
+  // 2026-11-02：流式熔断前置。流式校验是事后的（无法撤回已发字节），
+  // 所以"持续劣化"只能靠拒绝**后续**请求来表达；仅 block 模式生效。
+  if (body.stream === true && breakerBlocking('stream')) {
+    metrics.fpBlocked = (metrics.fpBlocked || 0) + 1;
+    log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_BREAKER_BLOCK_STREAM', requestedModel });
+    return replyEarly(req, res, 503, { error: { type: 'gate_stream_breaker_open',
+      message: '流式指纹连续失败已熔断；已 fail-closed，请稍后重试或 POST /gate/admin/fp-reset。',
+      request_id: reqId } });
+  }
 
   // 兼容层：修掉悬空 $ref。
   // 实测（2026-10-20）：dsh 在 anthropic-messages 协议下转换 MCP 工具 schema 时
@@ -2633,36 +3007,61 @@ async function handle(req, res) {
       let fbody = null;
       try { fbody = JSON.parse(Buffer.concat(r.buffered).toString('utf8')); } catch {}
       if (fbody) {
-        const miss = fingerprint(fbody, body);
+        const fpRes = fingerprint(fbody, body, model);
+        const miss = fpRes.hard || [];
+        if (fpRes.soft && fpRes.soft.length) {
+          metrics.fpSoft = (metrics.fpSoft || 0) + 1;
+          for (const k of fpRes.soft) fpMissing.set('soft:' + k, (fpMissing.get('soft:' + k) || 0) + 1);
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_SOFT', model, profile: fpRes.profile, soft: fpRes.soft });
+        }
         if (miss.length) {
           metrics.fpMismatch = (metrics.fpMismatch || 0) + 1;
           for (const k of miss) fpMissing.set(k, (fpMissing.get(k) || 0) + 1);
           log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_MISMATCH', model,
-                missing: miss, keyCount: Object.keys(fbody).length, idShape: r.idShape });
+                missing: miss, soft: (fpRes.soft || []), profile: fpRes.profile, keyCount: Object.keys(fbody).length, idShape: r.idShape });
           pushAlert('FP_MISMATCH', { reqId, model, missing: miss });
+          if (fpRes.profile && metrics.profiles) metrics.profiles[fpRes.profile] = (metrics.profiles[fpRes.profile] || 0) + 1;
+          noteFingerprint(false, miss.join(','), 'json');
           if (FP_POLICY !== 'warn') {
-            // 丢弃本次响应（尚未写出任何字节），重新发一次；仍不匹配则退回本次响应
-            if (fpRetriesLeft > 0 && remainMs() > 3000) {
+            // 断路器 open（仅 block 模式）→ 不重发，避免成本爆炸
+            if (breakerBlocking('json')) {
+              metrics.fpBlocked = (metrics.fpBlocked || 0) + 1;
+              try { r.stream && r.stream.destroy(); } catch {}
+              res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '60',
+                'x-gate-result': 'blocked', 'x-gate-reason': 'fp_breaker_open',
+                'x-gate-trust': trustLevel(), 'x-gate-req-id': reqId });
+              return res.end(JSON.stringify({ error: { type: 'gate_fp_breaker_open',
+                message: '指纹校验连续失败已熔断；已 fail-closed，未交付任何内容。',
+                missing: miss, request_id: reqId } }));
+            }
+            const tooBig = FP_RETRY_MAX_BYTES > 0 && Number(bodyBuf ? bodyBuf.length : 0) > FP_RETRY_MAX_BYTES;
+            if (fpRetriesLeft > 0 && remainMs() > 3000 && !tooBig) {
               try { r.stream && r.stream.destroy(); } catch {}
               metrics.fpRetries = (metrics.fpRetries || 0) + 1;
-              let rr = null;
+              let rr = null, rrErr = null;
               try {
                 rr = await withSlot(() => realRequest({
                   pathName, body, incoming: req.headers, model,
                   signal: clientGone.signal, payloadFactory,
                   timeoutMs: Math.max(1500, Math.min(UPSTREAM_TIMEOUT_MS, remainMs())),
                 }), clientGone.signal);
-              } catch { rr = null; }
+              } catch (e) { rr = null; rrErr = e; }
               if (rr && rr.status >= 200 && rr.status < 300) {
                 return deliver(model, rr, attemptNo + 1, fpRetriesLeft - 1);
               }
-              // 重发失败：无法再交付本次响应（流已被销毁），走 fail-closed
+              // 重发失败：透传上游真实状态与错误体（否则排障看不到为什么重发也失败）
+              const upStatus = rr ? rr.status : 0;
+              const upBody = rr && rr.buffered
+                ? Buffer.concat(rr.buffered).toString('utf8').replace(/\s+/g, ' ').slice(0, 200)
+                : String((rrErr && rrErr.message) || '');
+              log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_RETRY_UPSTREAM_ERROR',
+                    model, upstreamStatus: upStatus, upstreamBody: upBody });
               res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
-                'x-gate-result': 'blocked', 'x-gate-reason': 'fp_mismatch',
+                'x-gate-result': 'blocked', 'x-gate-reason': 'fp_retry_upstream_error',
                 'x-gate-trust': trustLevel(), 'x-gate-req-id': reqId });
-              return res.end(JSON.stringify({ error: { type: 'gate_response_fingerprint',
-                message: '上游响应的形态与基线不符，且重发未成功；已 fail-closed，未交付任何内容。',
-                missing: miss, request_id: reqId } }));
+              return res.end(JSON.stringify({ error: { type: 'gate_fp_retry_upstream_error',
+                message: '指纹不符后重发，但重发请求被上游拒绝；已 fail-closed。',
+                missing: miss, upstream_status: upStatus, upstream_body: upBody, request_id: reqId } }));
             }
             if (FP_POLICY === 'block') {
               metrics.fpBlocked = (metrics.fpBlocked || 0) + 1;
@@ -2677,8 +3076,14 @@ async function handle(req, res) {
           }
           fpDegraded = '1';
         } else {
+          if (fpRes.profile && metrics.profiles) metrics.profiles[fpRes.profile] = (metrics.profiles[fpRes.profile] || 0) + 1;
+          {
+            const mm = fpRes.cache || {};
+            metrics.cache.samples++; if (mm.hit > 0) metrics.cache.hits++;
+          }
+          noteFingerprint(true, '', 'json');
           log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_OK', model,
-                keyCount: Object.keys(fbody).length });
+                profile: fpRes.profile, keyCount: Object.keys(fbody).length });
         }
       }
     }
@@ -2742,7 +3147,8 @@ async function handle(req, res) {
       ...(truncatedFlag ? { 'x-gate-truncated': '1' } : {}),
       'x-gate-trust': trustLevel(),
       // 2026-10-29：每响应指纹结果（ok / degraded）
-      'x-gate-fp': fpDegraded ? 'degraded' : 'ok',
+      // 2026-11-02：流式不设 x-gate-fp（流式校验是事后的，写 ok 是伪信号）
+      ...(String(r.ctype || '').includes('event-stream') ? {} : { 'x-gate-fp': fpDegraded ? 'degraded' : 'ok' }),
     });
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
@@ -2754,7 +3160,17 @@ async function handle(req, res) {
     // 那会在 tap 还在 flush 时就把响应结束掉 → 客户端丢失末尾的 `response.completed`（5 次里丢 4 次），
     // 同时 tap 也判定"事件家族不全"→ 假 FP_MISMATCH。
     // 正确做法：让 tap.pipe(res) 自己负责结束；source 的 'end' 只在**未挂 tap**的分支里兜底。
-    if (proto === 'responses') {
+    // 2026-11-02：只在**确实是 SSE** 时挂 tap。实测官方车道偶发「客户端收到完整 SSE，
+    // 但 tap 只看到 1137 字节 JSON」→ 假 FP_MISMATCH（events:[]）。用内容做最后一道闸：
+    // SSE 首字节必然是 event: / data: / 注释 :，否则不挂 tap（只透传）。
+    const isSseBody = (() => {
+      try {
+        if (!r.buffered || !r.buffered.length) return String(r.ctype || '').includes('event-stream');
+        const head = Buffer.concat(r.buffered).toString('utf8', 0, 64).trimStart();
+        return head.startsWith('event:') || head.startsWith('data:') || head.startsWith(':');
+      } catch { return false; }
+    })();
+    if (proto === 'responses' && isSseBody) {
       const tap = makeEventTap(reqId, model, r.buffered);
       tap.on('error', () => { try { res.end(); } catch {} });
       tap.pipe(res);
