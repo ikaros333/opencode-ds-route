@@ -280,6 +280,32 @@ x-gate-fp:     ok | degraded                       每响应形态指纹
 > 当前 opencode 车道上 `x-gate-proof` **永远是 `unverified`**——这是诚实标注：中转抹掉了官方痕迹，
 > 我们只能证明「模型族没换」（canary），不能证明「响应来自官方 infrastructure」。
 
+### 请求体上限：16 → 24 MiB（2026-11-04）
+
+长会话（几十步工具调用 + 网页抓取）上下文会持续膨胀，实测台账 p90≈12.5 MB、max 15.33 MB——
+16 MiB 的门槛几乎贴在天花板上，会周期性撞 413 中断任务。
+
+| 项 | 值 |
+|---|---|
+| 拒绝阈值 `GATE_MAX_BODY` | **24 MiB（25165824）** |
+| 大 body 观测阈值 `GATE_BIG_BODY_BYTES` | 12 MiB（超过就打 `x-gate-big-body: 1` + 台账 `BIG_BODY`） |
+| 413 报错体 | 带 `actual_bytes` / `limit_bytes`，响应头带 `x-gate-fatal: 1`（提示重试无意义） |
+
+**改这个上限必须四参数联动**，否则会被自己的超时掐断：
+
+```powershell
+setx GATE_MAX_BODY 25165824            # 24 MiB
+setx GATE_UPSTREAM_TIMEOUT_MS 120000   # 120 s
+setx GATE_TOTAL_BUDGET_MS 150000       # 150 s
+setx GATE_ATTEMPT_HARD_CAP_MS 180000   # 必须 > 上游超时
+```
+
+实测依据：上游接受 ≥20.97 MiB；真实 15.33 MB 请求中位耗时 19.3 s；
+只抬 `GATE_MAX_BODY` 而不管 `ATTEMPT_HARD_CAP_MS`（默认 180 s）会在 180.2 s 被切断。
+
+> 注意：**计划任务/监护进程启动的门控不继承当前终端环境变量**。改完 `setx` 后要重启监护进程，
+> 否则 health 里 `bodyLimit.maxBodyBytes` 仍是旧值。
+
 ### 三协议实测对比（同一时刻）
 
 | 协议 | prompt 透传 | 参数校验走官方 | 多轮工具 token | 结论 |

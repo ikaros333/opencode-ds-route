@@ -30,7 +30,7 @@
 | 蓄意 TLS 中间人可复刻判据通过 | 黑盒可观测性的信息论边界，见 README「不解决什么」 |
 | 第三方转售真官方 API 无法分辨 | 同一原因 |
 | 不启用 `GATE_TOKEN` 时本机进程可白嫖 key 配额 | 文档已写明；`install.ps1` 默认生成 token |
-| `/gate/*` 观测端点无需鉴权 | 仅绑回环，与 `gate/logs` 同一信任域 |
+| `/gate/*` 观测端点默认无需鉴权（health/metrics/proof/matrix/latency/alerts） | **接受的风险**：只绑 `127.0.0.1`，与 `gate/logs` 同一信任域；伪造 `Host` 头返回 421（挡浏览器 DNS rebinding）。能读它的进程本来就能读你的环境变量与项目文件。需要收紧时设 `GATE_OBS_TOKEN`（注意：`ocg-supervise` 的存活探活、`install.ps1` 验证与部分测试轮询目前不带观测 token，开启前需先做兼容改造） |
 | 上游判据变化导致全部 503 | 预期行为（fail-closed），按 BASELINE 处理 |
 
 ## 处理预期
