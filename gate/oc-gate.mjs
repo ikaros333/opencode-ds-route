@@ -211,7 +211,7 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   // 2026-10-29：每响应指纹
   fpMismatch: 0, fpRetries: 0, fpBlocked: 0,
   // 2026-11-02：软判据（未知字段等）与熔断计数
-  fpSoft: 0, streamSoft: 0, breakerOpenCount: 0, bigBody: 0, bodyTooLarge: 0,
+  fpSoft: 0, streamSoft: 0, breakerOpenCount: 0, bigBody: 0, bodyTooLarge: 0, proofVerified: 0, proofUnverified: 0,
   // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
   profiles: { official: 0, opencode: 0, unknown: 0 },
   cache: { samples: 0, hits: 0 } };
@@ -412,6 +412,12 @@ const EVIDENCE_MAX_AGE_MS = num('GATE_EVIDENCE_MAX_AGE_MS', 43200000, { min: 600
 // 2026-11-02：模型族证据策略。require = 快照里的 model.family 必须为 deepseek-consistent，否则 503。
 // 注意：证明的是「模型族」（分词一致性 + 官方校验器模板），不是权重托管方。
 const MODEL_EVIDENCE_POLICY = (process.env.GATE_MODEL_EVIDENCE_POLICY || 'label').toLowerCase();
+// 2026-11-04：统一 assure 档 —— off|label|probe|strict
+//   probe  = 需校验器可达（responses V1 或 messages V2）
+//   strict = 需 L0 指纹全过 + 逐响应官方痕迹（只有直连能做到）
+const ASSURANCE = (process.env.GATE_ASSURANCE || 'label').toLowerCase();
+// 2026-11-04：L0 指纹策略。label=只标注（默认）；reject=指纹不全即拒
+const L0_POLICY = (process.env.GATE_L0_POLICY || 'label').toLowerCase();
 let lastEvidenceVerdict = null;
 // 断路器：按模式分开（json / stream）。实测用户 100% 流式流量，单份状态会让熔断对真实流量失效。
 const BREAKER_POLICY = (process.env.GATE_BREAKER_POLICY || 'alert').toLowerCase();
@@ -871,6 +877,20 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
       const up = String(res.headers['x-opencode-upstream-model-id'] || '');
       const twoxx = res.statusCode >= 200 && res.statusCode < 300;
       const ctype = String(res.headers['content-type'] || '');
+      // 2026-11-04：逐响应官方痕迹（L0-2 / L0-3）
+      //   verified   = 上游带 x-ds-trace-id 且无第三方包装头（官方 infra 经手）
+      //   unverified = 出现 cf-ray / x-zen-model / x-opencode-log-id（中转层留下痕迹）
+      //   unknown    = 两者都没有，不下结论
+      let proof = null;   // 2026-11-04：逐响应官方痕迹（L0-2 / L0-3）
+      {
+        const hs = Object.keys(res.headers || {}).map((k) => k.toLowerCase());
+        const hasTrace = hs.includes('x-ds-trace-id');
+        const relayHs = ['cf-ray', 'x-zen-model', 'x-opencode-log-id'].filter((k) => hs.includes(k));
+        proof = { level: hasTrace && relayHs.length === 0 ? 'verified' : relayHs.length ? 'unverified' : 'unknown',
+                  trace: hasTrace, relay: relayHs };
+        if (proof.level === 'verified') metrics.proofVerified = (metrics.proofVerified || 0) + 1;
+        else if (proof.level === 'unverified') metrics.proofUnverified = (metrics.proofUnverified || 0) + 1;
+      }
       let verdict = 'unknown', classifier = 'none', idShape = '', votes = null, signals = [], buffered = [];
       if (twoxx) {
         const p = await peekBody(res, ctype.includes('event-stream'));
@@ -951,7 +971,7 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
       // 因此 `unknown` 根本走不到交付阶段；再把 unknown 升格成"可交付"就是反向开洞。
       // GATE_BLIND_MODE 开关一并移除（保留它只会让人以为还能开观察期）。
       settle({ verdict, classifier, idShape, votes, signals, status: res.statusCode, endpoint: '',
-               upstreamModel: up, stream: res, buffered, ctype, model, passthrough, retryAfterMs, ms: Date.now() - started });
+               upstreamModel: up, stream: res, buffered, ctype, proof, model, passthrough, retryAfterMs, ms: Date.now() - started });
       } catch (e) {
         // 响应处理内部抛错（peek 解析、Buffer 拼接等）必须收敛成 error 结论，
         // 否则外层 Promise 永不 settle、withSlot 槽位不归还，累计 MAX_CONC 次即全服务死锁。
@@ -2676,6 +2696,11 @@ async function handle(req, res) {
         return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: ev.endpoint?.verdict || 'unknown',
                  score: ev.endpoint?.score, max: ev.endpoint?.max, ageMs, stale: ageMs > EVIDENCE_MAX_AGE_MS,
                  impl: ev.impl?.profile || null, model: ev.model?.claim || 'unproven',
+                 l0: ev.l0 ? { score: ev.l0.score, max: ev.l0.max, items: ev.l0.items } : null,
+                 messages: ev.messages ? { score: ev.messages.score, max: ev.messages.max } : null,
+                 validator: ev.validator || null, assurance: ev.assurance || 'none',
+                 assurancePolicy: ASSURANCE, l0Policy: L0_POLICY,
+                 proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0 },
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };
       })(),
@@ -2879,6 +2904,35 @@ async function handle(req, res) {
         message: '模型族证据未达成（分词一致性 / 官方校验器模板）或已过期；已 fail-closed。',
         model_family: fam, evidence_age_ms: Number.isFinite(ageM) ? ageM : null,
         request_id: reqId } });
+    }
+  }
+  // 2026-11-04：assurance 闸（统一 inbox 判定）
+  if (ASSURANCE === 'probe' || ASSURANCE === 'strict' || L0_POLICY === 'reject') {
+    const evA = readEvidenceSnapshot(EVIDENCE_FILE);
+    const ageA = evA ? Date.now() - Date.parse(evA.at || '') : Infinity;
+    const fresh = evA && ageA <= EVIDENCE_MAX_AGE_MS;
+    const validatorOk = fresh && evA.validator?.reachable === true;
+    const strictOk = fresh && evA.assurance === 'strict';
+    const l0Ok = fresh && evA.l0 && evA.l0.max > 0 && evA.l0.score === evA.l0.max;
+    const needValidator = (ASSURANCE === 'probe' || ASSURANCE === 'strict');
+    const failed = (needValidator && !(ASSURANCE === 'strict' ? strictOk : validatorOk))
+      || (L0_POLICY === 'reject' && !l0Ok);
+    if (failed) {
+      const why = !fresh ? 'snapshot_missing_or_stale'
+        : (L0_POLICY === 'reject' && !l0Ok) ? 'l0_fingerprint_incomplete'
+        : (ASSURANCE === 'strict' ? 'strict_official_trace_missing' : 'validator_unreachable');
+      metrics.assuranceBlocked = (metrics.assuranceBlocked || 0) + 1;
+      log({ ts: new Date().toISOString(), reqId, result: 'ASSURANCE_UNMET', why,
+            assurance: ASSURANCE, l0Policy: L0_POLICY,
+            l0: evA?.l0 ? evA.l0.score + '/' + evA.l0.max : null,
+            validator: evA?.validator || null, ageMs: Number.isFinite(ageA) ? ageA : null });
+      res.setHeader('x-gate-fatal', '1');
+      return replyEarly(req, res, 503, { error: { type: 'gate_assurance_unmet',
+        message: '本车道的官方性证据未达标（' + why + '）；已 fail-closed。',
+        assurance: ASSURANCE, l0_policy: L0_POLICY, reason: why,
+        validator: evA?.validator || null,
+        l0: evA?.l0 ? { score: evA.l0.score, max: evA.l0.max } : null,
+        evidence_age_ms: Number.isFinite(ageA) ? ageA : null } });
     }
   }
   if (EVIDENCE_POLICY === 'require' && EVIDENCE_EXPECT === 'official') {
@@ -3171,6 +3225,8 @@ async function handle(req, res) {
       // 2026-10-29：每响应指纹结果（ok / degraded）
       // 2026-11-02：流式不设 x-gate-fp（流式校验是事后的，写 ok 是伪信号）
       ...(String(r.ctype || '').includes('event-stream') ? {} : { 'x-gate-fp': fpDegraded ? 'degraded' : 'ok' }),
+      // 2026-11-04：逐响应官方痕迹（verified / unverified / unknown）
+      'x-gate-proof': (r.proof && r.proof.level) || 'unknown',
     });
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
@@ -3290,7 +3346,23 @@ async function handle(req, res) {
   //
   // 代价（已知并接受）：预检拿不到结论（net/超时/fail）时直接 503；
   // 若上游改动 e1 的错误文案，responses 会持续 503 直到更新判据（台账 detail=e1:format 可诊断）。
-  if (decision.precheck?.verdict !== 'pass') {
+  // 2026-11-04：messages 协议的车道级证据兜底。
+  // messages 的成功响应 id 被中转重编号（53 hex），形态预检对它永远判 third，
+  // 但 MX 判据里的 M6（官方范围文案 + UUID4 request_id）能证明"校验器可达"。
+  // 因此在 probe/strict 档下，允许用快照里的 validator.messages 作为放行依据。
+  let precheckPassed = decision.precheck?.verdict === 'pass';
+  if (!precheckPassed && proto === 'messages' && (ASSURANCE === 'probe' || ASSURANCE === 'strict')) {
+    const evM = readEvidenceSnapshot(EVIDENCE_FILE);
+    const freshM = evM && (Date.now() - Date.parse(evM.at || '')) <= EVIDENCE_MAX_AGE_MS;
+    if (freshM && evM.validator?.messages === true) {
+      precheckPassed = true;
+      metrics.passByEvidence = (metrics.passByEvidence || 0) + 1;
+      log({ ts: new Date().toISOString(), reqId, proto, result: 'PRECHECK_BY_EVIDENCE',
+            basis: 'validator.messages', assurance: ASSURANCE,
+            precheckVerdict: decision.precheck?.verdict || 'missing' });
+    }
+  }
+  if (!precheckPassed) {
     const pv = decision.precheck?.verdict || 'missing';
     metrics.blocked++;
     metrics.precheckNotPass = (metrics.precheckNotPass || 0) + 1;
@@ -3318,6 +3390,22 @@ async function handle(req, res) {
     }));
   }
 
+  if (!candidates.length) {
+    // 2026-11-04：messages 的车道级证据兜底（同 precheck 分支）。
+    // 中转的车道形态判据必然 third（id 被重编号），但 M6 证明校验器可达，
+    // probe/strict 档下据此放行，避免把"形态不一致"误判成"路由被拒"。
+    if (proto === 'messages' && (ASSURANCE === 'probe' || ASSURANCE === 'strict')) {
+      const evL = readEvidenceSnapshot(EVIDENCE_FILE);
+      const freshL = evL && (Date.now() - Date.parse(evL.at || '')) <= EVIDENCE_MAX_AGE_MS;
+      if (freshL && evL.validator?.messages === true) {
+        metrics.passByEvidence = (metrics.passByEvidence || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'LANE_BY_EVIDENCE',
+              basis: 'validator.messages', assurance: ASSURANCE,
+              lanes: notes.map(n => n.model + ':' + n.verdict) });
+        candidates = CHAIN.map((m, i) => ({ model: m, idx: i, byEvidence: true }));
+      }
+    }
+  }
   if (!candidates.length) {
     metrics.blocked++;
     // 三种拒绝原因必须分开归因，否则客户端无法判断「等一会儿再试」还是「路由被拒」。

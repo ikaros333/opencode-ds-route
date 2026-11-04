@@ -627,6 +627,25 @@ has('AG32 大 body 台账', "result: 'BIG_BODY'");
 has('AG33 health 暴露 bodyLimit', 'bodyLimit: { maxBodyBytes: MAX_BODY');
 has('AG34 413 计数', 'metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1');
 
+// ===== 2026-11-04：L0 端点指纹 + messages 判据 + assurance 闸 =====
+console.log('\n=== AH. L0/MSG/assurance ===');
+hasIn(evLines, 'AH35 L0 判据常量', "export const L0_IDS = ['L0-1'");
+hasIn(evLines, 'AH36 messages 判据常量', "export const MSG_IDS = ['M1'");
+hasIn(evLines, 'AH37 探针支持可切换认证方式', "auth = 'bearer'");
+hasIn(evLines, 'AH38 L0-1 models 指纹', "add('L0-1'");
+hasIn(evLines, 'AH39 L0-2 官方 trace 头', "add('L0-2'");
+hasIn(evLines, 'AH40 L0-3 第三方头', "add('L0-3'");
+hasIn(evLines, 'AH41 L0-4 governor 文案', "add('L0-4'");
+hasIn(evLines, 'AH42 L0-5 跨厂商模型', "add('L0-5'");
+hasIn(evLines, 'AH43 M6 官方校验器', "add('M6'");
+hasIn(evLines, 'AH44 messages 路径按 host 选择', 'MSG_PATH');
+hasIn(evLines, 'AH45 validator 可达判定', 'const validator = { responses: v1, messages: v2');
+has('AH46 GATE_ASSURANCE 常量', 'const ASSURANCE = (process.env.GATE_ASSURANCE');
+has('AH47 GATE_L0_POLICY 常量', 'const L0_POLICY = (process.env.GATE_L0_POLICY');
+has('AH48 assurance fail-closed 503', "type: 'gate_assurance_unmet'");
+has('AH49 逐响应 proof 响应头', "'x-gate-proof'");
+has('AH50 health 暴露 assurancePolicy', 'assurancePolicy: ASSURANCE');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

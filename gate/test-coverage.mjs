@@ -1002,6 +1002,71 @@ try {
       `maxBody=${h?.bodyLimit?.maxBodyBytes} peak=${h?.bodyLimit?.estPeakMemMB}MB`);
     try { big.child.kill('SIGKILL'); } catch {}
   }
+  // ★ 2026-11-04：assurance 四档 + L0 指纹策略 + 逐响应官方痕迹
+  console.log('\n=== G24 assurance/L0 闸 + 逐响应 proof ===');
+  {
+    const fs4 = await import('node:fs');
+    const path4 = await import('node:path');
+    const dir4 = path4.join(process.env.TEMP || '.', 'ocg-asr-' + Date.now());
+    fs4.mkdirSync(dir4, { recursive: true });
+    const mk = (name, { reachable, level, l0score }) => {
+      const f = path4.join(dir4, name);
+      fs4.writeFileSync(f, JSON.stringify({ at: new Date().toISOString(), version: 1,
+        upstream: { host: 'mock', prefix: '' },
+        l0: { score: l0score, max: 5, items: [] },
+        messages: { score: 0, max: 6, items: [] },
+        validator: { responses: reachable, messages: reachable, reachable },
+        assurance: level,
+        endpoint: { verdict: 'non-official', score: 1, max: 6, items: [] },
+        impl: { score: 0, max: 2, profile: 'compat', items: [] },
+        model: { family: 'deepseek-thirdparty', claim: 'unproven', weights: 'unproven', items: [] } }));
+      return f;
+    };
+    const runA = async (env) => {
+      const port = P0 + 500 + Math.floor(Math.random() * 200);
+      const snap = env.__snap; delete env.__snap;
+      const g = await startGate(port, { ...env, GATE_EVIDENCE_FILE: snap });
+      let up = false;
+      for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+      await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+      const body = await res.text();
+      const proof = res.headers.get('x-gate-proof');
+      const h = await fetch(`http://127.0.0.1:${port}/gate/health`).then(r => r.json()).catch(() => null);
+      try { g.child.kill('SIGKILL'); } catch {}
+      return { status: res.status, body, proof, health: h };
+    };
+
+    const reach = mk('reach.json', { reachable: true, level: 'probe', l0score: 0 });
+    const noReach = mk('noreach.json', { reachable: false, level: 'none', l0score: 0 });
+    const strict = mk('strict.json', { reachable: true, level: 'strict', l0score: 5 });
+
+    const a = await runA({ __snap: reach, GATE_ASSURANCE: 'probe' });
+    check('G24 probe + 校验器可达 → 200', a.status === 200, `status=${a.status}`);
+
+    const b = await runA({ __snap: noReach, GATE_ASSURANCE: 'probe' });
+    check('G24 probe + 校验器不可达 → 503 gate_assurance_unmet',
+      b.status === 503 && b.body.includes('gate_assurance_unmet'), `status=${b.status}`);
+
+    const c4 = await runA({ __snap: reach, GATE_ASSURANCE: 'strict' });
+    check('G24 strict + 证据只到 probe → 503', c4.status === 503, `status=${c4.status}`);
+
+    const d4 = await runA({ __snap: strict, GATE_ASSURANCE: 'strict' });
+    check('G24 strict + 证据达 strict → 200', d4.status === 200, `status=${d4.status}`);
+
+    const e4 = await runA({ __snap: reach, GATE_L0_POLICY: 'reject' });
+    check('G24 L0_POLICY=reject + 指纹不全 → 503', e4.status === 503, `status=${e4.status}`);
+
+    const f4 = await runA({ __snap: strict, GATE_L0_POLICY: 'reject' });
+    check('G24 L0_POLICY=reject + 指纹全过 → 200', f4.status === 200, `status=${f4.status}`);
+
+    check('G24 逐响应 x-gate-proof 存在', ['verified', 'unverified', 'unknown'].includes(f4.proof), `proof=${f4.proof}`);
+    check('G24 health 暴露 assurance 与 proof 计数',
+      f4.health?.evidence?.assurancePolicy === 'label' && f4.health?.evidence?.proof !== undefined,
+      `policy=${f4.health?.evidence?.assurancePolicy}`);
+  }
 } finally {
   stopAll();
   mock.close();

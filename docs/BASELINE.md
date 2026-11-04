@@ -143,3 +143,43 @@ GATE_ATTEMPT_HARD_CAP_MS = 180000   (180 s，不变)
 - 真实请求 15 MB ≈ 20 s，24 MB 预估 30–40 s，均在 120 s 预算内；
 - **超过约 150 s 才返回首帧的请求会被判 `REJECT_SHAPE_UNKNOWN`**（首帧判定窗口耗尽），这是 shape 预检的固有边界；
 - 因此不要为了"极端大 body"继续抬上限——瓶颈会转移到首帧判定，而不是 body 限制。
+
+## B20 L0 指纹与 messages 判据标定（2026-11-04）
+
+| 判据 | 官方 api.deepseek.com | opencode /zen/go |
+|---|---|---|
+| L0-1 models | 2 条，`owned_by=deepseek` | **28 条**，`owned_by=opencode`（含 glm/gpt/grok/claude/qwen） |
+| L0-2 `x-ds-trace-id` | 有 | **无** |
+| L0-3 第三方头 | 无 | `cf-ray`、`x-zen-model`、`x-opencode-log-id` |
+| L0-4 401 文案 | `Authentication Fails (governor)` | `{"type":"server_error",…}` |
+| L0-5 `glm-5.2` | 400 | **200** |
+| M1 messages id | UUID4 | 53 位 hex（递增） |
+| M2 usage 包装 | 无 | `cost` + `opencode` |
+| M3 `service_tier` | 有 | 无 |
+| M4 额外 request id | 无 | `(request id: 2026…jGCQm7ig)` |
+| M5 包装前缀 | 无 | `Upstream request failed: [invalid_request_error]` |
+| M6 官方范围文案 + UUID4 | ✅ | ✅ **6/6** |
+
+**汇总**：官方 `L0=5/5, MX=6/6, assurance=strict`；opencode `L0=0/5, MX=1/6, assurance=probe`。
+
+### 2026-11-04 的重要修正
+
+此前记录的「中转注入 26 token」是**对比错误**造成的误判：
+当时拿官方 `deepseek-chat`（非推理，5 token）对比中转 `deepseek-v4.1-flash`（推理，31 token）。
+同模型同参数实测后：
+
+| 对比 | 官方 | 中转 |
+|---|---|---|
+| messages 均为 flash | 31 | **31** |
+| responses 均为 flash（默认 reasoning） | 31 / 36 | **31 / 36** |
+| responses（reasoning=none） | 5 / 10 / 10 | **5 / 10 / 10** |
+
+**结论：三个协议均无注入，token 计数逐条一致。**
+
+### 各协议能力矩阵（2026-11-04）
+
+| 协议 | token 透传 | 校验器可达 | 工具 | 流式 |
+|---|---|---|---|---|
+| responses · flash | ✅ | ❌ 0/3 | ✅ | ✅ |
+| responses · v4-pro | ✅ | ✅ 3/3 | ✅ | ✅ |
+| messages · flash | ✅ | ✅ 6/6 | ✅ | ✅（标准 Anthropic SSE） |

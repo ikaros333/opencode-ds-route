@@ -15,11 +15,18 @@ import { TOKENIZER_CORPUS, OFFICIAL_ERR_TEMPLATES, UUID4_REQUEST_ID } from './ba
 export const EVIDENCE_VERSION = 1;
 export const L1_IDS = ['EV1', 'EV2', 'EV3', 'EV4', 'EV5', 'EV6'];
 export const L2_IDS = ['EV7', 'EV8', 'EV9'];
+// 2026-11-04：L0 端点指纹（零成本判负）+ MX messages 协议判据（唯一可判正判负的协议）
+export const L0_IDS = ['L0-1', 'L0-2', 'L0-3', 'L0-4', 'L0-5'];
+export const MSG_IDS = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'];
+export const OFFICIAL_OWNERS = ['deepseek'];
 
-function request(t, { method = 'POST', path: p, body = null, headers = {}, timeoutMs = 15000 }) {
+function request(t, { method = 'POST', path: p, body = null, headers = {}, timeoutMs = 15000, auth = 'bearer' }) {
   return new Promise((resolve) => {
     const data = body ? Buffer.from(JSON.stringify(body)) : null;
-    const h = { authorization: 'Bearer ' + t.key, accept: 'application/json', ...headers };
+    const h = { accept: 'application/json', ...headers };
+    // 2026-11-04：auth 支持 bearer / apikey / none（L0-4 需要"无认证"探针）
+    if (auth === 'bearer' && t.key) h.authorization = 'Bearer ' + t.key;
+    if (auth === 'apikey' && t.key) h['x-api-key'] = t.key;
     if (data) { h['content-type'] = 'application/json'; h['content-length'] = data.length; }
     if (t.session) { h['x-opencode-session'] = 'evidence'; h['x-opencode-session-id'] = 'evidence'; }
     const lib = t.scheme === 'http' ? http : https;
@@ -28,7 +35,7 @@ function request(t, { method = 'POST', path: p, body = null, headers = {}, timeo
     }, (res) => {
       let b = '';
       res.on('data', (c) => b += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: b }));
+      res.on('end', () => resolve({ status: res.statusCode, body: b, headers: res.headers || {} }));
     });
     r.on('error', (e) => resolve({ status: 0, err: e.message }));
     r.on('timeout', () => { try { r.destroy(); } catch {} resolve({ status: 0, err: 'timeout' }); });
@@ -192,6 +199,98 @@ export async function runEvidence(o) {
     add('EV11', ok >= 3, `命中 ${ok}/${OFFICIAL_ERR_TEMPLATES.length} (${detail.join(' ')})`);
   }
 
+  // ---------------- 2026-11-04：L0 端点指纹（零成本判负）----------------
+  const hdrUnion = [];
+  {
+    const r = await request(t, { method: 'GET', path: '/v1/models', timeoutMs: timeout });
+    const hdrOf = (x) => Object.keys(x.headers || {}).map((k) => k.toLowerCase());
+    hdrUnion.push(...hdrOf(r));
+    let owners = [], count = 0;
+    if (r.status === 200) {
+      try {
+        const j = JSON.parse(r.body);
+        const data = Array.isArray(j.data) ? j.data : [];
+        count = data.length;
+        owners = [...new Set(data.map((m) => String(m.owned_by || '')))];
+      } catch {}
+    }
+    const ownOk = owners.length > 0 && owners.every((o) => OFFICIAL_OWNERS.includes(o));
+    add('L0-1', ownOk && count > 0 && count <= 5,
+      `HTTP ${r.status} 条目=${count} owned_by=${owners.join('|') || '-'}`);
+  }
+
+  // 一次真实小请求，读取响应头（L0-2 / L0-3 共用）
+  {
+    const r = await request(t, {
+      path: '/v1/responses',
+      body: { model: t.model, input: 'hi', max_output_tokens: 4, reasoning: { effort: 'none' } },
+      timeoutMs: timeout,
+    });
+    const hs = Object.keys(r.headers || {}).map((k) => k.toLowerCase());
+    hdrUnion.push(...hs);
+    const hasTrace = hs.includes('x-ds-trace-id');
+    const relayHs = ['cf-ray', 'x-zen-model', 'x-opencode-log-id'].filter((k) => hs.includes(k));
+    add('L0-2', hasTrace, hasTrace ? 'x-ds-trace-id 存在' : '缺 x-ds-trace-id');
+    add('L0-3', relayHs.length === 0, relayHs.length ? '第三方头: ' + relayHs.join(',') : '无第三方头');
+  }
+
+  // L0-4：无认证 401 文案（官方含 "Authentication Fails (governor)"）
+  {
+    const r = await request(t, {
+      path: '/v1/responses', body: { model: t.model, input: 'hi', max_output_tokens: 4 }, auth: 'none', timeoutMs: timeout,
+    });
+    const governor = /Authentication Fails \(governor\)/i.test(r.body || '');
+    add('L0-4', r.status === 401 && governor, `HTTP ${r.status}${governor ? ' governor' : ''}`);
+  }
+
+  // L0-5：跨厂商模型（官方必然拒绝；能跑通 = 转售池）
+  {
+    const r = await request(t, {
+      path: '/v1/chat/completions',
+      body: { model: OFFICIAL_OWNERS[0] === 'deepseek' ? 'glm-5.2' : 'glm-5.2', max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] },
+      timeoutMs: timeout,
+    });
+    add('L0-5', r.status === 400, `glm-5.2 → HTTP ${r.status}`);
+  }
+
+  // ---------------- 2026-11-04：MX messages 协议判据 ----------------
+  {
+    const M_HEADERS = { 'x-api-key': t.key, 'anthropic-version': '2023-06-01' };
+    // 2026-11-04：messages 路径因上游而异 —— 官方在 /anthropic/v1/messages，中转在 /v1/messages
+    const MSG_PATH = /(^|\.)deepseek\.com$/i.test(t.host) ? '/anthropic/v1/messages' : '/v1/messages';
+    // M1–M3：成功响应形态
+    const ok = await request(t, {
+      method: 'POST', path: MSG_PATH, headers: M_HEADERS,
+      body: { model: t.model, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      timeoutMs: timeout,
+    });
+    let id = '', usage = null;
+    if (ok.status === 200) {
+      try { const j = JSON.parse(ok.body); id = String(j.id || ''); usage = j.usage || {}; } catch {}
+    }
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+    add('M1', uuid, ok.status === 200 ? `id=${id.slice(0, 12)}(${id.length})` : 'HTTP ' + ok.status);
+    const wrapped = usage && ('cost' in usage || 'opencode' in usage);
+    add('M2', !!usage && !wrapped, usage ? (wrapped ? 'usage 含 cost/opencode' : 'usage 干净') : '无 usage');
+    add('M3', !!usage && 'service_tier' in usage, usage ? ('usage 键=' + Object.keys(usage).join(',')) : '无 usage');
+
+    // M4–M6：错误响应形态（非法 temperature）
+    const bad = await request(t, {
+      method: 'POST', path: MSG_PATH, headers: M_HEADERS,
+      body: { model: t.model, max_tokens: 4, temperature: 9, messages: [{ role: 'user', content: 'hi' }] },
+      timeoutMs: timeout,
+    });
+    const bmsg = msgOf(bad) || String(bad.body || '');
+    const extraReq = /\(request id:\s*\d{15,}/i.test(bmsg);
+    const wrappedPrefix = /Upstream request failed/i.test(bmsg);
+    const officialText = /valid range of temperature is \[0, 2\]/i.test(bmsg);
+    const uuidReq = UUID4_REQUEST_ID.test(bmsg);
+    add('M4', bad.status === 400 && !extraReq, extraReq ? '有 (request id: 2026…) 包装' : '无额外 request id');
+    add('M5', bad.status === 400 && !wrappedPrefix, wrappedPrefix ? '有 Upstream request failed 前缀' : '无包装前缀');
+    add('M6', bad.status === 400 && officialText && uuidReq,
+      `HTTP ${bad.status}${officialText ? '/官方文案' : ''}${uuidReq ? '/UUID4' : ''}`);
+  }
+
   return { at: new Date().toISOString(), upstream: { host: t.host, prefix: t.prefix, model: t.model }, items };
 }
 
@@ -210,6 +309,8 @@ export function scoreEvidence(ev) {
   const l1 = count(L1_IDS);          // 端点身份（EV1–EV6）
   const l2 = count(L2_IDS);          // 实现身份（EV7–EV9）
   const l3 = count(['EV10', 'EV11']); // 模型族（EV10 分词 / EV11 官方校验器）
+  const l0 = count(L0_IDS);          // 端点指纹（2026-11-04）
+  const mx = count(MSG_IDS);         // messages 协议（2026-11-04）
 
   const verdict = l1.max === 0 ? 'unknown'
     : l1.score >= Math.max(4, l1.max - 1) ? 'official'
@@ -231,9 +332,28 @@ export function scoreEvidence(ev) {
     return 'unknown';
   })();
 
+  // 2026-11-04：校验器可达性（判正）。V1 = responses 官方范围文案；V2 = messages 官方范围文案。
+  const v1 = !!(byId.EV3?.ok && byId.EV4?.ok);
+  const v2 = !!byId.M6?.ok;
+  const validator = { responses: v1, messages: v2, reachable: v1 || v2 };
+
+  // 2026-11-04：assurance 四档（供门控 GATE_ASSURANCE 使用）
+  //   strict  = L0 全通过（官方指纹齐全，只有直连能做到）
+  //   probe   = 任一校验器可达（V1 或 V2）
+  //   label   = 不判，只记录
+  //   off     = 关闭
+  const trackerOk = byId['L0-2']?.ok;   // 逐响应官方痕迹（x-ds-trace-id）
+  const level = (l0.max > 0 && l0.score === l0.max && trackerOk) ? 'strict'
+    : validator.reachable ? 'probe'
+    : 'none';
+
   return {
     ...ev,
     version: EVIDENCE_VERSION,
+    l0: { ...l0, items: (ev.items || []).filter((x) => L0_IDS.includes(x.id)) },
+    messages: { ...mx, items: (ev.items || []).filter((x) => MSG_IDS.includes(x.id)), officialTrace: trackerOk },
+    validator,
+    assurance: level,
     endpoint: { ...l1, verdict, items: (ev.items || []).filter((x) => L1_IDS.includes(x.id)) },
     impl: { ...l2, profile: implProfile, items: (ev.items || []).filter((x) => L2_IDS.includes(x.id)) },
     model: {

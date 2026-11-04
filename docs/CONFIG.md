@@ -310,3 +310,58 @@ setx GATE_ATTEMPT_HARD_CAP_MS 180000   # 保持 > 上游超时
 ```
 
 > 注意：**计划任务/监护进程启动的门控不会继承当前终端的环境变量**。改完 `setx` 后需要重启监护进程（`ocg stop` → 重新拉起 supervise），否则 health 里 `bodyLimit.maxBodyBytes` 仍是旧值。
+
+## 端点指纹与 assurance 闸（2026-11-04）
+
+三档证据体系：**L0 端点指纹**（零成本判负）→ **L1/L2 端点与实现身份** → **MX messages 协议**（唯一可判正）。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATE_ASSURANCE` | `label` | `off` / `label`（只记录）/ `probe`（需校验器可达）/ `strict`（需 L0 全过 + 逐响应官方痕迹） |
+| `GATE_L0_POLICY` | `label` | `label` 只标注；`reject` 则 L0 指纹不全即 503 `gate_assurance_unmet` |
+| `GATE_ALLOW_MESSAGES` | 关闭 | 设为 `1` 才允许客户端使用 `/v1/messages` |
+
+### L0 端点指纹（5 条，零 token，秒级）
+
+| ID | 判据 | 官方 | 中转/自部署 |
+|---|---|---|---|
+| L0-1 | `GET /v1/models` 的 `owned_by` 全为 `deepseek` 且条目 ≤5 | ✅ | ❌ |
+| L0-2 | 响应头含 `x-ds-trace-id` | ✅ | ❌ |
+| L0-3 | 无 `cf-ray` / `x-zen-model` / `x-opencode-log-id` | ✅ | ❌ |
+| L0-4 | 无认证 401 文案含 `Authentication Fails (governor)` | ✅ | ❌ |
+| L0-5 | 试跑 `glm-5.2` 必须 400（能跑通=转售池） | ✅ | ❌ |
+
+### MX messages 协议判据（6 条）
+
+| ID | 判据 | 官方 | 中转 |
+|---|---|---|---|
+| M1 | 成功响应 `id` 为 UUID4 | ✅ | 53~62 hex |
+| M2 | `usage` 无 `cost`/`opencode` | ✅ | ❌ |
+| M3 | `usage` 含 `service_tier` | ✅ | ❌ |
+| M4 | 错误无 `(request id: 2026…)` 包装 | ✅ | ❌ |
+| M5 | 错误无 `Upstream request failed:` 前缀 | ✅ | ❌ |
+| M6 | 错误含官方范围文案 + UUID4 `request_id` | ✅ | ✅（=校验器可达） |
+
+> messages 路径因上游而异：官方是 `/anthropic/v1/messages`，中转是 `/v1/messages`，探针按 host 自动选择。
+
+### 逐响应官方痕迹
+
+每个成功响应都打一个响应头：
+
+```
+x-gate-proof: verified    ← 上游带 x-ds-trace-id 且无第三方包装头
+x-gate-proof: unverified  ← 出现 cf-ray / x-zen-model / x-opencode-log-id
+x-gate-proof: unknown     ← 两者都没有
+```
+
+### 常见组合
+
+```bash
+# 中转通道 + 需要"校验器可达"才放行
+GATE_ALLOW_MESSAGES=1
+GATE_ASSURANCE=probe
+
+# 直连官方
+GATE_ASSURANCE=strict
+GATE_L0_POLICY=reject
+```

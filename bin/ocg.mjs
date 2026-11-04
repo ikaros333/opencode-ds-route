@@ -192,6 +192,24 @@ async function cmdAuditLane(rest) {
       console.log(`    ${m} ${it.id}  ${it.detail}`);
     }
     console.log(`\n  L3 模型族：${scored.model.family}  ${scored.model.familyScore}/${scored.model.familyMax}（权重:${scored.model.weights}）`);
+    if (scored.l0) {
+      console.log(`\n  L0 端点指纹（零成本判负）：${scored.l0.score}/${scored.l0.max}`);
+      for (const it of scored.l0.items) {
+        const m = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
+        console.log(`    ${m} ${it.id}  ${it.detail}`);
+      }
+    }
+    if (scored.messages) {
+      console.log(`\n  MX messages 协议（唯一可判正判负）：${scored.messages.score}/${scored.messages.max}`);
+      for (const it of scored.messages.items) {
+        const m = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
+        console.log(`    ${m} ${it.id}  ${it.detail}`);
+      }
+    }
+    if (scored.validator) {
+      console.log(`\n  校验器可达：responses=${scored.validator.responses ? '是' : '否'}  messages=${scored.validator.messages ? '是' : '否'}  → ${scored.validator.reachable ? '可达（判正）' : '不可达（无法判正）'}`);
+      console.log(`  assurance 档：${scored.assurance}   （probe=需校验器可达；strict=需 L0 全过 + 逐响应官方痕迹）`);
+    }
   }
   if (has('write')) {
     const out = process.env.GATE_EVIDENCE_FILE || path.join(ROOT, 'gate', 'logs', 'lane-evidence.json');
