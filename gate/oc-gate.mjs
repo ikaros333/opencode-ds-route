@@ -783,6 +783,9 @@ function probe(pathName, body, incoming, signal) {
       ? { model: body.model, input: 'ping', max_output_tokens: 1 }
       : { model: body.model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] };
     const payload = Buffer.from(JSON.stringify(tiny), 'utf8');
+    if (process.env.GATE_DEBUG_PROBE === '1') {
+      try { console.error('[probe] path=' + pathName + ' proto=' + proto + ' body=' + JSON.stringify(tiny)); } catch {}
+    }
     const headers = { ...headersFor(pathName, incoming, incoming['x-opencode-session'] || STABLE_SESSION), 'content-length': String(payload.length) };
     metrics.probes++;
     const req = transport.request({ host: HOST, port: HOST_PORT, path: pathName, method: 'POST', headers, signal }, async (res) => {
@@ -831,6 +834,9 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
   return new Promise((resolve) => {
     // 大 body 场景下 JSON.stringify 很贵：优先用调用方预构造的工厂，换 model 时只做轻量拼接
     const payload = payloadFactory ? payloadFactory(model) : Buffer.from(JSON.stringify({ ...body, model }), 'utf8');
+    if (process.env.GATE_DEBUG_PROBE === '1') {
+      try { console.error('[real] path=' + pathName + ' body=' + payload.toString('utf8').slice(0, 400)); } catch {}
+    }
     const sess = incoming['x-opencode-session'] || STABLE_SESSION;
     const headers = { ...headersFor(pathName, incoming, sess), 'content-length': String(payload.length) };
     const started = Date.now();
@@ -3346,23 +3352,10 @@ async function handle(req, res) {
   //
   // 代价（已知并接受）：预检拿不到结论（net/超时/fail）时直接 503；
   // 若上游改动 e1 的错误文案，responses 会持续 503 直到更新判据（台账 detail=e1:format 可诊断）。
-  // 2026-11-04：messages 协议的车道级证据兜底。
-  // messages 的成功响应 id 被中转重编号（53 hex），形态预检对它永远判 third，
-  // 但 MX 判据里的 M6（官方范围文案 + UUID4 request_id）能证明"校验器可达"。
-  // 因此在 probe/strict 档下，允许用快照里的 validator.messages 作为放行依据。
-  let precheckPassed = decision.precheck?.verdict === 'pass';
-  if (!precheckPassed && proto === 'messages' && (ASSURANCE === 'probe' || ASSURANCE === 'strict')) {
-    const evM = readEvidenceSnapshot(EVIDENCE_FILE);
-    const freshM = evM && (Date.now() - Date.parse(evM.at || '')) <= EVIDENCE_MAX_AGE_MS;
-    if (freshM && evM.validator?.messages === true) {
-      precheckPassed = true;
-      metrics.passByEvidence = (metrics.passByEvidence || 0) + 1;
-      log({ ts: new Date().toISOString(), reqId, proto, result: 'PRECHECK_BY_EVIDENCE',
-            basis: 'validator.messages', assurance: ASSURANCE,
-            precheckVerdict: decision.precheck?.verdict || 'missing' });
-    }
-  }
-  if (!precheckPassed) {
+  // 2026-11-04 结论：messages 不能作为业务通道 —— 中转把成功响应的 id 重编号成 53 hex，
+  // 「身份白名单」（identity_whitelist）按 id 形态直接判 third 并拒绝，这是项目的核心判据，
+  // 不能为单一协议放宽。messages 只作为**证据探针**（MX 判据，见 gate/evidence.mjs）使用。
+  if (decision.precheck?.verdict !== 'pass') {
     const pv = decision.precheck?.verdict || 'missing';
     metrics.blocked++;
     metrics.precheckNotPass = (metrics.precheckNotPass || 0) + 1;
@@ -3391,20 +3384,6 @@ async function handle(req, res) {
   }
 
   if (!candidates.length) {
-    // 2026-11-04：messages 的车道级证据兜底（同 precheck 分支）。
-    // 中转的车道形态判据必然 third（id 被重编号），但 M6 证明校验器可达，
-    // probe/strict 档下据此放行，避免把"形态不一致"误判成"路由被拒"。
-    if (proto === 'messages' && (ASSURANCE === 'probe' || ASSURANCE === 'strict')) {
-      const evL = readEvidenceSnapshot(EVIDENCE_FILE);
-      const freshL = evL && (Date.now() - Date.parse(evL.at || '')) <= EVIDENCE_MAX_AGE_MS;
-      if (freshL && evL.validator?.messages === true) {
-        metrics.passByEvidence = (metrics.passByEvidence || 0) + 1;
-        log({ ts: new Date().toISOString(), reqId, proto, result: 'LANE_BY_EVIDENCE',
-              basis: 'validator.messages', assurance: ASSURANCE,
-              lanes: notes.map(n => n.model + ':' + n.verdict) });
-        candidates = CHAIN.map((m, i) => ({ model: m, idx: i, byEvidence: true }));
-      }
-    }
   }
   if (!candidates.length) {
     metrics.blocked++;

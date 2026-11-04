@@ -183,3 +183,27 @@ GATE_ATTEMPT_HARD_CAP_MS = 180000   (180 s，不变)
 | responses · flash | ✅ | ❌ 0/3 | ✅ | ✅ |
 | responses · v4-pro | ✅ | ✅ 3/3 | ✅ | ✅ |
 | messages · flash | ✅ | ✅ 6/6 | ✅ | ✅（标准 Anthropic SSE） |
+
+## B21 messages 为何不能作业务通道（2026-11-04 定位结论）
+
+排查过程踩到三个独立问题，最终结论是「架构上不允许」，不是 bug：
+
+1. **candidates 类型混用**：若把 `candidates` 写成对象数组，下游 `const model = candidates[idx]`
+   会把整个对象当模型名 → 上游收到 `{"model":"[object Object]"}` → 400 `Model is unavailable`。
+   回显上游确认：`[real] path=/zen/go/v1/messages body={"model":"[object Object]",...}`
+2. **多层闸门互相独立**：预检闸、候选筛选闸、交付闸各自判断，改一处仍会被另一处挡。
+3. **根本原因**：`identity_whitelist`（身份白名单）在 `verdict==='third'` 且非 4xx 透传时**硬拒绝**，
+   与 `allowAllLanes` 无关。
+
+中转 messages 的成功响应：
+
+| 项 | 官方 | 中转 |
+|---|---|---|
+| 响应 id | UUID4 | **53~62 hex（递增）** |
+| usage | `service_tier` | `cost` + `opencode` |
+| 响应头 | `x-ds-trace-id` | `x-opencode-log-id` |
+
+即：**每个 messages 成功响应都必然被判 third**，要放行就只能放宽身份白名单——那等于放弃项目最核心的判据。
+
+**结论**：messages 只作为**证据探针**（MX 判据），其 M6 已能证明"校验器可达"并写入快照；
+业务通道保持 responses，messages 端点对客户端继续 `503 gate_proto_blocked`。
