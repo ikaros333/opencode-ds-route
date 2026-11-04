@@ -392,6 +392,7 @@ export function scoreEvidence(ev) {
       const s = rows13.filter((r) => r.hit).length;
       return { score: rows13.length ? s : cy.score, max: rows13.length || cy.max,
                ok: e13?.ok === true, skipped: !!e13?.skipped,
+               reason: e13?.skipped ? 'skipped' : (e13?.ok ? 'consistent' : 'mismatch'),
                items: (ev.items || []).filter((x) => x.id === 'EV13') };
     })(),
     validator,

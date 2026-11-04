@@ -1080,7 +1080,7 @@ try {
         upstream: { host: 'mock', prefix: '' },
         l0: { score: 0, max: 5, items: [] },
         messages: { score: 1, max: 6, items: [] },
-        canary: { score: canaryOk ? 10 : 2, max: 10, ok: canaryOk, items: [] },
+        canary: { score: canaryOk === null ? 0 : (canaryOk ? 10 : 2), max: canaryOk === null ? 0 : 10, ok: canaryOk === true, skipped: canaryOk === null, items: [] },
         validator,
         assurance: 'probe',
         endpoint: { verdict: 'non-official', score: 1, max: 6, items: [] },
@@ -1128,6 +1128,11 @@ try {
 
     const f5 = await runC({ __snap: respFalse, GATE_ASSURANCE: 'probe' });
     check('G27 responses 显式 false + probe → 503', f5.status === 503, `status=${f5.status}`);
+
+    // 2026-11-04：直连场景 canary 会 skipped（目标即官方）——不能因此拒绝，否则自锁
+    const skipCy = mk('cy-skip.json', { validator: { responses: true, messages: true, reachable: true }, canaryOk: null });
+    const g5 = await runC({ __snap: skipCy, GATE_CANARY_POLICY: 'require' });
+    check('G26 canary skipped（直连）+ require → 200（不自锁）', g5.status === 200, `status=${g5.status}`);
   }
 } finally {
   stopAll();

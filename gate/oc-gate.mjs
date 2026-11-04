@@ -764,6 +764,25 @@ function normalizeToolSchemas(tools) {
   }
   return fixed;
 }
+/**
+ * 2026-11-04：把最近一次证据快照里的 canary 结果压成响应头值（形如 "10/10"）。
+ * 读快照有成本，这里做 5 秒缓存；读不到返回空串（不设头）。
+ */
+let canaryHdrCache = { at: 0, val: '' };
+function lastCanaryHeader() {
+  const now = Date.now();
+  if (now - canaryHdrCache.at < 5000) return canaryHdrCache.val;
+  let val = '';
+  try {
+    const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+    if (ev?.canary && typeof ev.canary.max === 'number' && ev.canary.max > 0) {
+      val = ev.canary.skipped ? 'skipped' : ev.canary.score + '/' + ev.canary.max;
+    }
+  } catch {}
+  canaryHdrCache = { at: now, val };
+  return val;
+}
+
 function headersFor(pathName, incoming, sess) {
   const h = {
     'content-type': 'application/json',
@@ -2930,10 +2949,12 @@ async function handle(req, res) {
       : proto === 'responses' ? evA?.validator?.responses
       : undefined;
     const validatorKnown = fresh && typeof protoEvidence === 'boolean';
-    const validatorOk = validatorKnown && protoEvidence === true;
     const strictOk = fresh && evA.assurance === 'strict';
     const l0Ok = fresh && evA.l0 && evA.l0.max > 0 && evA.l0.score === evA.l0.max;
-    const canaryOk = fresh && evA.canary && evA.canary.max > 0 && evA.canary.ok === true;
+    // skipped 有两种来源：目标就是官方（无需比对）或没有官方基线。
+    // 前者不能因此拒绝（否则直连会被自己的 canary 闸打死），后者才算"无法证明"。
+    const canarySkipped = fresh && evA.canary && evA.canary.skipped === true;
+    const canaryOk = fresh && (evA.canary?.ok === true || canarySkipped);
     const needValidator = (ASSURANCE === 'probe' || ASSURANCE === 'strict');
     // 三态：pass / fail / unknown（快照里没有该协议字段）。unknown 不拦——避免把"没测过"当成"不达标"。
     const protoVerdict = !fresh ? 'stale' : (protoEvidence === undefined ? 'unknown' : (protoEvidence ? 'pass' : 'fail'));
@@ -3255,6 +3276,8 @@ async function handle(req, res) {
       ...(String(r.ctype || '').includes('event-stream') ? {} : { 'x-gate-fp': fpDegraded ? 'degraded' : 'ok' }),
       // 2026-11-04：逐响应官方痕迹（verified / unverified / unknown）
       'x-gate-proof': (r.proof && r.proof.level) || 'unknown',
+      // 2026-11-04：本次放行所依据的 canary 结果（便于在客户端侧直接看到'模型族是否被验证过'）
+      ...(lastCanaryHeader() ? { 'x-gate-canary': lastCanaryHeader() } : {}),
     });
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
