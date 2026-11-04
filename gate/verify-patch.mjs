@@ -646,6 +646,19 @@ has('AH48 assurance fail-closed 503', "type: 'gate_assurance_unmet'");
 has('AH49 逐响应 proof 响应头', "'x-gate-proof'");
 has('AH50 health 暴露 assurancePolicy', 'assurancePolicy: ASSURANCE');
 
+// ===== 2026-11-04：随机 canary + 按协议解耦 =====
+console.log('\n=== AJ. canary / 协议解耦 ===');
+hasIn(evLines, 'AJ1 EV13 canary 探针', "add('EV13'");
+hasIn(evLines, 'AJ2 canary 使用随机串', 'crypto.randomBytes(7)');
+hasIn(evLines, 'AJ3 canary 只在非官方目标跑', 'isOfficial || !baseKey');
+hasIn(evLines, 'AJ4 canary 计入打分', 'const cy = count([');
+hasIn(evLines, 'AJ5 canary 输出到 scored', 'canary: (() => {');
+has('AJ6 GATE_CANARY_POLICY 常量', 'const CANARY_POLICY = (process.env.GATE_CANARY_POLICY');
+has('AJ7 canary 失败 503 原因', "'canary_mismatch'");
+has('AJ8 assurance 按协议取证据', 'const protoEvidence = proto === ');
+has('AJ9 unknown 不拦（三态）', "protoEvidence === undefined ? 'unknown'");
+has('AJ10 health 暴露 canaryPolicy', 'canaryPolicy: CANARY_POLICY');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

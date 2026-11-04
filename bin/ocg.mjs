@@ -206,6 +206,13 @@ async function cmdAuditLane(rest) {
         console.log(`    ${m} ${it.id}  ${it.detail}`);
       }
     }
+    if (scored.canary) {
+      console.log(`\n  CY 随机 canary（抓换模型）：${scored.canary.score}/${scored.canary.max}` + (scored.canary.ok ? '  → 模型族一致' : '  → 与官方不一致（疑似换模型）'));
+      for (const it of scored.canary.items) {
+        const m2 = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
+        console.log(`    ${m2} ${it.id}  ${it.detail}`);
+      }
+    }
     if (scored.validator) {
       console.log(`\n  校验器可达：responses=${scored.validator.responses ? '是' : '否'}  messages=${scored.validator.messages ? '是' : '否'}  → ${scored.validator.reachable ? '可达（判正）' : '不可达（无法判正）'}`);
       console.log(`  assurance 档：${scored.assurance}   （probe=需校验器可达；strict=需 L0 全过 + 逐响应官方痕迹）`);

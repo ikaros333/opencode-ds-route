@@ -418,6 +418,9 @@ const MODEL_EVIDENCE_POLICY = (process.env.GATE_MODEL_EVIDENCE_POLICY || 'label'
 const ASSURANCE = (process.env.GATE_ASSURANCE || 'label').toLowerCase();
 // 2026-11-04：L0 指纹策略。label=只标注（默认）；reject=指纹不全即拒
 const L0_POLICY = (process.env.GATE_L0_POLICY || 'label').toLowerCase();
+// 2026-11-04：canary 策略。require = 最近一次随机分词比对必须通过（抓"换成别的模型"）。
+// 实测判别力：官方 flash 39 tokens vs 中转 glm-5.2 21 tokens vs 官方 chat 13 tokens（同一随机串）。
+const CANARY_POLICY = (process.env.GATE_CANARY_POLICY || 'label').toLowerCase();
 let lastEvidenceVerdict = null;
 // 断路器：按模式分开（json / stream）。实测用户 100% 流式流量，单份状态会让熔断对真实流量失效。
 const BREAKER_POLICY = (process.env.GATE_BREAKER_POLICY || 'alert').toLowerCase();
@@ -2705,7 +2708,8 @@ async function handle(req, res) {
                  l0: ev.l0 ? { score: ev.l0.score, max: ev.l0.max, items: ev.l0.items } : null,
                  messages: ev.messages ? { score: ev.messages.score, max: ev.messages.max } : null,
                  validator: ev.validator || null, assurance: ev.assurance || 'none',
-                 assurancePolicy: ASSURANCE, l0Policy: L0_POLICY,
+                 assurancePolicy: ASSURANCE, l0Policy: L0_POLICY, canaryPolicy: CANARY_POLICY,
+                 canary: ev.canary ? { score: ev.canary.score, max: ev.canary.max, ok: ev.canary.ok } : null,
                  proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0 },
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };
@@ -2912,31 +2916,49 @@ async function handle(req, res) {
         request_id: reqId } });
     }
   }
-  // 2026-11-04：assurance 闸（统一 inbox 判定）
-  if (ASSURANCE === 'probe' || ASSURANCE === 'strict' || L0_POLICY === 'reject') {
+  // 2026-11-04：assurance 闸 —— **按协议取证据**。
+  // 修复耦合缺陷：原先看 `validator.reachable`（= V1 || V2），而今天 responses 侧 V1=false，
+  // 于是"能否放行 responses 流量"完全取决于 messages 探针 → 在 messages 的实现 B 窗口里，
+  // 一条 M6 失败就会把全部 responses 业务打成 503（已实测复现）。
+  // 现在：responses 只看 validator.responses，messages 只看 validator.messages；
+  // 字段缺失视为 unknown（不拦，只标注），避免把"没测过"当成"不达标"。
+  if (ASSURANCE === 'probe' || ASSURANCE === 'strict' || L0_POLICY === 'reject' || CANARY_POLICY === 'require') {
     const evA = readEvidenceSnapshot(EVIDENCE_FILE);
     const ageA = evA ? Date.now() - Date.parse(evA.at || '') : Infinity;
     const fresh = evA && ageA <= EVIDENCE_MAX_AGE_MS;
-    const validatorOk = fresh && evA.validator?.reachable === true;
+    const protoEvidence = proto === 'messages' ? evA?.validator?.messages
+      : proto === 'responses' ? evA?.validator?.responses
+      : undefined;
+    const validatorKnown = fresh && typeof protoEvidence === 'boolean';
+    const validatorOk = validatorKnown && protoEvidence === true;
     const strictOk = fresh && evA.assurance === 'strict';
     const l0Ok = fresh && evA.l0 && evA.l0.max > 0 && evA.l0.score === evA.l0.max;
+    const canaryOk = fresh && evA.canary && evA.canary.max > 0 && evA.canary.ok === true;
     const needValidator = (ASSURANCE === 'probe' || ASSURANCE === 'strict');
-    const failed = (needValidator && !(ASSURANCE === 'strict' ? strictOk : validatorOk))
-      || (L0_POLICY === 'reject' && !l0Ok);
+    // 三态：pass / fail / unknown（快照里没有该协议字段）。unknown 不拦——避免把"没测过"当成"不达标"。
+    const protoVerdict = !fresh ? 'stale' : (protoEvidence === undefined ? 'unknown' : (protoEvidence ? 'pass' : 'fail'));
+    const failed = (needValidator && ASSURANCE === 'strict' && !strictOk)
+      || (needValidator && ASSURANCE === 'probe' && protoVerdict === 'fail')
+      || (needValidator && protoVerdict === 'stale')
+      || (L0_POLICY === 'reject' && !l0Ok)
+      || (CANARY_POLICY === 'require' && !canaryOk);
     if (failed) {
       const why = !fresh ? 'snapshot_missing_or_stale'
+        : (CANARY_POLICY === 'require' && !canaryOk) ? 'canary_mismatch'
         : (L0_POLICY === 'reject' && !l0Ok) ? 'l0_fingerprint_incomplete'
         : (ASSURANCE === 'strict' ? 'strict_official_trace_missing' : 'validator_unreachable');
       metrics.assuranceBlocked = (metrics.assuranceBlocked || 0) + 1;
-      log({ ts: new Date().toISOString(), reqId, result: 'ASSURANCE_UNMET', why,
-            assurance: ASSURANCE, l0Policy: L0_POLICY,
-            l0: evA?.l0 ? evA.l0.score + '/' + evA.l0.max : null,
-            validator: evA?.validator || null, ageMs: Number.isFinite(ageA) ? ageA : null });
+      log({ ts: new Date().toISOString(), reqId, result: 'ASSURANCE_UNMET', why, proto,
+            assurance: ASSURANCE, l0Policy: L0_POLICY, canaryPolicy: CANARY_POLICY,
+            protoEvidence: protoEvidence === undefined ? 'unknown' : protoEvidence,
+            canary: evA?.canary ? evA.canary.score + '/' + evA.canary.max : null,
+            l0: evA?.l0 ? evA.l0.score + '/' + evA.l0.max : null, ageMs: Number.isFinite(ageA) ? ageA : null });
       res.setHeader('x-gate-fatal', '1');
       return replyEarly(req, res, 503, { error: { type: 'gate_assurance_unmet',
-        message: '本车道的官方性证据未达标（' + why + '）；已 fail-closed。',
-        assurance: ASSURANCE, l0_policy: L0_POLICY, reason: why,
-        validator: evA?.validator || null,
+        message: '本协议（' + proto + '）的官方性证据未达标（' + why + '）；已 fail-closed。',
+        proto, assurance: ASSURANCE, l0_policy: L0_POLICY, canary_policy: CANARY_POLICY, reason: why,
+        proto_evidence: protoEvidence === undefined ? 'unknown' : protoEvidence,
+        canary: evA?.canary ? { score: evA.canary.score, max: evA.canary.max } : null,
         l0: evA?.l0 ? { score: evA.l0.score, max: evA.l0.max } : null,
         evidence_age_ms: Number.isFinite(ageA) ? ageA : null } });
     }

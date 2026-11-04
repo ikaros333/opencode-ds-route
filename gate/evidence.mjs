@@ -8,6 +8,7 @@
 import https from 'node:https';
 import http from 'node:http';
 import tls from 'node:tls';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { TOKENIZER_CORPUS, OFFICIAL_ERR_TEMPLATES, UUID4_REQUEST_ID } from './baseline.mjs';
@@ -291,6 +292,35 @@ export async function runEvidence(o) {
       `HTTP ${bad.status}${officialText ? '/官方文案' : ''}${uuidReq ? '/UUID4' : ''}`);
   }
 
+  // ---------------- 2026-11-04：EV13 随机 canary（动态分词比对）----------------
+  // 目的：抓"模型被换成别的"——同一个随机串在官方与目标端的分词数必须一致。
+  // 实测判别力：官方 flash 39 / 官方 chat 13 / 中转 glm-5.2 21（同一串）。
+  // 只在目标端不是官方时才有意义（官方自身与自己比是恒真的）。
+  {
+    const baseKey = process.env.DEEPSEEK_API_KEY || '';
+    const isOfficial = /(^|\.)deepseek\.com$/i.test(t.host);
+    if (isOfficial || !baseKey) {
+      add('EV13', false, isOfficial ? 'skipped（目标即官方，无需比对）' : 'skipped（缺 DEEPSEEK_API_KEY 基线）', { skipped: true });
+    } else {
+      const rows = [];
+      let ok = 0;
+      const baseT = { host: 'api.deepseek.com', port: 443, scheme: 'https', prefix: '', key: baseKey, model: 'deepseek-flash' };
+      for (let i = 0; i < 10; i++) {
+        const s = crypto.randomBytes(7).toString('base64').slice(0, 10) + ' ' + crypto.randomBytes(4).toString('hex') + ' 测';
+        const body = (m) => ({ model: m, input: s, max_output_tokens: 1, reasoning: { effort: 'none' } });
+        const a = await request(baseT, { path: '/v1/responses', body: body('deepseek-flash'), timeoutMs: timeout });
+        const b = await request(t, { path: '/v1/responses', body: body(t.model), timeoutMs: timeout });
+        let ai = null, bi = null;
+        try { ai = JSON.parse(a.body)?.usage?.input_tokens ?? null; } catch {}
+        try { bi = JSON.parse(b.body)?.usage?.input_tokens ?? null; } catch {}
+        const hit = ai !== null && bi !== null && ai === bi;
+        if (hit) ok++;
+        rows.push({ i, official: ai, target: bi, hit });
+      }
+      add('EV13', ok >= 9, `一致 ${ok}/10` + (ok < 10 ? ' 差异: ' + rows.filter((x) => !x.hit).map((x) => `${x.official}≠${x.target}`).join(',') : ''), { rows });
+    }
+  }
+
   return { at: new Date().toISOString(), upstream: { host: t.host, prefix: t.prefix, model: t.model }, items };
 }
 
@@ -311,6 +341,7 @@ export function scoreEvidence(ev) {
   const l3 = count(['EV10', 'EV11']); // 模型族（EV10 分词 / EV11 官方校验器）
   const l0 = count(L0_IDS);          // 端点指纹（2026-11-04）
   const mx = count(MSG_IDS);         // messages 协议（2026-11-04）
+  const cy = count(['EV13']);        // 随机 canary（2026-11-04）
 
   const verdict = l1.max === 0 ? 'unknown'
     : l1.score >= Math.max(4, l1.max - 1) ? 'official'
@@ -343,8 +374,11 @@ export function scoreEvidence(ev) {
   //   label   = 不判，只记录
   //   off     = 关闭
   const trackerOk = byId['L0-2']?.ok;   // 逐响应官方痕迹（x-ds-trace-id）
+  const canaryOk = byId.EV13?.ok === true;
+  // 2026-11-04：canary 是"模型没被换"的硬证据；即使没有校验器正向证据，
+  // 只要 canary 通过也可以算 probe 档（它证明的是模型族未变，这正是核心目标）。
   const level = (l0.max > 0 && l0.score === l0.max && trackerOk) ? 'strict'
-    : validator.reachable ? 'probe'
+    : (validator.reachable || canaryOk) ? 'probe'
     : 'none';
 
   return {
@@ -352,6 +386,14 @@ export function scoreEvidence(ev) {
     version: EVIDENCE_VERSION,
     l0: { ...l0, items: (ev.items || []).filter((x) => L0_IDS.includes(x.id)) },
     messages: { ...mx, items: (ev.items || []).filter((x) => MSG_IDS.includes(x.id)), officialTrace: trackerOk },
+    canary: (() => {
+      const e13 = byId.EV13;
+      const rows13 = (e13?.rows || []);
+      const s = rows13.filter((r) => r.hit).length;
+      return { score: rows13.length ? s : cy.score, max: rows13.length || cy.max,
+               ok: e13?.ok === true, skipped: !!e13?.skipped,
+               items: (ev.items || []).filter((x) => x.id === 'EV13') };
+    })(),
     validator,
     assurance: level,
     endpoint: { ...l1, verdict, items: (ev.items || []).filter((x) => L1_IDS.includes(x.id)) },

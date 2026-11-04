@@ -207,3 +207,49 @@ GATE_ATTEMPT_HARD_CAP_MS = 180000   (180 s，不变)
 
 **结论**：messages 只作为**证据探针**（MX 判据），其 M6 已能证明"校验器可达"并写入快照；
 业务通道保持 responses，messages 端点对客户端继续 `503 gate_proto_blocked`。
+
+## B22 canary 判据与协议解耦（2026-11-04 收尾标定）
+
+### 为什么需要 canary
+
+今天遍历了"防换模型"的可用判据，只有**随机分词比对**是稳定的：
+
+| 判据 | 稳定性 | 判别力 |
+|---|---|---|
+| M6（messages 官方校验器） | ❌ 窗口 A 16/16、窗口 B 0/20 | 判"是否走官方校验" |
+| canary（随机串 input_tokens） | ✅ 24/24（跨实例一致） | 判"模型族是否被换" |
+
+canary 的判别力实测（同一随机串）：
+
+| 目标 | input_tokens |
+|---|---|
+| 官方 deepseek-flash | **39** |
+| 官方 deepseek-chat | **13** |
+| 中转 glm-5.2 | **21** |
+| 中转 deepseek-v4.1-flash | **39**（与官方 flash 一致） |
+
+→ 换模型必现差异；同模型逐条一致。
+
+### 协议解耦（修复停机缺陷）
+
+原实现：`assurance` 闸对所有请求看 `validator.reachable = V1(responses) || V2(messages)`。
+今天 V1=false，于是"能否放行 responses"完全取决于 messages 探针 → **窗口 B 里一次 M6 失败就把全部 responses 打成 503**（已实测复现）。
+
+修复后：
+
+| 请求协议 | 只看 |
+|---|---|
+| responses | `validator.responses` |
+| messages | `validator.messages` |
+| 字段缺失 | `unknown` → **不拦**（只标注），避免把"没测过"当"不达标" |
+| `stale`（快照过期） | 拦 |
+
+### messages 为何仍不做业务通道
+
+| 项 | 窗口 A | 窗口 B |
+|---|---|---|
+| id | 53 hex | **32 hex** |
+| 参数校验（M6） | ✅ | ❌ 0/20 |
+| 多轮工具 input_tokens | 未测 | **官方 191 vs 中转 63**（差 -128） |
+
+而 responses 多轮工具 **319 = 319（3/3 一致）**，是三个协议里最忠实的通道。

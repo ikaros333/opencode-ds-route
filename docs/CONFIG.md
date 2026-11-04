@@ -365,3 +365,32 @@ GATE_ASSURANCE=probe
 GATE_ASSURANCE=strict
 GATE_L0_POLICY=reject
 ```
+
+## canary 与按协议 assurance（2026-11-04）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATE_CANARY_POLICY` | `label` | `require` = 最近一次随机分词比对必须通过，否则 503 `gate_assurance_unmet`（reason=`canary_mismatch`） |
+
+canary 做的是：每次 `audit-lane` 取 10 条随机串，同时打官方与目标端，比较 `usage.input_tokens`，一致 ≥9/10 判通过。
+
+**实测判别力**：官方 flash 39 / 官方 chat 13 / 中转 glm 21（同一串）→ 换模型必现差异。
+
+### assurance 现在按协议判定
+
+```
+responses 请求 → 只看 validator.responses
+messages  请求 → 只看 validator.messages
+字段缺失       → unknown（不拦，只标注）
+快照过期       → 拦
+```
+
+这样一条 messages 探针失败**不会**再打挂 responses 业务流量。
+
+### 推荐组合（当前生产）
+
+```powershell
+GATE_ASSURANCE label        # responses 目前没有正向证据，不据此拒
+GATE_CANARY_POLICY require  # 模型被换 → 立即 503（这是核心目标的硬闸）
+GATE_L0_POLICY label        # 转售池事实只标注
+```

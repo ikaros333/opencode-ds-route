@@ -1067,6 +1067,68 @@ try {
       f4.health?.evidence?.assurancePolicy === 'label' && f4.health?.evidence?.proof !== undefined,
       `policy=${f4.health?.evidence?.assurancePolicy}`);
   }
+  // ★ 2026-11-04：canary 闸 + assurance 按协议解耦
+  console.log('\n=== G26 canary 闸 / G27 按协议解耦 ===');
+  {
+    const fs5 = await import('node:fs');
+    const path5 = await import('node:path');
+    const dir5 = path5.join(process.env.TEMP || '.', 'ocg-cy-' + Date.now());
+    fs5.mkdirSync(dir5, { recursive: true });
+    const mk = (name, { validator, canaryOk }) => {
+      const f = path5.join(dir5, name);
+      fs5.writeFileSync(f, JSON.stringify({ at: new Date().toISOString(), version: 1,
+        upstream: { host: 'mock', prefix: '' },
+        l0: { score: 0, max: 5, items: [] },
+        messages: { score: 1, max: 6, items: [] },
+        canary: { score: canaryOk ? 10 : 2, max: 10, ok: canaryOk, items: [] },
+        validator,
+        assurance: 'probe',
+        endpoint: { verdict: 'non-official', score: 1, max: 6, items: [] },
+        impl: { score: 0, max: 2, profile: 'compat', items: [] },
+        model: { family: 'deepseek-thirdparty', claim: 'unproven', weights: 'unproven', items: [] } }));
+      return f;
+    };
+    const runC = async (env) => {
+      const port = P0 + 700 + Math.floor(Math.random() * 150);
+      const snap = env.__snap; delete env.__snap;
+      const g = await startGate(port, { ...env, GATE_EVIDENCE_FILE: snap });
+      let up = false;
+      for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+      await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
+      const body = await res.text();
+      try { g.child.kill('SIGKILL'); } catch {}
+      return { status: res.status, body };
+    };
+
+    const cyOk = mk('cy-ok.json', { validator: { responses: true, messages: true, reachable: true }, canaryOk: true });
+    const cyBad = mk('cy-bad.json', { validator: { responses: true, messages: true, reachable: true }, canaryOk: false });
+    const onlyMsg = mk('only-msg.json', { validator: { responses: false, messages: true, reachable: true }, canaryOk: true });
+    const noResp = mk('no-resp.json', { validator: { messages: false }, canaryOk: true });
+    const respFalse = mk('resp-false.json', { validator: { responses: false }, canaryOk: true });
+
+    const a = await runC({ __snap: cyOk, GATE_CANARY_POLICY: 'require' });
+    check('G26 canary 通过 + require → 200', a.status === 200, `status=${a.status}`);
+
+    const b = await runC({ __snap: cyBad, GATE_CANARY_POLICY: 'require' });
+    check('G26 canary 失败 + require → 503 canary_mismatch',
+      b.status === 503 && b.body.includes('canary_mismatch'), `status=${b.status} body=${b.body.slice(0, 60)}`);
+
+    const c5 = await runC({ __snap: cyBad, GATE_CANARY_POLICY: 'label' });
+    check('G26 canary 失败 + label → 200（只标注）', c5.status === 200, `status=${c5.status}`);
+
+    const d5 = await runC({ __snap: onlyMsg, GATE_ASSURANCE: 'probe' });
+    check('G27 messages 证据 true / responses false → responses 仍 503（本协议判定）',
+      d5.status === 503, `status=${d5.status}`);
+
+    const e5 = await runC({ __snap: noResp, GATE_ASSURANCE: 'probe' });
+    check('G27 快照缺 responses 字段 → unknown 不拦（200）', e5.status === 200, `status=${e5.status}`);
+
+    const f5 = await runC({ __snap: respFalse, GATE_ASSURANCE: 'probe' });
+    check('G27 responses 显式 false + probe → 503', f5.status === 503, `status=${f5.status}`);
+  }
 } finally {
   stopAll();
   mock.close();
