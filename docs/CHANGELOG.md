@@ -1,3 +1,108 @@
+## v0.1.8 — 2026-11-04
+
+**不是"又多了一批判据"，而是把「能不能证明这条通道是官方」这件事第一次说清楚了。**
+
+### 一句话总结
+
+新增三层可核验证据（L0 端点指纹 / MX messages 判据 / CY 随机 canary），
+把其中唯一稳定的那条（canary）接成硬闸；同时修掉两个会打挂服务的缺陷。
+
+### 新增：L0 端点指纹（5 条，零 token、秒级）
+
+| ID | 判据 | 官方 | 中转 |
+|---|---|---|---|
+| L0-1 | `GET /v1/models` 的 `owned_by` + 条目数 | `deepseek` / 2 条 | `opencode` / **28 条**（含 glm/gpt/grok/claude/qwen） |
+| L0-2 | 响应头 `x-ds-trace-id` | 有 | **无** |
+| L0-3 | 第三方头 `cf-ray` / `x-zen-model` / `x-opencode-log-id` | 无 | 有 |
+| L0-4 | 无认证 401 文案 | `Authentication Fails (governor)` | `{"type":"server_error"}` |
+| L0-5 | 试跑 `glm-5.2` | 400 | **200（能跑通 = 转售池）** |
+
+### 新增：MX messages 判据（6 条）
+
+M1 id 形态 / M2 `cost`+`opencode` / M3 `service_tier` / M4 额外 `(request id: 2026…)` /
+M5 `Upstream request failed` 前缀 / **M6 官方范围文案 + UUID4 `request_id`**。
+
+实测：官方 6/6 全过；中转 1/6（仅 M6 通过，说明请求确实到达官方校验器）。
+
+### 新增：CY 随机 canary（本次核心，已接成硬闸）
+
+每次 audit 取 10 条随机串，同时打官方与目标端，比对 `usage.input_tokens`。
+
+判别力实测（同一随机串）：
+
+| 目标 | tokens |
+|---|---|
+| 官方 deepseek-flash | **39** |
+| 官方 deepseek-chat | **13** |
+| 中转 glm-5.2 | **21** |
+| 中转 deepseek-v4.1-flash | **39** |
+
+稳定性：24 次采样 24/24 一致。`GATE_CANARY_POLICY=require` 下不一致即
+`503 gate_assurance_unmet`（reason=`canary_mismatch`）。
+
+### 新增：assurance 四档 + 逐响应官方痕迹
+
+```
+GATE_ASSURANCE = off | label | probe | strict
+x-gate-proof  = verified | unverified | unknown
+x-gate-canary = 10/10 | skipped
+```
+
+当前 opencode 车道：`x-gate-proof` **恒为 `unverified`**——这是诚实标注，
+不是故障：中转抹掉了官方痕迹，我们只能证明"模型族没换"。
+
+### 修复：assurance 耦合导致的全站停机（已实测复现）
+
+原实现所有请求都看 `validator.reachable = V1(responses) || V2(messages)`；
+而今天 V1=false，于是"能否放行 responses"完全取决于 messages 探针 →
+messages 的实现 B 窗口里，一次 M6 失败就把全部 responses 流量打成 503。
+
+现在按协议取证据：responses 只看 `validator.responses`，messages 只看 `validator.messages`；
+字段缺失视为 `unknown`（不拦），快照过期视为 `stale`（拦）。
+
+### 修复：canary skipped 自锁
+
+`EV13` 在"目标即官方"或"缺 `DEEPSEEK_API_KEY`"时标 `skipped`，
+而 `canary.ok=false` → `require` 下会把直连流量全部 503。
+现在 `skipped` 视为通过（直连不能因为"无需比对"而被自己拒绝）。
+
+### 新增：请求体上限 16 → 24 MiB 与四参数联动
+
+实测上游接受 ≥20.97 MiB；真实 15.33 MB 请求中位 19.3 s。
+**只抬 `GATE_MAX_BODY` 不够**：`GATE_ATTEMPT_HARD_CAP_MS`（180 s）会先掐断，
+必须四参数联动（`MAX_BODY` / `UPSTREAM_TIMEOUT` / `TOTAL_BUDGET` / `ATTEMPT_HARD_CAP`）。
+413 报错体现在带 `actual_bytes` 与 `x-gate-fatal: 1`（提示重试无意义）。
+
+### 重要更正：此前记录的「中转注入 26 token」是对比错误
+
+当时拿官方 `deepseek-chat`（非推理，5 token）对比中转 `deepseek-v4.1-flash`（推理，31 token）。
+同模型同参数实测：responses / messages / chat 三协议 token **逐条一致**，**没有任何注入**。
+详见 BASELINE B20。
+
+### 结论：messages 不做业务通道（数据支撑）
+
+| 项 | 窗口 A | 窗口 B |
+|---|---|---|
+| id | 53 hex | **32 hex** |
+| 参数校验（M6） | ✅ 16/16 | ❌ **0/20** |
+| 多轮工具 `input_tokens` | — | 官方 191 vs 中转 **63** |
+
+而 responses 多轮工具 **319 = 319（3/3 一致）** —— 三个协议里最忠实的通道。
+细节见 BASELINE B21/B22。
+
+### 新增：证据自动刷新（必须配）
+
+`canary=require` 依据快照，过期会 fail-closed（实测 13h 旧快照 → 全量 503）。
+新增 `scripts/install-refresh-task.ps1` 一键安装每小时 `ocg audit-lane --write`。
+
+### 测试
+
+```
+verify-patch   401 → 427  （+AH/AI/AJ 共 26 条单源断言）
+test-coverage  130 → 151  （+G21/G22/G23/G24/G26/G27）
+其余套件全绿
+```
+
 ## v0.1.7 — 2026-11-01
 
 **纯文档版，不改任何放行逻辑、不改任何阈值。** 记录两条"判据不可靠"的实证，供以后复盘。

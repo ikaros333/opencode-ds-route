@@ -243,6 +243,65 @@ pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desk
 
 一句话：**能拒绝「意外的第三方」，不能拒绝「蓄意的中间人」，也不能证明「这就是官方后端」。**
 
+## 2026-11-04 新增：证据链与 canary 硬闸
+
+在原有「形态判据」之上，新增四层可核验的证据，并把其中最稳的一条接成硬闸。
+
+### 四层证据
+
+| 层 | 判据 | 能看到什么 | 现在是否拦截 |
+|---|---|---|---|
+| **L0 端点指纹**（5 条，零 token、秒级） | `owned_by`、`x-ds-trace-id`、`cf-ray`/`x-zen-model`、401 的 `governor` 文案、试跑 `glm-5.2` | 这条通道是不是多厂商转售池 | 只标注（`GATE_L0_POLICY=label`） |
+| **MX messages 判据**（6 条） | id 形态、`cost`/`opencode` 块、`service_tier`、错误包装、官方范围文案 + UUID4 `request_id` | 请求是否到达官方校验器 | 只标注（`GATE_ASSURANCE=label`） |
+| **CY 随机 canary**（10 条随机串） | 同一随机串在官方与门控上游的 `input_tokens` 是否一致 | **模型族有没有被换** | ✅ **硬闸**（`GATE_CANARY_POLICY=require`） |
+| **PR 逐响应痕迹** | 每个成功响应的 `x-gate-proof` | 有没有官方 infra 痕迹（`x-ds-trace-id`） | 只标注（当前全为 `unverified`） |
+
+### canary 的判别力（实测）
+
+同一随机串的 `input_tokens`：
+
+| 目标 | token 数 |
+|---|---|
+| 官方 `deepseek-flash` | **39** |
+| 官方 `deepseek-chat` | **13** |
+| 中转 `glm-5.2` | **21** |
+| 中转 `deepseek-v4.1-flash` | **39**（与官方 flash 一致） |
+
+→ 换模型必现差异；同模型逐条一致（24 次采样 24/24）。
+
+### 响应头
+
+```
+x-gate-proof:  verified | unverified | unknown      有没有官方 infra 痕迹
+x-gate-canary: 10/10 | skipped                     本次放行依据的 canary 结果
+x-gate-fp:     ok | degraded                       每响应形态指纹
+```
+
+> 当前 opencode 车道上 `x-gate-proof` **永远是 `unverified`**——这是诚实标注：中转抹掉了官方痕迹，
+> 我们只能证明「模型族没换」（canary），不能证明「响应来自官方 infrastructure」。
+
+### 三协议实测对比（同一时刻）
+
+| 协议 | prompt 透传 | 参数校验走官方 | 多轮工具 token | 结论 |
+|---|---|---|---|---|
+| **responses** | ✅ 319=319 | ❌ 全 200 | ✅ 319=319 | **最忠实，业务走它** |
+| messages | ✅ 逐条一致 | ✅ 16/16（会翻转） | ❌ 官方 191 / 中转 63 | 只作探针 |
+| chat | ✅ 31=31 | ❌ 全 200 | — | 只作判据 |
+
+`messages` 在两种实现之间轮换（窗口 A：id 53hex + 走官方校验；窗口 B：id 32hex + 不校验），
+因此**不做业务通道**，只作为 MX 探针来源。细节见 [docs/BASELINE.md](docs/BASELINE.md) B20–B22。
+
+### 必须配套：证据自动刷新
+
+`canary=require` 依据的是**证据快照**，快照过期会 fail-closed（实测 13 小时旧快照 → 全量 503）。
+所以必须挂定时刷新：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-refresh-task.ps1
+```
+
+详见 [docs/CONFIG.md](docs/CONFIG.md) 的「证据自动刷新」。
+
 ## 怎么工作
 
 ```text
