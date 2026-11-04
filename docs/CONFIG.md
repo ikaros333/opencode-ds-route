@@ -394,3 +394,46 @@ GATE_ASSURANCE label        # responses 目前没有正向证据，不据此拒
 GATE_CANARY_POLICY require  # 模型被换 → 立即 503（这是核心目标的硬闸）
 GATE_L0_POLICY label        # 转售池事实只标注
 ```
+
+## 证据自动刷新（2026-11-04，必须配置）
+
+`GATE_CANARY_POLICY=require` 的判断依据是**证据快照**，快照过期会 fail-closed 拒掉全部流量
+（实测：13 小时前的快照 + require → `503 snapshot_missing_or_stale`）。因此必须定时刷新。
+
+### 1. 持久化车道配置（计划任务读不到交互式终端的环境）
+
+```powershell
+setx GATE_HOST opencode.ai
+setx GATE_CHAIN deepseek-v4.1-flash
+setx GATE_UPSTREAM_PREFIX /zen/go
+setx GATE_EVIDENCE_MAX_AGE_MS 7200000    # 2 小时（一次失败不至于全拒）
+```
+
+### 2. 注册每小时刷新任务
+
+```powershell
+schtasks /create /tn "ocg-evidence-refresh" /sc hourly ^
+  /tr "cmd /c cd /d <REPO> && node bin\ocg.mjs audit-lane --write >> gate\logs\audit-refresh.log 2>&1 & exit 0" /f
+```
+
+> 末尾的 `& exit 0` **不能省**：`audit-lane` 在非官方车道上退出码是 2（表示"端点非官方"），
+> 不加的话计划任务每小时都会显示"失败"，掩盖真正的故障。
+
+### 3. 验证
+
+```powershell
+schtasks /run /tn "ocg-evidence-refresh"
+# 约 60~90 秒后：
+Get-Content gate\logs\lane-evidence.json | Select-String '"at"'
+# 门控侧：
+curl -H "x-gate-token: $env:GATE_TOKEN" http://127.0.0.1:8787/gate/health
+# → evidence.ageMs 应很小、stale=false、canary 显示最近一次一致率
+```
+
+### 实测耗时与成本
+
+| 项 | 数值 |
+|---|---|
+| 单次 audit 耗时 | 60–90 秒 |
+| 单次 audit 上游请求 | 约 51（其中 canary 占 20：10 官方 + 10 中转） |
+| 生成 token 成本 | 几乎为 0（全部 `max_output_tokens: 1`） |
