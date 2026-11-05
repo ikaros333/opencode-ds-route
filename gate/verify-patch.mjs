@@ -58,6 +58,14 @@ function hasNot(name, needle) {
   else { fail++; failures.push(name); console.log(`FAIL  ${name.padEnd(50)} ${hits.length} 处（line ${hits.join(',')}）`); }
 }
 
+/** 同 hasNot，但作用于另一个文件的源码行（测试脚本 / CLI 等） */
+function hasNotIn(arr, name, needle) {
+  const hits = [];
+  for (let i = 0; i < arr.length; i++) if (arr[i].includes(needle)) hits.push(i + 1);
+  if (hits.length === 0) { pass++; console.log(`PASS  ${name.padEnd(50)} 0 处`); }
+  else { fail++; failures.push(name); console.log(`FAIL  ${name.padEnd(50)} ${hits.length} 处（line ${hits.join(',')}）`); }
+}
+
 /** 断言 a 出现在 b 之前（用于"防护必须早于响应出口"这类顺序不变量） */
 function hasOrder(name, a, b) {
   const ia = lines.findIndex(l => l.includes(a));
@@ -73,6 +81,9 @@ function hasOrder(name, a, b) {
 console.log('=== A. 硬约束 ===');
 has('A1 禁止模型含 deepseek-v4-flash', "'deepseek-v4-flash'");
 has('A2 禁止模型含 deepseek-flash-1017', "'deepseek-flash-1017'");
+has('A2b 禁止模型含 deepseek-v4-pro（用户硬约束）', "'deepseek-v4-pro'");
+has('A2c 官方直连作业务上游需显式放开', "flag('GATE_ALLOW_OFFICIAL_HOST', false)");
+has('A2d 官方 host 启动即拒绝', 'if (HOST_IS_OFFICIAL && !ALLOW_OFFICIAL_HOST) {');
 has('A3 ALLOWED 从 CHAIN 过滤禁模型', 'CHAIN.filter(m => !FORBIDDEN.has(m))');
 has('A4 rankCandidates 归一 model 到链上', 'ALLOWED.includes(requestedModel) ? requestedModel : ALLOWED[0]');
 
@@ -126,7 +137,9 @@ has('F6 body 上限可配', "const MAX_BODY = num('GATE_MAX_BODY'");
 
 console.log('\n=== G. 客户端断开传播 ===');
 has('G1 clientGone AbortController', 'const clientGone = new AbortController();');
-has('G2 res.close 触发 abort', "if (!res.writableEnded) { metrics.abortedByClient++; try { clientGone.abort(); }");
+has('G2 res.close 触发 abort', "if (!res.writableEnded) {");
+has('G2b 中止即 abort 整条链', "try { clientGone.abort(); } catch {}");
+has('G2c 中止在台账留痕', "result: 'CLIENT_ABORTED'");
 has('G3 signal 传入 rankCandidates', 'clientGone.signal)');
 has('G4 signal 传入 realRequest', 'signal: clientGone.signal');
 
@@ -174,13 +187,13 @@ has('L1 PRECHECK 开关', 'const PRECHECK_ENABLE = ');
 has('L2 按协议定义预检用例', 'const PRECHECK_CASES_BY_PROTO = {');
 has('L2b 协议判据矩阵', 'const PROTO_TRUST = {');
 has('L3 预检单例（按协议 Map）', 'const precheckInflight = new Map()');
-has('L3b 单例引用清理', 'precheckInflight.get(proto) === run');
+has('L3b 单例引用清理', 'precheckInflight.get(ckey) === run');
 has('L4 预检结果缓存（按协议）', 'precheckLastByProto = new Map()');
 has('L4b 按协议读取预检结论', 'precheckLastFor = (p) =>');
 has('L5 综合信任判定（带协议）', 'async function trustDecision(precheckPromise, proto');
 has('L6 预检失败由 proof 兜底', 'proof_over_precheck_fail');
 has('L7 预检通过跳过车道探测', 'probeSkippedByPrecheck');
-has('L8 预检与真实请求并行启动', 'const precheckP = PRECHECK_ENABLE ? precheck(proto)');
+has('L8 预检与真实请求并行启动', 'const precheckRun = PRECHECK_ENABLE');
 has('L11 chat 协议用 logprob 探针', 'async function runChatPrecisionProbe()');
 has('L11b chat 用 3 探针取 min', 'const CHAT_PRECISION_PROBES = [');
 has('L11c chat 阈值 1e-5', 'const CHAT_TOP1_MAX = 1e-5');
@@ -497,7 +510,7 @@ hasIn(baseLines, 'X8 旧枚举判据标记退役', '已退役（2026-10-27 晚�
 // 冻结后 responses 只用形态探针（id 位模式 38/38 + usage 键集 20/20），
 // 参数探针降级为"实现指纹向量"，只告警不放行。
 console.log('\n=== Y. 判据冻结版（形态探针 + 结构闸 + 信任分级）===');
-has('Y1 形态探针存在', 'function runShapeProbe()');
+has('Y1 形态探针存在（支持车道级）', "function runShapeProbe(lane = '')");
 has('Y2 responses 走形态策略', "responses: 'shape',");
 has('Y3 形态判据校验 usage 键集（按剖面）', 'const need = hasOpc ? USAGE_KEYS_REQUIRED : OFFICIAL_USAGE_KEYS;');
 has('Y4 结构闸拒绝无正文', "result: 'STRUCTURE_BAD'");
@@ -674,6 +687,126 @@ hasIn(cliLines, 'AK10 翻转告警类型', "'VALIDATOR_FLIP'");
 hasIn(cliLines, 'AK11 模型漂移告警类型', "'MODEL_SET_DRIFT'");
 hasIn(lines, 'AK12 msg_hex 形态识别', "return 'msg_hex'");
 hasIn(lines, 'AK13 health 暴露 validate', 'validate: ev.validate || null');
+
+// ===== 2026-11-05：审计修复（health 语义 / 声明长度闸 / 测试套件鉴权）=====
+console.log('\n=== AL. 审计修复回归 ===');
+hasIn(lines, 'AL1 health 暴露 respShapeStrict', 'respShapeStrict: RESP_SHAPE_STRICT');
+hasIn(lines, 'AL2 health 暴露有效白名单', 'deliverableShapesEffective');
+has('AL3 有效白名单按 strict 过滤 resp_', "filter(s => !(RESP_SHAPE_STRICT && s === 'resp_'))");
+hasIn(lines, 'AL4 health 矩阵 TTL 改名（同名不同义）', 'matrixTtlMs: PROBE_TTL');
+hasNot('AL5 health 不再用含糊的 ttl 字段', 'probe: USE_PROBE, ttl: PROBE_TTL');
+hasIn(lines, 'AL6 usage 必需键按剖面给出', 'usageKeysRequired: USAGE_KEYS_BY_PROFILE[lastUpstreamProfile]');
+hasIn(lines, 'AL7 usage 键集按剖面全量暴露', 'usageKeysByProfile: { official: OFFICIAL_USAGE_KEYS');
+hasIn(lines, 'AL8 台账改名 precheckTrust（不再冒用 proofTrust）', 'precheckTrust: dgate.trust');
+hasNot('AL9 台账不再把预检结论写成 proofTrust', 'proofTrust: dgate.trust');
+hasIn(lines, 'AL10 声明长度先拒（不等 body）', 'declaredLen > MAX_BODY');
+hasIn(lines, 'AL11 413 带 declared 标记', 'declared: !!declared');
+has('AL12 413 收口到单一出口', 'const tooLarge = (bodySize, declared) => {');
+hasOrder('AL13 声明长度检查早于读 body', 'declaredLen > MAX_BODY', 'for await (const c of req)');
+const riskLines = fs.readFileSync(path.join(import.meta.dirname, 'test-risk.mjs'), 'utf8').split('\n');
+hasIn(riskLines, 'AL14 风险套件携带 x-gate-token', "x-gate-token");
+hasNot('AL15 风险套件不再用展开求最大值（会爆栈）', 'Math.max(...samples)');
+hasIn(riskLines, 'AL16 风险套件首请求失败即中止', "if (r1.status !== 200)");
+hasIn(riskLines, 'AL17 风险套件按 health 读上限', 'h0?.bodyLimit?.maxBodyBytes');
+hasIn(riskLines, 'AL18 风险套件覆盖声明长度攻击', 'declaredOnly(');
+const covLines = fs.readFileSync(path.join(import.meta.dirname, 'test-coverage.mjs'), 'utf8').split('\n');
+hasIn(covLines, 'AL19 测试台账写入 logs/tests/', "path.join(import.meta.dirname, 'logs', 'tests')");
+hasNotIn(covLines, 'AL20 测试不再改写生产 matrix.json', "path.join(import.meta.dirname, 'logs', 'matrix.json')");
+hasIn(lines, 'AL21 轮转落在台账自己目录', 'const rotDir = path.dirname(LOG_FILE);');
+hasIn(lines, 'AL22 轮转用台账自己的前缀', 'pruneRotated(rotDir, prefix)');
+hasNot('AL23 轮转不再写死共享 LOG_DIR', 'path.join(LOG_DIR, `gate-${Date.now()}.jsonl`)');
+
+// ===== 2026-11-05：证据过期自愈 / canary skipped 语义 / 拦截者可见（16:26 全站 503 事故） =====
+console.log('\n=== AM. 证据自愈与 canary 语义 ===');
+has('AM1 布尔开关统一解析（不再 ===\'1\'）', 'function flag(name, def)');
+has('AM2 自愈开关可关（测试/排障）', "flag('GATE_EVIDENCE_AUTO_REFRESH', true)");
+hasIn(lines, 'AM3 自愈冷却可配', "num('GATE_EVIDENCE_REFRESH_MIN_MS'");
+hasIn(lines, 'AM4 后台刷新函数存在', 'function refreshEvidenceInBackground(why)');
+hasIn(lines, 'AM5 自愈不 spawn 子进程（同进程复用探针）', 'runEvidence({ host: HOST, port: HOST_PORT');
+hasIn(lines, 'AM6 刷新每个周期只跑一个', 'if (evRefresh.inflight) return false;');
+hasIn(lines, 'AM7 刷新成功写回快照', 'writeEvidenceSnapshot(EVIDENCE_FILE, scored)');
+hasIn(lines, 'AM8 刷新失败留台账', "result: 'EVIDENCE_REFRESH_FAIL'");
+hasIn(lines, 'AM9 判定 stale 时触发自愈', 'refreshEvidenceInBackground(evA ? \'stale\' : \'missing\')');
+hasIn(evLines, 'AM10 skipped 必须带原因', "skippedReason: e13?.skipped ? (e13.skippedReason || 'legacy_unknown') : null");
+hasIn(lines, 'AM11 缺基线不等于通过', "const canarySkippedOfficial = canarySkipReason === 'official_target';");
+hasIn(lines, 'AM12 报文点明拦截者', "proto, blocked_by: blockedBy, reason: why,");
+hasIn(lines, 'AM13 报文声明可重试与补刷', "refresh_started: refreshStarted,");
+hasIn(lines, 'AM14 补刷中回 x-gate-refresh', "res.setHeader('x-gate-refresh', 'started')");
+hasIn(lines, 'AM15 health 暴露刷新状态', 'lastAt: evRefresh.at || null, lastWhy: evRefresh.lastWhy');
+hasIn(lines, 'AM16 health 暴露 maxAgeMs', 'maxAgeMs: EVIDENCE_MAX_AGE_MS');
+hasIn(lines, 'AM17 health 暴露 canary 跳过原因', "skippedReason: ev.canary.skippedReason || (ev.canary.skipped ? 'legacy_unknown' : null)");
+hasIn(evLines, 'AM18 EV13 记录官方目标跳过', "skippedReason: isOfficial ? 'official_target' : 'no_baseline_key'");
+hasIn(evLines, 'AM19 runEvidence 支持快路径', 'const fast = !!o.fast;');
+hasIn(evLines, 'AM20 快路径跳过 EV7/EV8（生成型）', "add('EV7', false, 'skipped（fast refresh");
+hasIn(evLines, 'AM21 快路径跳过 EV10（最贵的一段）', "add('EV10', false, 'skipped（fast refresh：分词比对太慢）'");
+hasIn(evLines, 'AM22 canary 采样数可配', 'const canaryN = Number.isFinite(Number(o.canaryN))');
+hasIn(evLines, 'AM23 canary 阈值随采样数缩放', 'const needN = Math.max(1, Math.ceil(canaryN * 0.9));');
+hasIn(lines, 'AM24 门控自愈走快路径', 'fast: true, canaryN: EVIDENCE_REFRESH_CANARY_N');
+hasIn(lines, 'AM25 自愈 canary 采样可配', "num('GATE_EVIDENCE_REFRESH_CANARY_N', 4");
+
+// ===== 2026-11-05 阶段一：异常归类 + 分段计时 =====
+console.log('\n=== AN. 异常归类与分段计时 ===');
+hasIn(lines, 'AN1 客户端中止单独归类', "result: 'CLIENT_ABORTED'");
+hasIn(lines, 'AN2 AbortError 判定', "e?.name === 'AbortError'");
+hasIn(lines, 'AN3 中止判定先于 HANDLER_ERROR', 'if (aborted) {');
+hasOrder('AN4 中止分支早于 500 兜底', "result: 'CLIENT_ABORTED'", "type: 'gate_handler_error'");
+hasIn(lines, 'AN5 分段统计结构存在', 'const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], total: [] };');
+hasIn(lines, 'AN6 分段采样有界', 'if (a.length > PHASE_KEEP) a.shift();');
+hasIn(lines, 'AN7 四段时间戳', 'const tPhase = { precheckDone: 0, upstreamDone: 0, headersAt: 0 };');
+hasIn(lines, 'AN8 预检落定打点', 'tPhase.precheckDone = Date.now();');
+hasIn(lines, 'AN9 上游响应打点', 'tPhase.upstreamDone = Date.now();');
+hasIn(lines, 'AN10 写完响应头打点', 'tPhase.headersAt = Date.now();');
+hasIn(lines, 'AN11 PASS 台账带 phase', 'phase: phaseSnap(), elapsedMs: Date.now() - startedAt');
+hasIn(lines, 'AN12 finish/close 采样回传段', "res.once('finish', () => { if (tPhase.headersAt) notePhase(phaseSnap()); });");
+hasIn(lines, 'AN12b 重发不重复采样', 'if (!res.__phaseNoted) {');
+hasIn(lines, 'AN13 health 暴露分段分位', 'phase: phaseView(),');
+hasIn(lines, 'AN14 分位计算只取近 PHASE_KEEP 条', 'const PHASE_KEEP = 300;');
+
+// ===== 2026-11-05 阶段二：车道级预检 + 判负即切换 =====
+console.log('\n=== AO. 车道级预检与判负即切换 ===');
+hasIn(lines, 'AO1 precheck 支持 lane 参数', "const lane = String(opts.lane || '');");
+hasIn(lines, 'AO2 预检缓存 key 带车道', "const ckey = lane ? proto + '@' + lane : proto;");
+hasIn(lines, 'AO3 形态探针按车道取 model', 'const probeModel = lane || ALLOWED[0];');
+hasIn(lines, 'AO4 车道级预检编排函数', 'async function precheckLanes(proto, lanes) {');
+hasIn(lines, 'AO5 单车道退化（零回归）', 'if (!PERLANE_PRECHECK || list.length <= 1) {');
+hasIn(lines, 'AO6 聚合：任一 pass 即整体 pass', "const verdict = passCount > 0 ? 'pass'");
+hasIn(lines, 'AO7 交付闸按赢下车道判定', 'const lanePc = dgate.byLane && typeof dgate.byLane.get ===');
+hasIn(lines, 'AO8 pgate 携带逐车道结论', 'pgate.byLane = laneBox.byLane;');
+hasIn(lines, 'AO8b 逐车道结论不额外 await（零新增延迟）', 'const laneBox = { byLane: null };');
+hasIn(lines, 'AO9 开关可关（回退旧行为）', "flag('GATE_PERLANE_PRECHECK', true)");
+hasIn(lines, 'AO10 探针结论带 lane', "resolve(lane ? { ...o, lane } : o);");
+hasIn(lines, 'AO11 保活刷车道级缓存（防 fail 永久锁死）', 'const rl = await precheck(p, { force: true, lane: m });');
+hasIn(lines, 'AO12 单车道不额外发探针（探针数不变）', 'if (PERLANE_PRECHECK && ALLOWED.length > 1) {');
+hasIn(lines, 'AO13 车道恢复/未恢复均计数', 'metrics.lanePrecheckRecovered = (metrics.lanePrecheckRecovered || 0) + 1;');
+
+// ===== 2026-11-05 判正增强：逐响应骨架证据（键顺序 + server 头）=====
+console.log('\n=== AP. 逐响应骨架证据 ===');
+hasIn(baseLines, 'AP1 官方顶层键顺序基线（35 键）', 'export const OFFICIAL_TOP_KEY_ORDER = [');
+hasIn(baseLines, 'AP2 中转顶层键顺序基线（18 键）', 'export const RELAY_TOP_KEY_ORDER = [');
+hasIn(baseLines, 'AP3 server 头基线：官方 openresty', "export const OFFICIAL_SERVER_HEAD = 'openresty';");
+hasIn(baseLines, 'AP4 server 头基线：中转 cloudflare', "export const RELAY_SERVER_HEAD = 'cloudflare';");
+hasIn(baseLines, 'AP5 顶层键解析器（跳过字符串/嵌套）', 'export function topLevelKeyOrder(text, maxKeys = 0) {');
+hasIn(baseLines, 'AP5b 字符串整段跳过（大 body 不逐字符）', "const q = t.indexOf('\"', i)");
+hasIn(baseLines, 'AP5c 收集够数即停（限 12 键）', 'if (maxKeys > 0 && out.length >= maxKeys) return out;');
+hasIn(baseLines, 'AP6 键序判定按位置集合求 LIS', 'const tails = [];');
+hasIn(baseLines, 'AP7 少键不判（防零星匹配）', 'if (ks.length < 10) return \'unknown\';');
+hasIn(baseLines, 'AP7b 用 LIS 判顺序（抗条件缺字段）', 'return tails.length / ks.length;');
+hasIn(baseLines, 'AP7c 键集覆盖率下限', 'known.length < ks.length * 0.85');
+hasIn(baseLines, 'AP7d 官方独有键硬门槛（防 12 键截断假阳）', "hitOfficialOnly >= 3) return 'official';");
+hasIn(baseLines, 'AP7e 官方独有键集合', 'export const OFFICIAL_ONLY_KEYS =');
+hasNot('AP7g srvKey 不得在 if 块内声明（跨块引用会 ReferenceError）', 'if (proof.server) {');
+hasIn(lines, 'AP7f 单车道路径预检失败不炸链', "await precheck(proto).catch(() => ({ verdict: 'unknown', source: 'error'");
+hasIn(lines, 'AP8 探针结论合并键序', 'keyOrderVerdict(topLevelKeyOrder(bodyText, KEY_ORDER_SCAN_KEYS))');
+hasIn(lines, 'AP8b 流式不判键序（防假告警）', "if (ctype.includes('event-stream')) proof.keyOrder = 'unknown';");
+hasIn(lines, 'AP8c server 头归一化（防注入/无界）', "const srvKey = proof.server === OFFICIAL_SERVER_HEAD ? 'official'");
+hasIn(lines, 'AP9 官方骨架才升 verified', "if (proof.keyOrder === 'official' && officialLike) proof.level = 'verified';");
+hasIn(lines, 'AP10 中转骨架/头判 unverified', "else if (proof.keyOrder === 'relay' || relayLike) proof.level = 'unverified';");
+hasIn(lines, 'AP11 两边都不像保持 unknown（不误杀）', "else if (proof.keyOrder === 'unknown' && !officialLike) proof.level = 'unknown';");
+hasIn(lines, 'AP12 伪装升级告警', "pushAlert('RELAY_MIMICS_OFFICIAL'");
+hasIn(lines, 'AP13 伪装计数', 'metrics.relayMimicsOfficial = (metrics.relayMimicsOfficial || 0) + 1;');
+hasIn(lines, 'AP14 health 暴露键序分布', 'keyOrder: metrics.keyOrder, server: metrics.proofServer,');
+hasIn(lines, 'AP15 台账带逐响应证明明细', 'proofEvidence: r.proof || null');
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

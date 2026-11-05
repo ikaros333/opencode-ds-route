@@ -468,6 +468,33 @@ async function cmdDoctor() {
       line('warn', '判据', '该门控未暴露判据字段（旧版本）→ 把它升级到本版本后重启，或直接看 /gate/proof');
     }
     line('ok', '出网目标', h.egressHost || '未知（旧版本门控未暴露）');
+    // 5b 证据快照新鲜度 + 后台刷新状态（2026-11-05 事故：计划任务停摆 → 快照过期 → 全站 503，
+    // 而 doctor 当时一个字都没说，所以这条必须自己会报）
+    if (h.evidence) {
+      const ev = h.evidence;
+      const r = ev.refresh || {};
+      const ageMin = typeof ev.ageMs === 'number' ? (ev.ageMs / 60000) : null;
+      const maxMin = typeof ev.maxAgeMs === 'number' ? (ev.maxAgeMs / 60000) : null;
+      if (ev.verdict === 'missing' || ev.snapshot === null) {
+        bad++;
+        line('bad', '证据快照', '不存在 → 跑 `ocg audit-lane --write`（canary=require 时会全量 503）');
+      } else if (ev.stale) {
+        bad++;
+        line('bad', '证据快照', `已过期 ${ageMin.toFixed(0)} 分钟（上限 ${maxMin === null ? '?' : maxMin.toFixed(0)}）→ 跑 \`ocg audit-lane --write\`；查计划任务 ${'ocg-evidence-refresh'}`);
+      } else {
+        const tail = `（${ageMin.toFixed(0)}/${maxMin === null ? '?' : maxMin.toFixed(0)} 分钟，canary=${ev.canary ? ev.canary.score + '/' + ev.canary.max : '—'}${ev.canary?.skippedReason ? ' skipped:' + ev.canary.skippedReason : ''}）`;
+        line('ok', '证据快照', `新鲜${tail}`);
+      }
+      if (r.auto === false) line('warn', '证据自愈', '已关闭（GATE_EVIDENCE_AUTO_REFRESH=0）→ 快照过期只能人工刷新');
+      else if (r.ok === false) { bad++; line('bad', '证据自愈', `上次后台补刷失败：${r.lastError || '未知'} → 看台账 EVIDENCE_REFRESH_FAIL`); }
+      else if (r.attempts > 0) line('ok', '证据自愈', `已启用（尝试 ${r.attempts} 次，最近 ${r.lastMs ?? '—'}ms，ok=${r.ok}）`);
+      else line('ok', '证据自愈', '已启用（尚未触发过）');
+      // 缺基线跳过的 canary = 硬闸失效：必须显式警告，否则用户以为在防换模型，其实没防
+      if (ev.canary?.skippedReason && ev.canary.skippedReason !== 'official_target') {
+        bad++;
+        line('bad', 'canary 基线', `跳过原因=${ev.canary.skippedReason} → 设 DEEPSEEK_API_KEY 后重跑刷新；否则"防换模型"这条硬闸实际没生效`);
+      }
+    }
     line('ok', '本地鉴权', h.tokenRequired ? '已启用（需 x-gate-token）' : '未启用（仅本机可用）');
     if (h.blockedProtos?.length) line('ok', '封禁协议', h.blockedProtos.join(', '));
   }

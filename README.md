@@ -19,7 +19,7 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 > **本项目不在 npm 发布。**`package.json` 是 `private: true`，`opencode-ds-route` 这个包名在 npm 上没有对应本项目。
 > 任何 `npm i opencode-ds-route` 装到的都是**别人上传的包**，与这里无关。请只从
 > [Releases](https://github.com/ikaros333/opencode-ds-route/releases) 或 `git clone` 获取。
-`v0.1.7` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.8` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
 它不改变 OpenCode 的路由，只判断"这次响应是不是官方的"。
@@ -55,15 +55,15 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.2](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.7) 下载
-`opencode-ds-route-v0.1.7.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.8](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.8) 下载
+`opencode-ds-route-v0.1.8.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.7.zip -Algorithm SHA256
+Get-FileHash .\opencode-ds-route-v0.1.8.zip -Algorithm SHA256
 # 与 Release 附件里的 SHA256SUMS.txt 对照，必须完全一致
 ```
 
@@ -280,16 +280,24 @@ x-gate-fp:     ok | degraded                       每响应形态指纹
 > 当前 opencode 车道上 `x-gate-proof` **永远是 `unverified`**——这是诚实标注：中转抹掉了官方痕迹，
 > 我们只能证明「模型族没换」（canary），不能证明「响应来自官方 infrastructure」。
 
-### 请求体上限：16 → 24 MiB（2026-11-04）
+### 请求体上限：默认 16 MiB，可联动四参数抬到 24 MiB（2026-11-04 标定）
 
 长会话（几十步工具调用 + 网页抓取）上下文会持续膨胀，实测台账 p90≈12.5 MB、max 15.33 MB——
 16 MiB 的门槛几乎贴在天花板上，会周期性撞 413 中断任务。
 
-| 项 | 值 |
+> **出厂默认仍是 16 MiB**：`GATE_MAX_BODY` 在代码里的默认值就是 16 MiB，`install.ps1` 不覆盖它。
+> 下表是**按四参数联动设置后**的推荐值；本仓库所在这台机器跑到 24 MiB，是因为手工 `setx` 过。
+> 想确认当前生效值：`node bin\ocg.mjs health` 看 `bodyLimit.maxBodyBytes`。
+
+| 项 | 推荐值（需自行 `setx`，未设置时取括号内默认） |
 |---|---|
-| 拒绝阈值 `GATE_MAX_BODY` | **24 MiB（25165824）** |
-| 大 body 观测阈值 `GATE_BIG_BODY_BYTES` | 12 MiB（超过就打 `x-gate-big-body: 1` + 台账 `BIG_BODY`） |
-| 413 报错体 | 带 `actual_bytes` / `limit_bytes`，响应头带 `x-gate-fatal: 1`（提示重试无意义） |
+| 拒绝阈值 `GATE_MAX_BODY` | **24 MiB（25165824）**（默认 16 MiB） |
+| 大 body 观测阈值 `GATE_BIG_BODY_BYTES` | 12 MiB（默认 12 MiB；超过就打 `x-gate-big-body: 1` + 台账 `BIG_BODY`） |
+| 413 报错体 | 带 `actual_bytes` / `limit_bytes` / `declared`，响应头带 `x-gate-fatal: 1`（提示重试无意义） |
+
+**声明长度也会被检查**（2026-11-05）：`Content-Length` 本身超限时立刻 413（`declared: true`），
+不等 body 到齐——否则「只发头、不发体」的连接会挂到 `GATE_BODY_IDLE_TIMEOUT_MS`（默认 120 s），
+六条即可占满 `MAX_CONC` 槽位。
 
 **改这个上限必须四参数联动**，否则会被自己的超时掐断：
 
@@ -331,14 +339,18 @@ powershell -ExecutionPolicy Bypass -File scripts\install-refresh-task.ps1
 ## 怎么工作
 
 ```text
-客户端 ──POST──▶ 127.0.0.1:8787 ──▶ ① 形态预检：这条通道还是正常网关形态吗？
-                                  ② 转发：用你的 key 打 opencode.ai:443（唯一出网目标）
-                                  ③ 交付闸：id 位模式 / usage 键集 / 结构完整性
+客户端 ──POST──▶ 127.0.0.1:8787 ──▶ ① 车道级形态预检（每条车道一条结论；单车道退化为一次）
+                                  ② 转发：CHAIN 内切换/对冲 —— 判负即换下一条车道
+                                  ③ 交付闸：按**赢下车道**的结论判 id 位模式 / usage 键集 / 结构完整性
 判定通过 ──▶ 交付（附 x-gate-trust）；判不了 ──▶ 503 + 可读原因（/gate/alerts）
 ```
 
-只有 `responses` 一个协议；`messages` 与 `chat` 默认拒绝（见上方重要提示）。
-判据全部是黑盒可观测的结构事实，常量与观测日期见 [docs/BASELINE.md](docs/BASELINE.md)。
+- 只有 `responses` 一个协议；`messages` 与 `chat` 默认拒绝（见上方重要提示）。
+- **判负即切换**（2026-11-05）：`GATE_CHAIN` 配多条车道时，某条车道被判 third 会**自动换到下一条**，
+  而不是整条请求 503；交付闸按赢下车道自己的预检结论判定（`GATE_PERLANE_PRECHECK`，单车道时自动退化）。
+- **分段耗时**：`/gate/health.phase` 给 `precheck / upstream / gate / stream` 四段 p50/p90，
+  用来回答"慢在门控还是慢在上游"。
+- 判据全部是黑盒可观测的结构事实，常量与观测日期见 [docs/BASELINE.md](docs/BASELINE.md)。
 
 ## 出问题了
 
@@ -391,7 +403,8 @@ set GATE_TRACE=1; node bin\ocg.mjs start   # 每次出网目标打到屏幕
 
 ## 已验证环境
 
-Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线 312 + 66 条断言全绿，真实上游 9 套（含 60s soak）全绿。
+Windows 11 24H2，Node `22.23.4` 与 `24.15.0`：离线断言全绿（`npm run check` + `npm test`）、
+真实上游 9 套（含 60s soak）全绿。断言数以脚本实际输出为准，不在文档里写死（写死过一次，之后就漂了）。
 最后一次验证：**2026-10-26**（单实例锁 / 端口占用归属 / health `root`，本机生产实测通过）。
 Linux / macOS 未验证，也不提供安装脚本。
 

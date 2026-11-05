@@ -78,6 +78,14 @@ export async function runEvidence(o) {
   };
   const timeout = o.timeoutMs || 15000;
   const allowGen = !!o.allowGen;
+  // 2026-11-05：门控侧「证据过期自愈」必须有快路径 —— 完整一轮要 ~48s，而 503 之后
+  // 客户端（dsh maxRetries=2，800ms 起退避）根本等不到。fast 只保留**判正必需**的探针：
+  // L0 指纹 / EV3+EV4 校验文案 / EV14+EV15 文本级 / M6 / EV13 canary / EV5+EV6 TLS。
+  // 跳过的（EV7 响应形态、EV8 serde、EV10 分词一致性）会打 skipped=fast_refresh，
+  // 打分自动把它们排除在分母外，不会把"没测"算成"不达标"。
+  const fast = !!o.fast;
+  const canaryN = Number.isFinite(Number(o.canaryN)) && Number(o.canaryN) > 0
+    ? Math.min(20, Math.floor(Number(o.canaryN))) : 10;
   const base = (extra) => ({ model: t.model, input: '只回答：好', max_output_tokens: 4, reasoning: { effort: 'none' }, ...extra });
   const items = [];
   const add = (id, ok, detail, extra = {}) => items.push({ id, ok, detail, ...extra });
@@ -180,7 +188,9 @@ export async function runEvidence(o) {
   }
 
   // EV7 响应形态（35 字段 / 裸 UUID4 / usage 5 键 / 无 opencode 块）
-  {
+  if (fast) {
+    add('EV7', false, 'skipped（fast refresh：只跑判正必需的探针）', { skipped: true, skippedReason: 'fast_refresh' });
+  } else {
     const r = await request(t, { path: '/v1/responses', body: base(), timeoutMs: timeout });
     let ok = false, detail = 'HTTP ' + r.status;
     if (r.status === 200) {
@@ -197,7 +207,9 @@ export async function runEvidence(o) {
   }
 
   // EV8 serde 文案（Rust = 官方；Go = 兼容层）
-  {
+  if (fast) {
+    add('EV8', false, 'skipped（fast refresh）', { skipped: true, skippedReason: 'fast_refresh' });
+  } else {
     const r = await request(t, { path: '/v1/responses', body: { model: t.model, input: 'ping', max_output_tokens: 'abc' }, timeoutMs: timeout });
     const m = msgOf(r);
     const rust = /Failed to deserialize the JSON body into the target type:\s*max_output_tokens:/i.test(m);
@@ -223,7 +235,12 @@ export async function runEvidence(o) {
   }
 
   // EV10 分词一致性（模型族）：与官方基线逐条比对 usage.input_tokens
-  {
+  if (fast) {
+    // 这一项要按语料逐条生成（十几条），是整轮里最贵的一段 → 自愈快路径跳过。
+    // 代价：model.family 会变 unknown（GATE_MODEL_EVIDENCE_POLICY=require 时不能靠它放行），
+    // 下一次整点任务会补回完整快照。
+    add('EV10', false, 'skipped（fast refresh：分词比对太慢）', { skipped: true, skippedReason: 'fast_refresh' });
+  } else {
     const rows = [];
     let ok = 0;
     for (const c of TOKENIZER_CORPUS) {
@@ -355,12 +372,14 @@ export async function runEvidence(o) {
     const baseKey = process.env.DEEPSEEK_API_KEY || '';
     const isOfficial = /(^|\.)deepseek\.com$/i.test(t.host);
     if (isOfficial || !baseKey) {
-      add('EV13', false, isOfficial ? 'skipped（目标即官方，无需比对）' : 'skipped（缺 DEEPSEEK_API_KEY 基线）', { skipped: true });
+      // 2026-11-05：两种 skipped 语义完全不同，必须分开记录（门控据此决定"放行"还是"无法证明"）。
+      add('EV13', false, isOfficial ? 'skipped（目标即官方，无需比对）' : 'skipped（缺 DEEPSEEK_API_KEY 基线）',
+        { skipped: true, skippedReason: isOfficial ? 'official_target' : 'no_baseline_key' });
     } else {
       const rows = [];
       let ok = 0;
       const baseT = { host: 'api.deepseek.com', port: 443, scheme: 'https', prefix: '', key: baseKey, model: 'deepseek-flash' };
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < canaryN; i++) {
         const s = crypto.randomBytes(7).toString('base64').slice(0, 10) + ' ' + crypto.randomBytes(4).toString('hex') + ' 测';
         const body = (m) => ({ model: m, input: s, max_output_tokens: 1, reasoning: { effort: 'none' } });
         const a = await request(baseT, { path: '/v1/responses', body: body('deepseek-flash'), timeoutMs: timeout });
@@ -372,7 +391,9 @@ export async function runEvidence(o) {
         if (hit) ok++;
         rows.push({ i, official: ai, target: bi, hit });
       }
-      add('EV13', ok >= 9, `一致 ${ok}/10` + (ok < 10 ? ' 差异: ' + rows.filter((x) => !x.hit).map((x) => `${x.official}≠${x.target}`).join(',') : ''), { rows });
+      // 阈值随采样数缩放（默认 10 条时仍是 ≥9/10 的旧口径）：自愈快路径只取 GATE_EVIDENCE_REFRESH_CANARY_N 条
+      const needN = Math.max(1, Math.ceil(canaryN * 0.9));
+      add('EV13', ok >= needN, `一致 ${ok}/${canaryN}` + (ok < canaryN ? ' 差异: ' + rows.filter((x) => !x.hit).map((x) => `${x.official}≠${x.target}`).join(',') : ''), { rows });
     }
   }
 
@@ -474,6 +495,9 @@ export function scoreEvidence(ev) {
       const s = rows13.filter((r) => r.hit).length;
       return { score: rows13.length ? s : cy.score, max: rows13.length || cy.max,
                ok: e13?.ok === true, skipped: !!e13?.skipped,
+               // 2026-11-05：把"为什么跳过"也写进快照。缺基线（no_baseline_key）不能当成通过——
+               // 否则刷新任务在缺 DEEPSEEK_API_KEY 的环境里跑一次，canary 硬闸就静默失效了。
+               skippedReason: e13?.skipped ? (e13.skippedReason || 'legacy_unknown') : null,
                reason: e13?.skipped ? 'skipped' : (e13?.ok ? 'consistent' : 'mismatch'),
                items: (ev.items || []).filter((x) => x.id === 'EV13') };
     })(),

@@ -71,7 +71,8 @@ jobs:
       - name: 语法检查
         shell: pwsh
         run: |
-          Get-ChildItem gate\*.mjs, probe\*.mjs, bin\*.mjs | ForEach-Object {
+          # 2026-11-05：scripts\*.mjs 也在跑（multilane-shadow 等观测脚本），一起做语法检查。
+          Get-ChildItem gate\*.mjs, probe\*.mjs, bin\*.mjs, scripts\*.mjs | ForEach-Object {
             node --check $_.FullName
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
@@ -108,10 +109,10 @@ jobs:
           if ($bad) { $bad | ForEach-Object { Write-Host "FAIL $_" }; exit 1 }
           Write-Host 'OK：脚本编码与行尾安全'
 
-      - name: 源码自检（312 条断言，离线）
+      - name: 源码自检（离线断言）
         run: node gate/verify-patch.mjs
 
-      - name: 自包含回归（66 条，自带 mock 上游，不需要 key）
+      - name: 自包含回归（自带 mock 上游，不需要 key）
         run: node gate/test-coverage.mjs
 
       - name: 冒烟：起服务并读 health

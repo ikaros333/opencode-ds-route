@@ -59,7 +59,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `gate_proto_blocked` | 协议被策略封禁（默认 `chat` + `messages`） | 正常行为；`error.available` 里列出可用端点 |
 | `gate_structure_bad` | 非流式 `responses` 的响应没有正文（只有思考/空内容），且不是工具调用 | 上游把答案写进了 reasoning；直接重试通常可恢复；`error.truncated=true` 表示被 `max_output_tokens` 截断 |
 | `gate_unknown_path` | 路径不在白名单 | 检查客户端端点；`messages` 的 baseURL **不带** `/v1` |
-| `gate_bad_body` / `gate_body_too_large` | 请求体非 JSON / 超 16 MB | 客户端问题 |
+| `gate_bad_body` / `gate_body_too_large` | 请求体非 JSON / 超过上限（默认 16 MiB） | 客户端问题；`declared=true` 表示是按 `Content-Length` 提前拒绝 |
 | `gate_upstream_rate_limited` | 上游 429 且 `Retry-After` 过长 | 等，或检查配额 |
 | `gate_method_not_allowed` | 方法与端点不符 | 客户端问题 |
 | `gate_http_parse_error` | 上游响应无法解析 | 看台账 `HTTP_PARSE_ERROR` 行 |
@@ -96,7 +96,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GATE_PORT` | 8787 | 监听端口（只绑 `127.0.0.1`） |
-| `GATE_HOST` | `opencode.ai` | 上游主机（唯一出网目标） |
+| `GATE_HOST` | `opencode.ai` | 上游主机（唯一出网目标）。**不允许指向 `*.deepseek.com`**：那是证据探针的基线，不是业务上游；真要放开必须显式 `GATE_ALLOW_OFFICIAL_HOST=1`，否则启动即拒绝（2026-11-05 用户硬约束） |
 | `GATE_HOST_PORT` | 443 | 上游端口 |
 | `GATE_HOST_SCHEME` | `https` | 上游协议 |
 | `GATE_SESSION` | 空 | 不设则读 `gate/logs/session.txt`，都没有就生成并写回。**决定 prompt cache 亲和，别乱换** |
@@ -105,7 +105,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_CHAIN` | `deepseek-v4.1-flash` | **必须是 `deepseek-` 前缀，否则拒绝启动**；2026-10-27 起 `deepseek-flash` 已被上游下线（410） |
+| `GATE_CHAIN` | `deepseek-v4.1-flash` | **必须是 `deepseek-` 前缀，否则拒绝启动**；2026-10-27 起 `deepseek-flash` 已被上游下线（410）。**硬约束：`deepseek-v4-pro` / `deepseek-v4-flash` / `deepseek-flash-1017` 一律禁止**（配进去会被剔除，全被剔除则拒绝启动） |
 | `GATE_MAX_ATTEMPTS` | 4 | 换道上限 |
 | `GATE_BACKOFF_MS` | 200 | 换道退避 |
 | `GATE_HEDGE` | 1 | 对冲开关（预检通过后不再触发） |
@@ -120,6 +120,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PRECHECK` | 1 | `0` = 全断（没有判据就不交付） |
 | `GATE_PRECHECK_TTL_MS` | 15000 | 预检复用窗口（responses）。2026-10-29 由 90000 收紧：池切换是分钟级，90s 窗口会让预检结论与交付时刻错位 |
 | `GATE_PRECHECK_TTL_MS_MESSAGES` | 90000 | messages 窗口（协议已封禁） |
+| `GATE_PERLANE_PRECHECK` | `1` | **车道级预检**（2026-11-05）：多车道时每条车道各出一条结论（缓存键 `proto@lane`），聚合语义「任一 pass 即整体 pass」。单车道时自动退化为旧行为，零回归；设 `0` 强制回退旧逻辑。**成本**：TTL（15 s）过期时探针数 = 车道数；保活（GATE_PROOF_REFRESH_MS，默认 25 s）也会按车道各刷一次（协议数 × (1 + N)），单车道不额外发探针 |
 | `GATE_DRAIN_MAX_MS` | 15000 | `POST /gate/admin/drain` 等待在途请求收尾的上限（ms）；空闲时立即完成，所以调大几乎不增加重启耗时 |
 | `GATE_OBS_TOKEN` | 空（关闭） | `/gate/*` 观测端点的独立鉴权 token；设了以后必须带 `x-gate-token`。与 `GATE_TOKEN` 解耦 |
 | `GATE_FP_POLICY` | retry | 每响应指纹策略：`retry` 不匹配就丢弃重发，`block` 直接 503 `gate_response_fingerprint`，`warn` 只记录 |
@@ -131,7 +132,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PRECHECK_CONFIRM_MS` | 250 | 重测间隔 |
 | `GATE_PROBE_DEADLINE_MS` | 未设（自适应） | 仅用于固定探针上限 |
 | `GATE_PROBE_DEADLINE_K` | 3 | 自适应系数：`deadline = clamp(K×EWMA, MIN, MAX)` |
-| `GATE_PROBE_DEADLINE_MIN` | 5000 | 下限 |
+| `GATE_PROBE_DEADLINE_MIN` | 8000 | 下限（2026-11-05 文档对齐代码；旧文档写 5000） |
 | `GATE_PROBE_DEADLINE_MAX` | 45000 | 上限 |
 | `GATE_PROOF_REFRESH_MS` | 25000 | 后台保活间隔（把探针移出请求关键路径）；`0` = 关闭 |
 | `GATE_RESP_SHAPE_STRICT` | 严格 | `resp_` 后缀必须是 UUID4 位模式（第13位=4、第17位∈89ab），否则判第三方拒绝；只有显式 `0` 才回退到「resp_ 一律中性」的旧行为（应急用） |
@@ -171,7 +172,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GATE_LOG_FILE` | `gate/logs/gate.jsonl` | 台账（不记正文，只记结构化字段） |
-| `GATE_LOG_CAP` / `GATE_LOG_KEEP` | 5 MB / 5 | 轮转 |
+| `GATE_LOG_CAP` / `GATE_LOG_KEEP` | 5 MB / 5 | 轮转：单文件超 `CAP` 即改名成 `<台账名>-<ms>.jsonl`，**只保留最近 `KEEP` 个**。轮转落在台账自己所在目录、只 trim 同一前缀（2026-11-05：旧实现在共享 `gate/logs` 下用固定 `gate-*.jsonl` 命名，影子/测试实例的历史块会混进生产目录并被对方 prune 掉） |
 | `GATE_SNAPSHOT` | `gate/logs/matrix.json` | 矩阵快照 |
 | `GATE_LAT_WINDOW` / `GATE_FAIL_WINDOW` | 200 / 20 | 延迟窗口 / 失败缓冲 |
 | `GATE_STARTUP_SELFTEST` | 1 | 启动时跑一次自检 |
@@ -239,8 +240,22 @@ git checkout <上一个可用版本> -- gate\oc-gate.mjs gate\verify-patch.mjs
 | `GATE_EVIDENCE_POLICY` | `label` | `off` / `label`（只记录+漂移告警）/ `require`（未达成则 503） |
 | `GATE_EVIDENCE_EXPECT` | `any` | 本车道声明期望；只有设 `official` 时 `require` 才生效（否则等于自断服务） |
 | `GATE_EVIDENCE_FILE` | `gate/logs/lane-evidence.json` | 证据快照路径 |
-| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed |
+| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed。**与刷新间隔必须配套**：窗口 < 2× 刷新间隔时，漏一次刷新就会全站 503（实测 16:26 事故：窗口 2h、刷新每小时、任务漏跑 → 503） |
 | `GATE_EVIDENCE_KEY_ENV` | 空 | 强制指定探针使用的 key 环境变量（默认按 host 自动选择） |
+| `GATE_EVIDENCE_AUTO_REFRESH` | `1` | **门控侧自愈**：判定快照过期/缺失时，在后台用同进程跑一次 `runEvidence` 并写回快照（不 spawn 子进程、不阻塞本次响应；本次仍 fail-closed）。设 `0` 关闭 |
+| `GATE_EVIDENCE_REFRESH_MIN_MS` | `120000`（2min） | 自愈冷却：两次自动刷新之间的最小间隔，防止上游抖动时把探针打成风暴 |
+| `GATE_EVIDENCE_REFRESH_TIMEOUT_MS` | `15000` | 自愈时单次探针超时 |
+| `GATE_EVIDENCE_REFRESH_CANARY_N` | `4` | 自愈快路径的 canary 采样数（阈值 = `ceil(0.9×N)`）。整点任务仍是 10 条 |
+
+**自愈走「快路径」**（2026-11-05）：完整一轮 `audit-lane` 实测 **48s**，而 503 之后客户端
+（dsh `maxRetries=2`，800ms 起退避）等不到。快路径只跑**判正必需**的探针：L0 指纹、EV3/EV4 校验文案、
+EV14/EV15 文本级、M6、EV13 canary（4 条）、EV5/EV6 TLS；跳过 EV7/EV8/EV10（生成型、最贵），实测 **23s**。
+被跳过项打 `skippedReason=fast_refresh`，打分自动把它们排除在分母之外，不会把"没测"当成"不达标"。
+代价：快照里的 `model.family` 会是 `unknown`（因为 EV10 没跑），下一次整点任务会把完整快照补回来。
+
+> 过期时的行为（2026-11-05 起）：503 报错体带 `blocked_by`（谁拦的）与 `refresh_started`（是否已触发补刷），
+> 响应头多一个 `x-gate-refresh: started`。默认 `x-gate-fatal: 1` 仍表示「别原样重试」，
+> 但与"证据过期"这种**可自愈**的原因区分开了——重试前先看 `x-gate-refresh`。
 
 生成/查看证据：
 
@@ -265,8 +280,9 @@ node bin/ocg.mjs audit-lane --write    # 写快照供门控读取
 |---|---|---|
 | `GATE_MODEL_EVIDENCE_POLICY` | `label` | `label` 只记录；`require` = `model.family` 必须为 `deepseek-official`，否则 503 `gate_modelfamily_unmet` |
 | `GATE_EVIDENCE_FILE` | `gate/logs/lane-evidence.json` | 证据快照路径（CLI `--write` 也写这里） |
-| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed |
+| `GATE_EVIDENCE_MAX_AGE_MS` | `43200000`（12h） | 快照过期判定；过期在 `require` 下 fail-closed（与刷新间隔配套，见上节） |
 | `GATE_EVIDENCE_KEY_ENV` | 空 | 强制指定探针用的 key 环境变量（默认按 host 自动选：`*.deepseek.com` → `DEEPSEEK_API_KEY`，其它 → `OPENCODE_GO_API_KEY`） |
+| `GATE_EVIDENCE_AUTO_REFRESH` / `GATE_EVIDENCE_REFRESH_MIN_MS` | `1` / `120000` | 门控侧自愈（见上节） |
 
 ### 三档判定
 
@@ -294,7 +310,7 @@ GATE_MODEL_EVIDENCE_POLICY=require
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_MAX_BODY` | 16 MiB | 超过直接 413（fail-closed），报错体带 `actual_bytes`，响应头带 `x-gate-fatal: 1`（提示重试无意义） |
+| `GATE_MAX_BODY` | 16 MiB | 超过直接 413（fail-closed），报错体带 `actual_bytes`，响应头带 `x-gate-fatal: 1`（提示重试无意义）。**声明长度也查**：`Content-Length` 超限时立刻拒绝（`declared: true`），不等 body 到齐，避免只发头不发体的连接占满并发槽 |
 | `GATE_BIG_BODY_BYTES` | 12 MiB | 超过即打 `x-gate-big-body: 1` + 台账 `BIG_BODY`，用于提前发现上下文膨胀 |
 | `GATE_UPSTREAM_TIMEOUT_MS` | 60 s | 单次上游超时 |
 | `GATE_TOTAL_BUDGET_MS` | 90 s | 单请求总预算 |
@@ -370,7 +386,12 @@ GATE_L0_POLICY=reject
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `GATE_CANARY_POLICY` | `label` | `require` = 最近一次随机分词比对必须通过，否则 503 `gate_assurance_unmet`（reason=`canary_mismatch`） |
+| `GATE_CANARY_POLICY` | `label` | `require` = 最近一次随机分词比对必须通过，否则 503 `gate_assurance_unmet`。`skipped` **分两种**：目标即官方（`official_target`，放行）/ 缺 `DEEPSEEK_API_KEY` 基线（`no_baseline_key`，**不放行**，reason=`canary_unproven_no_baseline_key`）。旧快照没有原因字段时按 `legacy_unknown` 处理，同样不放行 |
+
+> **2026-11-05 修正的 fail-open 隐患**：旧实现把「缺基线跳过」也当成通过。
+> 后果——刷新任务只要在缺少 `DEEPSEEK_API_KEY` 的环境里跑一次（例如在没继承该变量的终端里手工跑
+> `audit-lane --write`），canary 就会静默 `score 0/0` 且 `skip`，而 `require` 照旧放行，
+> 「防换模型」这条硬闸实际已失效。现在 `ocg doctor` 会直接报 ❌「canary 基线」。
 
 canary 做的是：每次 `audit-lane` 取 10 条随机串，同时打官方与目标端，比较 `usage.input_tokens`，一致 ≥9/10 判通过。
 
@@ -395,10 +416,18 @@ GATE_CANARY_POLICY require  # 模型被换 → 立即 503（这是核心目标�
 GATE_L0_POLICY label        # 转售池事实只标注
 ```
 
-## 证据自动刷新（2026-11-04，必须配置）
+## 证据自动刷新（2026-11-04，必须配置；2026-11-05 加固）
 
 `GATE_CANARY_POLICY=require` 的判断依据是**证据快照**，快照过期会 fail-closed 拒掉全部流量
 （实测：13 小时前的快照 + require → `503 snapshot_missing_or_stale`）。因此必须定时刷新。
+
+> **2026-11-05 事故（务必读）**：快照 `at=13:42:49`，刷新任务每小时一次、`StartWhenAvailable` 未开；
+> 某次运行返回 `0x800710E0`（请求被拒绝）后不再补跑，15:42 越过 2h 窗口 →
+> 16:26 起**全部 responses 请求 503**，而快照里 canary 本来就是 10/10。
+> 也就是说：**刷新停摆 = 全站停摆**，而当时 `doctor` 一个字都没说。
+>
+> 现在三道防线：① 门控自愈（`GATE_EVIDENCE_AUTO_REFRESH`，stale 时后台补刷，20 秒级恢复）；
+> ② 任务 `StartWhenAvailable=True`（错过补跑）+ 不因电池跳过；③ `doctor` 直接报「证据快照 / 证据自愈 / canary 基线」。
 
 ### 1. 持久化车道配置（计划任务读不到交互式终端的环境）
 
@@ -409,15 +438,18 @@ setx GATE_UPSTREAM_PREFIX /zen/go
 setx GATE_EVIDENCE_MAX_AGE_MS 7200000    # 2 小时（一次失败不至于全拒）
 ```
 
+> 该窗口必须 **≥ 2 × 刷新间隔**，否则一次漏跑就全拒。用 `bin\ocg.mjs doctor` 的「证据快照」一行可核对
+> 实际生效值（`ageMs / maxAgeMs`）。
+
 ### 2. 注册每小时刷新任务
 
 ```powershell
-schtasks /create /tn "ocg-evidence-refresh" /sc hourly ^
-  /tr "cmd /c cd /d <REPO> && node bin\ocg.mjs audit-lane --write >> gate\logs\audit-refresh.log 2>&1 & exit 0" /f
+powershell -ExecutionPolicy Bypass -File scripts\install-refresh-task.ps1
 ```
 
-> 末尾的 `& exit 0` **不能省**：`audit-lane` 在非官方车道上退出码是 2（表示"端点非官方"），
-> 不加的话计划任务每小时都会显示"失败"，掩盖真正的故障。
+它会注册任务并**显式设置**：`StartWhenAvailable=True`、`DisallowStartIfOnBatteries=False`、
+`ExecutionTimeLimit=PT10M`、`MultipleInstances=IgnoreNew`。手写 `schtasks /create` 时这些默认值并不理想
+（错过不补跑正是 11-05 停摆的成因）。
 
 ### 3. 验证
 

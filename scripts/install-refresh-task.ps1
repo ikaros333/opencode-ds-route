@@ -67,6 +67,24 @@ if ($LASTEXITCODE -ne 0) {
   exit 1
 }
 
+# --- 2026-11-05：把「静默停摆」这一类故障堵掉 ---
+# 事故：任务某次运行返回 0x800710E0（请求被拒绝），而 StartWhenAvailable 未开 → 错过的那次不补跑；
+# 之后逐小时级联错过，快照超过 GATE_EVIDENCE_MAX_AGE_MS 后整个 responses 通道 503（实测 2 小时 44 分）。
+# 这里显式设置：错过补跑、电池上照跑、不因切电池中断、单次限时（防一次卡死把后续全推掉）。
+try {
+  $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+  $s = $t.Settings
+  $s.StartWhenAvailable = $true            # 错过的运行在机器可用时补跑（关键）
+  $s.DisallowStartIfOnBatteries = $false   # 笔记本/断电保护场景不跳过
+  $s.StopIfGoingOnBatteries = $false
+  $s.ExecutionTimeLimit = 'PT10M'          # 单次上限
+  $s.MultipleInstances = 'IgnoreNew'       # 重叠时保留正在跑的那个
+  Set-ScheduledTask -TaskName $TaskName -Settings $s | Out-Null
+  $chk = (Get-ScheduledTask -TaskName $TaskName).Settings
+  Write-Host ("[ok] 任务设置：StartWhenAvailable={0} DisallowStartIfOnBatteries={1} ExecutionTimeLimit={2}" -f $chk.StartWhenAvailable, $chk.DisallowStartIfOnBatteries, $chk.ExecutionTimeLimit)
+} catch {
+  Write-Host "[warn] 未能调整任务设置（$($_.Exception.Message)）→ 手动在任务计划程序里勾选「错过计划开始时间后尽快启动」" -ForegroundColor Yellow
+}
 Write-Host "[ok] 已创建计划任务 $TaskName（每 $IntervalMinutes 分钟）"
 Write-Host "     命令: $cmd"
 Write-Host "     日志: $logFile"

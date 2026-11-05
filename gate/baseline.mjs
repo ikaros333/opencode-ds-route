@@ -39,6 +39,116 @@ export const ID_UUID_ANY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
  */
 export const DELIVERABLE_SHAPES = new Set(['UUID4', 'resp_uuid4', 'resp_']);
 
+// ---------- 2026-11-05：逐响应「骨架证据」（判正增强）----------
+// 实测背景（真实上游，各 3/3 稳定，形状与业务流量完全一致）：
+//   官方 api.deepseek.com：35 个顶层键，顺序 = serde 结构体声明顺序，server=openresty，无 cf-ray
+//   中转 opencode/zen/go：18 个顶层键（官方的是它的超集，中转独有 0 个），
+//                        顺序 = 另一套结构体顺序，server=cloudflare，带 cf-ray/x-zen-model
+// 为什么要它：id 形态只回答"是不是我方改写"，回答不了"这是谁在回"。
+// 键顺序是**每响应都有、不需额外请求、与业务同桶**的证据，且要伪造必须复刻 35 字段声明顺序。
+// 纪律：只在"匹配官方"时升级为 verified；"匹配中转"时记 unverified；两边都不像 → unknown（不误杀）。
+// 官方改结构体顺序 → 本表必须重标定，并同步 docs/BASELINE.md。
+export const OFFICIAL_TOP_KEY_ORDER = [
+  'id', 'object', 'created_at', 'status', 'background', 'completed_at', 'content_filters', 'error',
+  'frequency_penalty', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls',
+  'model', 'moderation', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id',
+  'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier',
+  'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation',
+  'usage', 'user', 'metadata',
+];
+export const RELAY_TOP_KEY_ORDER = [
+  'id', 'object', 'created_at', 'status', 'error', 'incomplete_details', 'instructions', 'metadata',
+  'model', 'output', 'parallel_tool_calls', 'temperature', 'tool_choice', 'tools', 'top_p',
+  'max_output_tokens', 'reasoning', 'usage',
+];
+export const OFFICIAL_SERVER_HEAD = 'openresty';
+export const RELAY_SERVER_HEAD = 'cloudflare';
+
+/** 官方独有的顶层键（中转 18 键里一个都没有）。用来给"官方骨架"加一道硬门槛。 */
+export const OFFICIAL_ONLY_KEYS = OFFICIAL_TOP_KEY_ORDER.filter((k) => !RELAY_TOP_KEY_ORDER.includes(k));
+
+/**
+ * 提取 JSON **顶层** 键顺序（跳过字符串/转义/嵌套）。非法文本返回 []。
+ * 2026-11-05 审查补丁：`maxKeys` 达到即停。判形只需要前缀顺序（12 个已足够区分两套结构），
+ * 而 MAX_BODY 上限是 24 MiB —— 全量字符扫描在最大包上约 15ms，会把"交付闸 p50=1ms"直接吃掉。
+ */
+export function topLevelKeyOrder(text, maxKeys = 0) {
+  const t = String(text || '');
+  if (!t) return [];
+  const out = [];
+  let d = 0, i = 0, inStr = false, esc = false, expectKey = false;
+  while (i < t.length) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) { esc = false; i++; continue; }
+      if (c === '\\') { esc = true; i++; continue; }
+      if (c === '"') { inStr = false; i++; continue; }
+      // 字符串内部整段跳过（JSON 里 base64/长文本很常见，逐字符走完 24 MiB 要几十毫秒）
+      const q = t.indexOf('"', i), b = t.indexOf('\\', i);
+      const nx = (b >= 0 && (q < 0 || b < q)) ? b : q;
+      if (nx < 0) return out;
+      i = nx; continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      if (d === 1 && expectKey) {
+        let j = i + 1, s = '';
+        while (j < t.length) {
+          if (t[j] === '\\') { s += t[j + 1] || ''; j += 2; continue; }
+          if (t[j] === '"') break;
+          s += t[j]; j++;
+        }
+        out.push(s); expectKey = false;
+        if (maxKeys > 0 && out.length >= maxKeys) return out;
+      }
+      i++; continue;
+    }
+    if (c === '{' || c === '[') { d++; if (d === 1) expectKey = true; i++; continue; }
+    if (c === '}' || c === ']') { d--; i++; continue; }
+    if (c === ',' && d === 1) { expectKey = true; i++; continue; }
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 键顺序判形：'official' | 'relay' | 'unknown'
+ *
+ * 2026-11-05 实测教训：**键集是条件性的**（请求里没有 `reasoning` 时，上游就不回这个键）。
+ * 真实上游一次只给了 17 键（缺 reasoning），而基线表是带 reasoning 时的 18 键。
+ * 所以不能要求"长度全等"，改为：
+ *   ① 键数 ≥ 10（少键不判）
+ *   ② 键集覆盖基线的比例 ≥ 85%（防止只匹配到零星几个键）
+ *   ③ 按基线位置求最长递增子序列（LIS）占比 ≥ 95%（这才是"顺序一致"）
+ * 取两者的较高分；官方/中转都像或都不像 → unknown（不误杀）。
+ */
+export function keyOrderVerdict(keys) {
+  const ks = Array.isArray(keys) ? keys : [];
+  if (ks.length < 10) return 'unknown';
+  const fit = (base) => {
+    const known = ks.map((k) => base.indexOf(k)).filter((i) => i >= 0);
+    if (known.length < ks.length * 0.85) return 0;
+    const tails = [];
+    for (const v of known) {
+      let lo = 0, hi = tails.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (tails[mid] < v) lo = mid + 1; else hi = mid; }
+      tails[lo] = v;
+    }
+    return tails.length / ks.length;
+  };
+  const fo = fit(OFFICIAL_TOP_KEY_ORDER);
+  const fr = fit(RELAY_TOP_KEY_ORDER);
+  // ★ 2026-11-05 审查补丁（防"限 12 键"带来的假阳）：
+  //   中转前 12 键在**官方**基线里的 LIS 得分是 0.917 —— 与 0.95 只差 0.033。
+  //   只靠"谁高判谁"是运气，官方一旦调整字段顺序就可能把中转判成 official（假 verified）。
+  //   官方独有的 17 个键（background/service_tier/text/truncation…）中转一个都没有，
+  //   所以要求"至少命中 3 个官方独有键"才允许判 official。中转实测命中 0。
+  const hitOfficialOnly = ks.filter((k) => OFFICIAL_ONLY_KEYS.includes(k)).length;
+  if (fo >= 0.95 && fo > fr && hitOfficialOnly >= 3) return 'official';
+  if (fr >= 0.95 && fr > fo) return 'relay';
+  return 'unknown';
+}
+
 /** messages 协议：9 项非法参数请求的期望状态码序列（分两层校验：400 业务层 / 422 反序列化层） */
 export const MSG_FINGERPRINT = '400,400,400,400,400,400,422,422,422';
 

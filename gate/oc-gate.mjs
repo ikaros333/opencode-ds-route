@@ -28,6 +28,12 @@ import {
   ID_UUID4 as UUID4,
   ID_UUID_ANY as UUID_ANY,
   DELIVERABLE_SHAPES,
+  OFFICIAL_TOP_KEY_ORDER,
+  RELAY_TOP_KEY_ORDER,
+  OFFICIAL_SERVER_HEAD,
+  RELAY_SERVER_HEAD,
+  topLevelKeyOrder,
+  keyOrderVerdict,
   MSG_FINGERPRINT,
   E_SERDE_TYPE_MSG,
   E_SERDE_TYPE_MSG_OFFICIAL,
@@ -51,7 +57,7 @@ import {
   EVENT_TERMINAL,
   OBSERVED_AT,
 } from './baseline.mjs';
-import { readSnapshot as readEvidenceSnapshot } from './evidence.mjs';
+import { readSnapshot as readEvidenceSnapshot, runEvidence, scoreEvidence, writeSnapshot as writeEvidenceSnapshot } from './evidence.mjs';
 
 // ---------- 配置安全解析 ----------
 // 直接 Number(process.env.X) 在值是 "abc"/空串时会得到 NaN，而 NaN 参与比较永远为 false，
@@ -68,6 +74,18 @@ function num(name, def, { min = -Infinity, max = Infinity } = {}) {
   return v;
 }
 const PORT = num('GATE_PORT', 8787, { min: 1, max: 65535 });
+// 布尔开关：与 num() 同一口径——非法值不静默生效，回落默认并记一条配置告警。
+// 为什么需要它：`process.env.X === '1'` 这种写法在 X='0' 时会被当成"未设置"，
+// 也会把 'false'/'off' 当成开启（实测过两次配置写反）。
+function flag(name, def) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return def;
+  const s = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'on', 'yes'].includes(s)) return true;
+  if (['0', 'false', 'off', 'no'].includes(s)) return false;
+  CONFIG_WARNINGS.push(`${name}="${raw}" 不是有效布尔值，回落到 ${def}`);
+  return def;
+}
 // 安装根：/gate/health 暴露它，让 doctor 能回答「8787 上跑的到底是哪一份安装」。
 // 起因（2026-10-26）：同机两份安装抢同一端口/同一任务名时，从外部只能看到「有个门控在跑」，
 // 无法分辨归属，误判成「改了没生效」。
@@ -212,9 +230,44 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   fpMismatch: 0, fpRetries: 0, fpBlocked: 0,
   // 2026-11-02：软判据（未知字段等）与熔断计数
   fpSoft: 0, streamSoft: 0, breakerOpenCount: 0, bigBody: 0, bodyTooLarge: 0, proofVerified: 0, proofUnverified: 0,
+  // 2026-11-05：车道级预检保活（多车道时每条车道各自的 fail 缓存能否被刷新）
+  lanePrecheckRecovered: 0, lanePrecheckMiss: 0,
+  // 2026-11-05：逐响应骨架证据（判正增强）观测计数
+  keyOrder: { official: 0, relay: 0, unknown: 0 }, proofServer: {}, relayMimicsOfficial: 0,
   // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
   profiles: { official: 0, opencode: 0, unknown: 0 },
   cache: { samples: 0, hits: 0 } };
+
+// ---------- 2026-11-05：分段计时（阶段一 P0-②） ----------
+// 起因：台账只有 elapsedMs，`elapsed − Σattempts.ms` 的 p90 有 1.7s 无法归因 ——
+// 可能是流式回传、也可能是 tap 开销，没有分段就只能猜。现在按四段采集并给分位：
+//   precheckMs 请求进来到预检结论落定 | upstreamMs 预检完到上游响应头
+//   gateMs 响应头到交付闸写完头       | streamMs 写头到响应结束（流式回传 + 客户端消费）
+const PHASE_KEEP = 300;
+// 键序判形只需前缀顺序；见 baseline.topLevelKeyOrder 的 maxKeys 说明（避免 24 MiB 全量扫描）
+const KEY_ORDER_SCAN_KEYS = 12;
+const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], total: [] };
+function notePhase(p) {
+  const put = (k, v) => {
+    if (!Number.isFinite(v) || v < 0) return;
+    const a = phaseStats[k]; a.push(Math.round(v)); if (a.length > PHASE_KEEP) a.shift();
+  };
+  put('precheck', p.precheckMs); put('upstream', p.upstreamMs);
+  put('gate', p.gateMs); put('stream', p.streamMs); put('total', p.totalMs);
+}
+const pctOf = (a, q) => {
+  if (!a || !a.length) return null;
+  const s = [...a].sort((x, y) => x - y);
+  return s[Math.min(s.length - 1, Math.floor(s.length * q))];
+};
+const phaseView = () => ({
+  n: phaseStats.total.length, keep: PHASE_KEEP,
+  precheckMs: { p50: pctOf(phaseStats.precheck, 0.5), p90: pctOf(phaseStats.precheck, 0.9) },
+  upstreamMs: { p50: pctOf(phaseStats.upstream, 0.5), p90: pctOf(phaseStats.upstream, 0.9) },
+  gateMs:     { p50: pctOf(phaseStats.gate, 0.5),     p90: pctOf(phaseStats.gate, 0.9) },
+  streamMs:   { p50: pctOf(phaseStats.stream, 0.5),   p90: pctOf(phaseStats.stream, 0.9) },
+  totalMs:    { p50: pctOf(phaseStats.total, 0.5),    p90: pctOf(phaseStats.total, 0.9) },
+});
 
 // 2026-10-27 冻结版：形态探针的最近结论 / 实现指纹向量（仅观测）
 let lastShape = null;      // { at, verdict, idShape, detail }
@@ -305,8 +358,18 @@ async function withSlot(fn, signal) {
   finally { inflight--; const w = waiters.shift(); if (w) w.resolve(); }
 }
 
-const FORBIDDEN = new Set(['deepseek-v4-flash', 'deepseek-flash-1017']); // 用户硬约束
+// 用户硬约束（2026-11-05 重申，勿删勿放宽）：
+//   · 不用 api.deepseek.com 作业务上游（见下方 GATE_ALLOW_OFFICIAL_HOST 启动校验）
+//   · 不用 deepseek-v4-pro（成本/偏好由用户自己决定，不由门控替他选）
+// 配进 CHAIN 会被直接剔除；若整条 CHAIN 都被剔除，启动即拒绝（P1-4），不会静默 503。
+const FORBIDDEN = new Set(['deepseek-v4-flash', 'deepseek-flash-1017', 'deepseek-v4-pro']); // 用户硬约束
 const ALLOWED = CHAIN.filter(m => !FORBIDDEN.has(m));
+
+// 2026-11-05：官方直连只能作**证据探针的基线**（canary 需要 api.deepseek.com 做对照），
+// 不能作业务上游。想改就显式设 GATE_ALLOW_OFFICIAL_HOST=1 —— 默认拒绝启动，
+// 避免"手滑把 GATE_HOST 指到官方"这件事悄悄发生（那会绕开全部判据，等于门控失去意义）。
+const ALLOW_OFFICIAL_HOST = flag('GATE_ALLOW_OFFICIAL_HOST', false);
+const HOST_IS_OFFICIAL = /(^|\.)deepseek\.com$/i.test(String(process.env.GATE_HOST || 'opencode.ai'));
 
 // ★ 第 17 轮：身份白名单 —— 允许交付的响应 id 形态（唯一定义点，勿在别处硬编码）。
 // 目标：只接受官方后端；第三方（自部署 / 异模型 / 第三方池）一律拒绝；官方自身降智不管。
@@ -409,6 +472,48 @@ const EVIDENCE_POLICY = (process.env.GATE_EVIDENCE_POLICY || 'label').toLowerCas
 const EVIDENCE_EXPECT = (process.env.GATE_EVIDENCE_EXPECT || 'any').toLowerCase();
 const EVIDENCE_FILE = process.env.GATE_EVIDENCE_FILE || path.join(process.cwd(), 'gate', 'logs', 'lane-evidence.json');
 const EVIDENCE_MAX_AGE_MS = num('GATE_EVIDENCE_MAX_AGE_MS', 43200000, { min: 60000, max: 604800000 });
+// ---------- 2026-11-05：证据快照过期时自愈 ----------
+// 事故（16:26 全站 503）：canary=require 的放行条件里有 `fresh`，而快照由每小时一次的计划任务刷新。
+// 任务错过一次（实测 LastTaskResult=0x800710E0「请求被拒绝」）没人发现，2 小时窗口一过，
+// 整个 responses 通道 503 —— 明明快照里 canary 还是 10/10，拦人的是"过期"。
+// 现在：判定 stale/missing 的同时，在**后台**跑一次同进程刷新（不阻塞本次响应，本次仍 fail-closed）。
+// 效果：同样的故障从"等人工救（小时级）"变成"20 秒自愈"，且不需要 gate 进程 spawn 子进程。
+const EVIDENCE_AUTO_REFRESH = flag('GATE_EVIDENCE_AUTO_REFRESH', true);
+const EVIDENCE_REFRESH_MIN_MS = num('GATE_EVIDENCE_REFRESH_MIN_MS', 120000, { min: 0, max: 3600000 });
+const EVIDENCE_REFRESH_TIMEOUT_MS = num('GATE_EVIDENCE_REFRESH_TIMEOUT_MS', 15000, { min: 1000, max: 120000 });
+// 自愈快路径的 canary 采样数：默认 4（仍要求 ≥ceil(0.9×N)=4 全中）。整点任务仍是 10 条全量。
+const EVIDENCE_REFRESH_CANARY_N = num('GATE_EVIDENCE_REFRESH_CANARY_N', 4, { min: 1, max: 20 });
+const evRefresh = { inflight: false, attempts: 0, at: 0, ok: null, ms: null, lastError: null, lastWhy: null };
+function refreshEvidenceInBackground(why) {
+  if (!EVIDENCE_AUTO_REFRESH) return false;
+  if (evRefresh.inflight) return false;                       // 同一时刻只跑一个
+  if (Date.now() - evRefresh.at < EVIDENCE_REFRESH_MIN_MS) return false;  // 冷却，防打爆上游
+  evRefresh.inflight = true; evRefresh.at = Date.now(); evRefresh.attempts++; evRefresh.lastWhy = why;
+  const t0 = Date.now();
+  log({ ts: new Date().toISOString(), result: 'EVIDENCE_REFRESH_START', why,
+        host: HOST + ':' + String(HOST_PORT) });
+  Promise.resolve()
+    .then(() => runEvidence({ host: HOST, port: HOST_PORT, scheme: HOST_SCHEME, prefix: UPSTREAM_PREFIX,
+                              key: KEY, model: ALLOWED[0], session: UPSTREAM_PREFIX !== '',
+                              timeoutMs: EVIDENCE_REFRESH_TIMEOUT_MS, allowGen: false,
+                              // 快路径：完整一轮 ~48s，客户端等不到；这里只跑判正必需项 + 4 条 canary
+                              fast: true, canaryN: EVIDENCE_REFRESH_CANARY_N }))
+    .then(ev => scoreEvidence(ev))
+    .then(scored => {
+      writeEvidenceSnapshot(EVIDENCE_FILE, scored);
+      evRefresh.ok = true; evRefresh.ms = Date.now() - t0; evRefresh.lastError = null;
+      log({ ts: new Date().toISOString(), result: 'EVIDENCE_REFRESH_OK', ms: evRefresh.ms,
+            assurance: scored.assurance, canary: (scored.canary?.score ?? 0) + '/' + (scored.canary?.max ?? 0),
+            canarySkipped: scored.canary?.skippedReason || null });
+    })
+    .catch(e => {
+      evRefresh.ok = false; evRefresh.ms = Date.now() - t0;
+      evRefresh.lastError = String((e && e.message) || e).slice(0, 200);
+      log({ ts: new Date().toISOString(), result: 'EVIDENCE_REFRESH_FAIL', ms: evRefresh.ms, error: evRefresh.lastError });
+    })
+    .finally(() => { evRefresh.inflight = false; });
+  return true;
+}
 // 2026-11-02：模型族证据策略。require = 快照里的 model.family 必须为 deepseek-consistent，否则 503。
 // 注意：证明的是「模型族」（分词一致性 + 官方校验器模板），不是权重托管方。
 const MODEL_EVIDENCE_POLICY = (process.env.GATE_MODEL_EVIDENCE_POLICY || 'label').toLowerCase();
@@ -508,14 +613,21 @@ if (!STABLE_SESSION) {
     try { fs.writeFileSync(SESSION_FILE, STABLE_SESSION); } catch {}
   }
 }
-/** 轮转后只保留最近 LOG_KEEP 个历史文件，避免无限累积 */
-function pruneRotated() {
+/**
+ * 轮转后只保留最近 LOG_KEEP 个历史文件，避免无限累积。
+ * 2026-11-05：轮转必须落在**自己的目录**、用**自己的前缀**。
+ * 旧实现固定写 LOG_DIR + `gate-<ts>.jsonl`：影子/测试实例（GATE_LOG_FILE 指到别处）
+ * 一旦超过 LOG_CAP，会把自己的历史块扔进共享的 gate/logs，并被对方的 prune 顺手删掉
+ * ——今天实测就有 4 个 5MB 的 8799 残留块躺在生产目录里。
+ */
+function pruneRotated(dir, prefix) {
   try {
-    const names = fs.readdirSync(LOG_DIR)
-      .filter(n => /^gate-\d+\.jsonl$/.test(n))
-      .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+    const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.jsonl$');
+    const names = fs.readdirSync(dir)
+      .filter(n => re.test(n))
+      .sort((a, b) => Number(a.match(re)[1]) - Number(b.match(re)[1]));
     while (names.length > LOG_KEEP) {
-      const victim = path.join(LOG_DIR, names.shift());
+      const victim = path.join(dir, names.shift());
       try { fs.unlinkSync(victim); } catch {}
     }
   } catch {}
@@ -524,8 +636,11 @@ function pruneRotated() {
 function log(rec) {
   try {
     if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > LOG_CAP) {
-      fs.renameSync(LOG_FILE, path.join(LOG_DIR, `gate-${Date.now()}.jsonl`));
-      pruneRotated();
+      const rotDir = path.dirname(LOG_FILE);
+      const prefix = path.basename(LOG_FILE).replace(/\.jsonl$/i, '');
+      try { fs.mkdirSync(rotDir, { recursive: true }); } catch {}
+      fs.renameSync(LOG_FILE, path.join(rotDir, `${prefix}-${Date.now()}.jsonl`));
+      pruneRotated(rotDir, prefix);
     }
     // 每条记录带实例标识：多实例共用目录时也能区分来源（生产 / 影子 / 测试）
     const tagged = (rec && rec.instance) ? rec : { ...rec, port: PORT, pid: process.pid };
@@ -912,20 +1027,59 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
       //   verified   = 上游带 x-ds-trace-id 且无第三方包装头（官方 infra 经手）
       //   unverified = 出现 cf-ray / x-zen-model / x-opencode-log-id（中转层留下痕迹）
       //   unknown    = 两者都没有，不下结论
-      let proof = null;   // 2026-11-04：逐响应官方痕迹（L0-2 / L0-3）
+      // 2026-11-05（判正增强）：再加两条**每响应可测**的骨架证据 ——
+      //   server 头（官方 openresty / 中转 cloudflare）
+      //   顶层键顺序（官方 35 键 serde 顺序 / 中转 18 键另一套顺序，实测各 3/3 稳定）
+      // 计数推迟到 body 分析之后，避免"头说 verified、身体说 relay"时两边都计数。
+      let proof = null;
       {
         const hs = Object.keys(res.headers || {}).map((k) => k.toLowerCase());
         const hasTrace = hs.includes('x-ds-trace-id');
         const relayHs = ['cf-ray', 'x-zen-model', 'x-opencode-log-id'].filter((k) => hs.includes(k));
+        const srv = String(res.headers?.server || '').toLowerCase();
         proof = { level: hasTrace && relayHs.length === 0 ? 'verified' : relayHs.length ? 'unverified' : 'unknown',
-                  trace: hasTrace, relay: relayHs };
-        if (proof.level === 'verified') metrics.proofVerified = (metrics.proofVerified || 0) + 1;
-        else if (proof.level === 'unverified') metrics.proofUnverified = (metrics.proofUnverified || 0) + 1;
+                  trace: hasTrace, relay: relayHs, server: srv || null, keyOrder: 'unknown' };
       }
       let verdict = 'unknown', classifier = 'none', idShape = '', votes = null, signals = [], buffered = [];
       if (twoxx) {
         const p = await peekBody(res, ctype.includes('event-stream'));
         buffered = p.chunks; idShape = shapeOf(p.id);
+        // 2026-11-05：键顺序骨架证据。**只对非流式的整体 JSON 有意义** ——
+        // SSE 文本里每个 `data:` 都是独立小对象，扫描它会得到 type/response 这类内层键；
+        // 若某个实现直接把完整 response 对象塞进 data，就会误判成 official 并触发假告警。
+        // 所以流式一律 unknown（流式另有事件家族判据，见 makeEventTap）。
+        try {
+          if (ctype.includes('event-stream')) proof.keyOrder = 'unknown';
+          else {
+            const bodyText = Buffer.concat(p.chunks).toString('utf8');
+            proof.keyOrder = keyOrderVerdict(topLevelKeyOrder(bodyText, KEY_ORDER_SCAN_KEYS));
+          }
+        } catch { proof.keyOrder = 'unknown'; }
+        // 合并定级：官方骨架 → 升 verified；中转骨架/头 → unverified；都不像 → unknown（不误杀）
+        const relayLike = proof.relay.length > 0 || proof.server === RELAY_SERVER_HEAD;
+        const officialLike = (proof.trace || proof.server === OFFICIAL_SERVER_HEAD) && !relayLike;
+        if (proof.keyOrder === 'official' && officialLike) proof.level = 'verified';
+        else if (proof.keyOrder === 'relay' || relayLike) proof.level = 'unverified';
+        else if (proof.keyOrder === 'unknown' && !officialLike) proof.level = 'unknown';
+        try { metrics.keyOrder[proof.keyOrder] = (metrics.keyOrder[proof.keyOrder] || 0) + 1; } catch {}
+        // server 头归一到三个已知值后**统一使用**：metrics / 台账 / 告警都不写原始外部字符串
+        // （health 与 alerts 会被 doctor、前端渲染，原样透出等于开了一个注入面）。
+        // ★ 2026-11-05 审查修复：这个声明必须留在 if 块**外**——下面 RELAY_MIMICS_OFFICIAL 分支要用它，
+        //   上一版把它放在 if 里，mimic 场景会抛 ReferenceError（G33 抓到）。
+        const srvKey = proof.server === OFFICIAL_SERVER_HEAD ? 'official'
+          : proof.server === RELAY_SERVER_HEAD ? 'relay'
+          : (proof.server ? 'other' : null);
+        if (srvKey) metrics.proofServer[srvKey] = (metrics.proofServer[srvKey] || 0) + 1;
+        if (proof.level === 'verified') metrics.proofVerified = (metrics.proofVerified || 0) + 1;
+        else if (proof.level === 'unverified') metrics.proofUnverified = (metrics.proofUnverified || 0) + 1;
+        // ★ 伪装升级告警：中转的痕迹（cf-ray / cloudflare）**同时**出现官方骨架（35 键 serde 顺序）
+        //   说明它开始模仿官方信封。这不是"更安全"，而是"伪装变深了"，必须留痕。
+        if (proof.keyOrder === 'official' && relayLike) {
+          metrics.relayMimicsOfficial = (metrics.relayMimicsOfficial || 0) + 1;
+          log({ ts: new Date().toISOString(), result: 'ALERT_RELAY_MIMICS_OFFICIAL',
+                server: srvKey, relay: proof.relay, keyOrder: proof.keyOrder });
+          pushAlert('RELAY_MIMICS_OFFICIAL', { server: srvKey, relay: proof.relay });
+        }
         const v = vote({ idShape, hasCompletedAt: p.completed_at });
         verdict = v.verdict; votes = v.votes; signals = v.signals; classifier = 'body-id';
         if (!p.id) {
@@ -1659,12 +1813,16 @@ function makeEventTap(reqId, model, seedChunks = []) {
   return tap;
 }
 
-function runShapeProbe() {
+function runShapeProbe(lane = '') {
   return new Promise((resolve) => {
     const t0 = Date.now();
+    // 2026-11-05：车道级探针。lane 为空 = 旧行为（探 ALLOWED[0]）；
+    // 多车道时每个车道各探一次，结论写进各自缓存（precheck 的 ckey 带 lane）。
+    const probeModel = lane || ALLOWED[0];
     // 所有出口都记一次 lastShape：health 的 trustLevel 依赖它
-    const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '', profile: o.profile || '' }; resolve(o); };
-    const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], input: 'ping', max_output_tokens: 1 }), 'utf8');
+    const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '', profile: o.profile || '' };
+      resolve(lane ? { ...o, lane } : o); };
+    const payload = Buffer.from(JSON.stringify({ model: probeModel, input: 'ping', max_output_tokens: 1 }), 'utf8');
     const req = transport.request({
       host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST',
       timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
@@ -1863,21 +2021,25 @@ function precheck(proto = 'responses', opts = {}) {
     return Promise.resolve({ verdict: 'unsupported', passCount: 0, trust: 'none', source: 'no_criteria', proto });
   }
   const force = opts.force === true;   // 后台保活用：绕过缓存做一次真探针
+  // 2026-11-05：车道级预检。lane 为空时 = 旧行为（只探 ALLOWED[0]，缓存 key 就是 proto），
+  // 单车道部署完全不变；多车道时每个车道各自一条结论、各自缓存。
+  const lane = String(opts.lane || '');
+  const ckey = lane ? proto + '@' + lane : proto;
 
   // ★ 2026-10-22 缓存语义（两条，顺序不能换）：
   // ① 正向证据优先：最近一次实测若明确 fail（指纹不符 / request_id 非 UUID4），
   //    立刻按 fail 处理 —— 这是「第三方」的正向证据，不能被窗口内的旧 pass 掩盖。
   // ② 否则只要窗口内有过 pass 就复用。**只有 pass 进缓存**，net/timeout 不再毒化整个窗口。
-  const lastAttempt = precheckLastFor(proto);
+  const lastAttempt = precheckLastFor(ckey);
   if (!force && lastAttempt && lastAttempt.verdict === 'fail') {
     return Promise.resolve({ ...lastAttempt, source: 'live' });
   }
-  const pcPass = precheckPassFor(proto);
+  const pcPass = precheckPassFor(ckey);
   if (!force && pcPass && precheckTtlFor(proto) > 0
       && Date.now() - pcPass.at < precheckTtlFor(proto)) {
     return Promise.resolve({ ...pcPass, source: 'cache' });
   }
-  const inflight = precheckInflight.get(proto);
+  const inflight = precheckInflight.get(ckey);
   if (inflight) return inflight;
 
   function runStrategy() {
@@ -1887,7 +2049,7 @@ function precheck(proto = 'responses', opts = {}) {
     }
     if (strategy === 'logprob') return runChatPrecisionProbe().then(r => [r]);
     // 2026-10-27 冻结版：responses 用形态探针（稳定特征），不再用错误文案探针。
-    if (strategy === 'shape') return runShapeProbe().then(r => [r]);
+    if (strategy === 'shape') return runShapeProbe(lane).then(r => [r]);
     if (strategy === 'msgfp') return runMsgFingerprint().then(r => [r]);
     return Promise.resolve([]);
   }
@@ -1977,11 +2139,13 @@ function precheck(proto = 'responses', opts = {}) {
     // 2026-11-02（P0-4）：记录命中的 serde 家族（official-rust / opencode-mapped），用于区分上游实现
     const serdeFamily = (results.find(r => r.serdeFamily) || {}).serdeFamily || null;
     lastSerdeFamily = serdeFamily;
-    const rec = { at: Date.now(), proto, strategy, verdict, passCount, total, results, ms: tookMs, serdeFamily };
-    precheckLastByProto.set(proto, rec);
+    const rec = { at: Date.now(), proto, lane: lane || null, strategy, verdict, passCount, total, results, ms: tookMs, serdeFamily };
+    precheckLastByProto.set(ckey, rec);
     // ★ 只缓存 pass（见 precheckPassByProto 注释）
-    if (verdict === 'pass') precheckPassByProto.set(proto, rec);
+    if (verdict === 'pass') precheckPassByProto.set(ckey, rec);
     log({ ts: new Date().toISOString(), result: 'PRECHECK', proto, strategy, verdict, passCount, ms: tookMs,
+          // 2026-11-05：车道级预检必须能区分"哪条车道的结论"（旧记录只有 proto，多车道时无法归因）
+          lane: lane || undefined,
           deadlineMs: probeDeadlineMs(), ewmaMs: Math.round(precheckEwmaMs),
           confirmed: confirmed > 0 ? confirmed : undefined, recovered: recovered || undefined, serdeFamily,
           detail: results.map(r => `${r.id}:${r.verdict}${r.detail ? '(' + r.detail + ')' : ''}`).join(',') });
@@ -1997,9 +2161,44 @@ function precheck(proto = 'responses', opts = {}) {
     return { ...rec, source: 'live' };
   })();
 
-  precheckInflight.set(proto, run);
-  run.finally(() => { if (precheckInflight.get(proto) === run) precheckInflight.delete(proto); });
+  precheckInflight.set(ckey, run);
+  run.finally(() => { if (precheckInflight.get(ckey) === run) precheckInflight.delete(ckey); });
   return run;
+}
+
+/**
+ * 2026-11-05：车道级预检编排。
+ * 单车道（或开关关闭）时**退化成原来的单次 precheck**，行为与旧版逐字节一致；
+ * 多车道时并行探每个车道，并给出聚合结论：任一 pass → 整条通道 pass（可以继续走），
+ * 全 fail → fail，其余 unknown。逐车道的精细判定留给交付闸（按 winner 车道）。
+ * 这样「首车道坏、次车道好」不会再被一句 BLOCKED_PRECHECK_NOT_PASS 全部打死。
+ */
+const PERLANE_PRECHECK = flag('GATE_PERLANE_PRECHECK', true);
+async function precheckLanes(proto, lanes) {
+  const list = Array.isArray(lanes) ? lanes : [];
+  if (!PRECHECK_ENABLE) {
+    const one = { verdict: 'skip', passCount: 0, trust: 'bypass', source: 'disabled', proto };
+    return { global: one, byLane: new Map(list.map(m => [m, one])) };
+  }
+  if (!PERLANE_PRECHECK || list.length <= 1) {
+    // 2026-11-05 审查补丁：预检本身若 reject，不能让整条 Promise 链炸掉
+    // （那会让 laneBox 永远不落定、并且把错误藏进 race 的超时分支里）。
+    const one = await precheck(proto).catch(() => ({ verdict: 'unknown', source: 'error', proto, lane: null }));
+    return { global: one, byLane: new Map(list.map(m => [m, one])) };
+  }
+  const byLane = new Map();
+  const settled = await Promise.all(list.map(async (m) => {
+    try { return [m, await precheck(proto, { lane: m })]; }
+    catch { return [m, { verdict: 'unknown', source: 'error', proto, lane: m }]; }
+  }));
+  for (const [m, r] of settled) byLane.set(m, r);
+  const all = [...byLane.values()];
+  const passCount = all.filter(x => x.verdict === 'pass').length;
+  const failCount = all.filter(x => x.verdict === 'fail').length;
+  const verdict = passCount > 0 ? 'pass' : (failCount === all.length ? 'fail' : 'unknown');
+  const global = { verdict, passCount, total: all.length, proto, lane: null,
+                   source: 'perlane', results: all.flatMap(x => x.results || []) };
+  return { global, byLane };
 }
 
 /** 综合判定：预检优先，预检拿不到结论时退回周期 proof */
@@ -2018,11 +2217,16 @@ async function trustDecision(precheckPromise, proto = 'responses') {
   let pc;
   // race 不会取消败者：不 clearTimeout 的话，每个请求都会残留一个 PRECHECK_WAIT_MS 的定时器
   let waitTimer = null;
+  let byLane = null;
   try {
-    pc = await Promise.race([
+    const raw = await Promise.race([
       precheckPromise || precheck(proto),
       new Promise(r => { waitTimer = setTimeout(() => r({ verdict: 'timeout', source: 'timeout' }), precheckWaitMs()); }),
     ]);
+    // 2026-11-05：precheckLanes() 返回 { global, byLane }；单车道/旧路径返回裸 precheck 结果。
+    // 这里统一成 pc，并把 byLane 带下去供交付闸按 winner 车道判定。
+    if (raw && raw.global) { pc = raw.global; byLane = raw.byLane || null; }
+    else pc = raw;
   } catch {
     pc = { verdict: 'unknown', source: 'error' };
   } finally {
@@ -2450,6 +2654,18 @@ function redactHeaders(raw) {
 const server = http.createServer(async (req, res) => {
   try { await handle(req, res); }
   catch (e) {
+    // 2026-11-05：客户端主动断开会让 await 链抛 AbortError（clientGone.abort() 所致）。
+    // 这不是门控内部异常，但旧实现一律记 HANDLER_ERROR —— 而 docs/CONFIG.md 写「出现即 bug」，
+    // 实测 24h 内误报 2 次，把排查方向带去错误的地方。现在单独归类。
+    // 注意：abortedByClient 已在 res.on('close') 里计过，这里不重复计数。
+    const aborted = e?.name === 'AbortError' || e?.code === 'ABORT_ERR'
+      || /aborted|abort/i.test(String(e?.message || ''));
+    if (aborted) {
+      log({ ts: new Date().toISOString(), result: 'CLIENT_ABORTED', error: String(e?.message || e),
+            path: String(req.url || '').split('?')[0] });
+      try { if (!res.writableEnded) res.destroy(); } catch {}
+      return;
+    }
     log({ ts: new Date().toISOString(), result: 'HANDLER_ERROR', error: String(e?.message || e) });
     try {
       if (!res.headersSent) {
@@ -2522,13 +2738,39 @@ async function handle(req, res) {
   // 客户端断开就立刻中止这条请求链上的所有上游调用（probe / 真实请求 / 重试），
   // 否则用户取消后门控仍会继续烧 token。
   const clientGone = new AbortController();
+  const t0Close = Date.now();
   res.on('close', () => {
-    if (!res.writableEnded) { metrics.abortedByClient++; try { clientGone.abort(); } catch {} }
+    if (!res.writableEnded) {
+      metrics.abortedByClient++;
+      try { clientGone.abort(); } catch {}
+      // 2026-11-05：中止必须在台账留痕。此前只加计数，日志里完全看不到"客户端取消了"；
+      // 而内层 `if (clientGone.signal.aborted) return` 会吞掉异常，顶层 catch 的
+      // AbortError 分支只兜未捕获路径 —— 所以这条 close 记录才是主记录。
+      try {
+        const p0 = String(req.url || '').split('?')[0];
+        if (req.method === 'POST' && !p0.startsWith('/gate/')) {
+          log({ ts: new Date().toISOString(), reqId: 'client-abort', result: 'CLIENT_ABORTED',
+                path: p0, elapsedMs: Date.now() - t0Close });
+        }
+      } catch {}
+    }
   });
 
   // 代理请求统一记录总耗时（/gate/* 自身的管理端点不计入）
   const isProxy = req.method === 'POST' && !req.url.startsWith('/gate/');
   const startedAt = Date.now();
+  // 分段计时的四个时间戳（0 = 尚未发生）；见 phaseStats / phaseView
+  const tPhase = { precheckDone: 0, upstreamDone: 0, headersAt: 0 };
+  const phaseSnap = () => {
+    const up = tPhase.upstreamDone || Date.now();
+    return {
+      precheckMs: tPhase.precheckDone ? tPhase.precheckDone - startedAt : 0,
+      upstreamMs: tPhase.precheckDone ? up - tPhase.precheckDone : up - startedAt,
+      gateMs: tPhase.headersAt ? tPhase.headersAt - up : 0,
+      streamMs: tPhase.headersAt ? Date.now() - tPhase.headersAt : 0,
+      totalMs: Date.now() - startedAt,
+    };
+  };
   // 总预算从收到请求那一刻开始算：探针也计入，否则上游 hang 时探针会把预算吃穿
   const deadline = startedAt + TOTAL_BUDGET_MS;
   const remainMs = () => deadline - Date.now();
@@ -2685,12 +2927,18 @@ async function handle(req, res) {
     const pg = proofGate();
     const lastPc = precheckLastFor('responses') || precheckLastFor('messages') || null;
     return res.end(JSON.stringify({
-      ok: true, chain: ALLOWED, forbidden: [...FORBIDDEN], probe: USE_PROBE, ttl: PROBE_TTL,
+      // 2026-11-05：原名 `ttl`（= matrix 探测结论的复用窗口）与旁边的 precheckTtlMs 极易混读，
+      // 实测运维会把 120000 当成"预检窗口"。改名并保留语义。
+      ok: true, chain: ALLOWED, forbidden: [...FORBIDDEN], probe: USE_PROBE, matrixTtlMs: PROBE_TTL,
       blind: 'block', port: PORT,
       // 归属标识：doctor / 人工用它判断「这个端口上跑的是哪一份安装」
       root: INSTALL_ROOT, pid: process.pid,
       // 身份白名单（第 17 轮）
       deliverableShapes: [...DELIVERABLE_SHAPES],
+      // 2026-11-05：白名单全集里含 'resp_'，但它只在应急回退（GATE_RESP_SHAPE_STRICT=0）时才会
+      // 由 shapeOf 产出。只列全集会让运维误读成"任意 resp_ 都放行"（resp_bad 其实一律拒绝）。
+      respShapeStrict: RESP_SHAPE_STRICT,
+      deliverableShapesEffective: [...DELIVERABLE_SHAPES].filter(s => !(RESP_SHAPE_STRICT && s === 'resp_')),
       blockedProtos: [...BLOCKED_PROTOS],
       // 判活辅助
       proofTrust: pg.trust, proofReason: pg.reason,
@@ -2720,8 +2968,14 @@ async function handle(req, res) {
       serdeFamily: lastSerdeFamily, upstreamPrefix: UPSTREAM_PREFIX, precheckProfile: lastUpstreamProfile,
       evidence: (() => {
         const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+        // 2026-11-05：刷新状态必须可见——16:26 那次全站 503 的根因就是"计划任务停摆没人发现"。
+        const refresh = { auto: EVIDENCE_AUTO_REFRESH, minIntervalMs: EVIDENCE_REFRESH_MIN_MS,
+                          inflight: evRefresh.inflight, attempts: evRefresh.attempts,
+                          ok: evRefresh.ok, lastMs: evRefresh.ms,
+                          lastAt: evRefresh.at || null, lastWhy: evRefresh.lastWhy,
+                          lastError: evRefresh.lastError };
         // 2026-11-02：两个闸的策略分开暴露，避免"看 board 显示 label 实际已 require"的误判
-        const base = { modelPolicy: MODEL_EVIDENCE_POLICY };
+        const base = { modelPolicy: MODEL_EVIDENCE_POLICY, maxAgeMs: EVIDENCE_MAX_AGE_MS, refresh };
         if (!ev) return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: 'missing', snapshot: null };
         const ageMs = Date.now() - Date.parse(ev.at || '');
         return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: ev.endpoint?.verdict || 'unknown',
@@ -2731,16 +2985,24 @@ async function handle(req, res) {
                  messages: ev.messages ? { score: ev.messages.score, max: ev.messages.max } : null,
                  validator: ev.validator || null, assurance: ev.assurance || 'none',
                  assurancePolicy: ASSURANCE, l0Policy: L0_POLICY, canaryPolicy: CANARY_POLICY,
-                 canary: ev.canary ? { score: ev.canary.score, max: ev.canary.max, ok: ev.canary.ok } : null,
+                 canary: ev.canary ? { score: ev.canary.score, max: ev.canary.max, ok: ev.canary.ok,
+                                       skipped: !!ev.canary.skipped,
+                                       skippedReason: ev.canary.skippedReason || (ev.canary.skipped ? 'legacy_unknown' : null) } : null,
                  validate: ev.validate || null,
-                 proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0 },
+                 proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0,
+                          // 2026-11-05：骨架证据分布（键顺序 / server 头 / 伪装升级计数）
+                          keyOrder: metrics.keyOrder, server: metrics.proofServer,
+                          relayMimicsOfficial: metrics.relayMimicsOfficial || 0 },
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };
       })(),
       bodyLimit: { maxBodyBytes: MAX_BODY, bigBodyBytes: BIG_BODY_BYTES,
         bigBodyCount: metrics.bigBody || 0, bodyTooLargeCount: metrics.bodyTooLarge || 0,
         maxConcurrency: MAX_CONC, estPeakMemMB: Math.round(MAX_BODY * MAX_CONC / 1048576 * 2) },
-      usageKeysRequired: USAGE_KEYS_REQUIRED,
+      // 2026-11-05：必需 usage 键是**按剖面**的（官方 5 键 / 中转 7 键含 cost+opencode，见 L1696）。
+      // 原实现恒返回中转那 7 键，字段名却叫 required —— 读起来像"必须含 cost 才算合格"，正好相反。
+      usageKeysRequired: USAGE_KEYS_BY_PROFILE[lastUpstreamProfile] || null,
+      usageKeysByProfile: { official: OFFICIAL_USAGE_KEYS, opencode: USAGE_KEYS_REQUIRED },
       // ★ 2026-10-29：每响应指纹（提高拒答率的主闸）
       fingerprint: {
         policy: FP_POLICY, retries: FP_RETRIES, billingPolicy: BILLING_POLICY,
@@ -2769,6 +3031,9 @@ async function handle(req, res) {
       // 保护状态可见性（对外信任设计的核心）：判据最近一次成功距今多久、当前连的是哪
       judgeAgeMs: lastPc ? Date.now() - lastPc.at : null,
       lastJudgeOk: !!lastPc && lastPc.verdict === 'pass',
+      // 2026-11-05：分段耗时（最近 PHASE_KEEP 条的 p50/p90）—— 给"门控慢在哪"一个可核答案。
+      // 口径：precheck=进来到预检结论｜upstream=预检完到上游响应头｜gate=响应头到写完响应头｜stream=写完头到响应结束
+      phase: phaseView(),
       egressHost: `${HOST}:${HOST_PORT}`,
       tokenRequired: !!GATE_TOKEN,
       obsTokenRequired: !!OBS_TOKEN,
@@ -2877,21 +3142,31 @@ async function handle(req, res) {
     }));
   }
 
+  // 2026-11-05：既看「声明长度」也看「实际字节」。
+  // 旧实现只在真收到 >MAX_BODY 字节后才 413，于是「Content-Length: 30MB 但不发 body」
+  // 能把连接挂到 BODY_IDLE_TIMEOUT_MS（默认 120s）——6 条即可占满 MAX_CONC 槽位，
+  // 与 README「超限即 413 + x-gate-fatal」也不一致（实测 5s 无响应）。
+  // 声明值超限时直接拒，不必等字节到齐；chunked（无 content-length）仍走流式累计判定。
+  const tooLarge = (bodySize, declared) => {
+    // 2026-11-02：报错体带上实际字节，便于判断"超了一点"还是"超了一倍"；
+    // x-gate-fatal 告诉客户端重试无意义（dsh 侧 maxRetries=2，否则会白重试两轮）。
+    log({ ts: new Date().toISOString(), reqId: 'pre-parse', result: 'BODY_TOO_LARGE',
+          actualBytes: bodySize, limitBytes: MAX_BODY, declared: !!declared,
+          proto: protoOf('/zen/go/v1' + (url.pathname || '').replace(/^\/v1/, '')) });
+    metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1;
+    res.setHeader('x-gate-fatal', '1');
+    return replyEarly(req, res, 413, { error: { type: 'gate_body_too_large',
+      message: '请求体' + (declared ? '（声明长度）' : '') + ' ' + bodySize + ' 字节超过上限 ' + MAX_BODY + ' 字节；已 fail-closed，重试无意义',
+      actual_bytes: bodySize, limit_bytes: MAX_BODY, declared: !!declared } });
+  };
+  const declaredLen = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY) return tooLarge(declaredLen, true);
+
   const chunks = [];
   let bodySize = 0;
   for await (const c of req) {
     bodySize += c.length;
-    if (bodySize > MAX_BODY) {
-      // 2026-11-02：报错体带上实际字节，便于判断"超了一点"还是"超了一倍"；
-      // x-gate-fatal 告诉客户端重试无意义（dsh 侧 maxRetries=2，否则会白重试两轮）。
-      log({ ts: new Date().toISOString(), reqId: 'pre-parse', result: 'BODY_TOO_LARGE',
-            actualBytes: bodySize, limitBytes: MAX_BODY, proto: protoOf('/zen/go/v1' + (url.pathname || '').replace(/^\/v1/, '')) });
-      metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1;
-      res.setHeader('x-gate-fatal', '1');
-      return replyEarly(req, res, 413, { error: { type: 'gate_body_too_large',
-        message: '请求体 ' + bodySize + ' 字节超过上限 ' + MAX_BODY + ' 字节；已 fail-closed，重试无意义',
-        actual_bytes: bodySize, limit_bytes: MAX_BODY } });
-    }
+    if (bodySize > MAX_BODY) return tooLarge(bodySize, false);
     chunks.push(c);
   }
   const bodyBuf = Buffer.concat(chunks);
@@ -2949,43 +3224,67 @@ async function handle(req, res) {
     const evA = readEvidenceSnapshot(EVIDENCE_FILE);
     const ageA = evA ? Date.now() - Date.parse(evA.at || '') : Infinity;
     const fresh = evA && ageA <= EVIDENCE_MAX_AGE_MS;
+    // 2026-11-05：过期/缺失即刻在后台自愈（本次仍 fail-closed，但故障窗口从"小时级"降到"一次刷新"）。
+    // 冷却由 EVIDENCE_REFRESH_MIN_MS 控制，刷新失败也会留台账（EVIDENCE_REFRESH_FAIL）。
+    const refreshStarted = !fresh ? refreshEvidenceInBackground(evA ? 'stale' : 'missing') : false;
     const protoEvidence = proto === 'messages' ? evA?.validator?.messages
       : proto === 'responses' ? evA?.validator?.responses
       : undefined;
-    const validatorKnown = fresh && typeof protoEvidence === 'boolean';
     const strictOk = fresh && evA.assurance === 'strict';
     const l0Ok = fresh && evA.l0 && evA.l0.max > 0 && evA.l0.score === evA.l0.max;
-    // skipped 有两种来源：目标就是官方（无需比对）或没有官方基线。
-    // 前者不能因此拒绝（否则直连会被自己的 canary 闸打死），后者才算"无法证明"。
-    const canarySkipped = fresh && evA.canary && evA.canary.skipped === true;
-    const canaryOk = fresh && (evA.canary?.ok === true || canarySkipped);
+    // skipped 有两种来源，**必须分开**（2026-11-05 修 fail-open 隐患）：
+    //   ① official_target：目标本身就是官方，与自己比恒真，无需比对 → 允许放行（否则直连会被自己打死）
+    //   ② no_baseline_key / legacy_unknown：缺官方基线或旧快照没记原因 → **无法证明模型族**，不能算通过
+    // 旧实现把两者都当 pass：刷新任务一旦在缺 DEEPSEEK_API_KEY 的环境里跑（例如在我的 pwsh 里手工跑），
+    // canary 会静默 skipped，硬闸形同关闭（本次事故复现过：score 0/0 却返回 200）。
+    const canarySkipReason = fresh && evA.canary
+      ? (evA.canary.skippedReason || (evA.canary.skipped === true ? 'legacy_unknown' : null))
+      : null;
+    const canarySkippedOfficial = canarySkipReason === 'official_target';
+    const canaryOk = fresh && (evA.canary?.ok === true || canarySkippedOfficial);
     const needValidator = (ASSURANCE === 'probe' || ASSURANCE === 'strict');
     // 三态：pass / fail / unknown（快照里没有该协议字段）。unknown 不拦——避免把"没测过"当成"不达标"。
     const protoVerdict = !fresh ? 'stale' : (protoEvidence === undefined ? 'unknown' : (protoEvidence ? 'pass' : 'fail'));
+    const canaryBlocked = CANARY_POLICY === 'require' && !canaryOk;
     const failed = (needValidator && ASSURANCE === 'strict' && !strictOk)
       || (needValidator && ASSURANCE === 'probe' && protoVerdict === 'fail')
       || (needValidator && protoVerdict === 'stale')
       || (L0_POLICY === 'reject' && !l0Ok)
-      || (CANARY_POLICY === 'require' && !canaryOk);
+      || canaryBlocked;
     if (failed) {
+      // blocked_by：这次到底是谁拦的。旧报文只把三个策略原样倾倒，于是"assurance:label 却被拦"
+      // 看起来像 bug（16:26 事故就是这样被误读的）。
+      const blockedBy = !fresh ? (CANARY_POLICY === 'require' ? 'canary_evidence' : (needValidator ? 'assurance_evidence' : 'evidence'))
+        : canaryBlocked ? (canarySkipReason ? 'canary_unproven' : 'canary')
+        : (L0_POLICY === 'reject' && !l0Ok) ? 'l0'
+        : (ASSURANCE === 'strict' ? 'assurance_strict' : 'validator');
       const why = !fresh ? 'snapshot_missing_or_stale'
-        : (CANARY_POLICY === 'require' && !canaryOk) ? 'canary_mismatch'
+        : canaryBlocked ? (canarySkipReason ? 'canary_unproven_' + canarySkipReason : 'canary_mismatch')
         : (L0_POLICY === 'reject' && !l0Ok) ? 'l0_fingerprint_incomplete'
         : (ASSURANCE === 'strict' ? 'strict_official_trace_missing' : 'validator_unreachable');
       metrics.assuranceBlocked = (metrics.assuranceBlocked || 0) + 1;
-      log({ ts: new Date().toISOString(), reqId, result: 'ASSURANCE_UNMET', why, proto,
+      log({ ts: new Date().toISOString(), reqId, result: 'ASSURANCE_UNMET', why, blockedBy, proto,
             assurance: ASSURANCE, l0Policy: L0_POLICY, canaryPolicy: CANARY_POLICY,
             protoEvidence: protoEvidence === undefined ? 'unknown' : protoEvidence,
             canary: evA?.canary ? evA.canary.score + '/' + evA.canary.max : null,
+            canarySkipReason, refreshStarted,
             l0: evA?.l0 ? evA.l0.score + '/' + evA.l0.max : null, ageMs: Number.isFinite(ageA) ? ageA : null });
       res.setHeader('x-gate-fatal', '1');
+      // x-gate-refresh: started = 已触发后台补刷（客户端稍后重试即可恢复），不是"永久不可用"
+      if (refreshStarted) res.setHeader('x-gate-refresh', 'started');
       return replyEarly(req, res, 503, { error: { type: 'gate_assurance_unmet',
-        message: '本协议（' + proto + '）的官方性证据未达标（' + why + '）；已 fail-closed。',
-        proto, assurance: ASSURANCE, l0_policy: L0_POLICY, canary_policy: CANARY_POLICY, reason: why,
+        message: '本协议（' + proto + '）被【' + blockedBy + '】判定不可放行（' + why + '）；已 fail-closed。' +
+                 (refreshStarted ? ' 证据已过期，门控正在后台补刷，稍后重试即可恢复。' : ''),
+        proto, blocked_by: blockedBy, reason: why,
+        assurance: ASSURANCE, l0_policy: L0_POLICY, canary_policy: CANARY_POLICY,
         proto_evidence: protoEvidence === undefined ? 'unknown' : protoEvidence,
-        canary: evA?.canary ? { score: evA.canary.score, max: evA.canary.max } : null,
+        canary: evA?.canary ? { score: evA.canary.score, max: evA.canary.max, skipped: !!evA.canary.skipped,
+                                skipped_reason: canarySkipReason } : null,
         l0: evA?.l0 ? { score: evA.l0.score, max: evA.l0.max } : null,
-        evidence_age_ms: Number.isFinite(ageA) ? ageA : null } });
+        evidence_age_ms: Number.isFinite(ageA) ? ageA : null,
+        evidence_max_age_ms: EVIDENCE_MAX_AGE_MS,
+        refresh_started: refreshStarted,
+        retryable: true } });
     }
   }
   if (EVIDENCE_POLICY === 'require' && EVIDENCE_EXPECT === 'official') {
@@ -3071,7 +3370,16 @@ async function handle(req, res) {
   } catch {}
 
   // 预检与车道探测并行启动：两者都约 1-2 秒，重叠后总耗时不变
-  const precheckP = PRECHECK_ENABLE ? precheck(proto) : Promise.resolve({ verdict: 'skip', source: 'disabled' });
+  // 2026-11-05：改为 precheckLanes —— 单车道时它内部直接退化回 precheck(proto)（行为不变），
+  // 多车道时并行探每个车道，并给出「任一 pass 即整体 pass」的聚合结论 + 逐车道结论。
+  const precheckRun = PRECHECK_ENABLE
+    ? precheckLanes(proto, ALLOWED)
+    : Promise.resolve({ global: { verdict: 'skip', passCount: 0, trust: 'bypass', source: 'disabled', proto }, byLane: new Map() });
+  // ★ 审查修复（2026-11-05）：逐车道结论用 then 取**已落定**的值，绝不额外 await。
+  // 原因：trustDecision 只等 precheckWaitMs(13s)，而多车道时每条车道各有 probeDeadlineMs；
+  // 若这里 await，慢车道的探针会把请求拖到 probe 上限（最长 45s），关键路径凭空变长。
+  const laneBox = { byLane: null };
+  const precheckP = precheckRun.then(x => { laneBox.byLane = x && x.byLane ? x.byLane : null; return x.global; });
 
   const ranked = await rankCandidates(String(body.model || ''), proto, pathName, body, req.headers, clientGone.signal, deadline);
   let { order } = ranked;
@@ -3088,6 +3396,7 @@ async function handle(req, res) {
 
   let currentTrust = null;
   const deliver = async (model, r, attemptNo, fpRetriesLeft = FP_RETRIES) => {
+    tPhase.upstreamDone = Date.now();   // 拿到上游响应（头已到）——之后都算交付闸 + 回传
     // ★ 2026-10-27 冻结版：结构闸放在**所有计数之前**。
     // 早期版本把它接在 metrics.pass++ 之后，导致「被判 pass 但实际返回 503」的台账/指标不一致
     // （实测 10 次请求里 1 次被拦，却显示 passByProof=10）。
@@ -3221,10 +3530,16 @@ async function handle(req, res) {
     // 必须用 currentTrust（handle 里已算好的决策），不能再读一次 proofGate()：
     // 那会绕过预检结果，导致预检明明通过却标记成 unverified。
     const dgate = currentTrust || proofGate();
+    // 2026-11-05（阶段二）：交付闸按**赢下车道的预检结论**判定。
+    // 旧实现只有全局 allowAllLanes：多车道时"首车道预检 fail"会把整条请求打死，
+    // 即使另一条车道已经通过预检并被判负换道选中（实测 mock 首车道 HEX32 → 应换道却被拦）。
+    // 现在：该车道有独立结论就用它，没有才退回全局。单车道两者等价，行为不变。
+    const lanePc = dgate.byLane && typeof dgate.byLane.get === 'function' ? dgate.byLane.get(model) : null;
+    const laneAllowed = lanePc ? lanePc.verdict === 'pass' : dgate.allowAllLanes;
     let resultKind;
     if (r.verdict === 'official') {
       metrics.pass++; resultKind = 'PASS'; lastSuccessAt = new Date().toISOString();
-    } else if (dgate.allowAllLanes) {
+    } else if (laneAllowed) {
       metrics.passByProof++; resultKind = 'PASS_BY_PROOF'; lastSuccessAt = new Date().toISOString();
     } else {
       // ★ 2026-10-21：这是不可达保险丝。
@@ -3248,8 +3563,17 @@ async function handle(req, res) {
     // 导致端到端时延只能从 PRECHECK 记录反推。现在补齐。
     log({ ts: new Date().toISOString(), reqId, proto, attempt: attemptNo, model, status: r.status,
           verdict: r.verdict, classifier: r.classifier, idShape: r.idShape, votes: r.votes,
-          hedge: HEDGE, result: resultKind, proofTrust: dgate.trust, probeNotes: notes, attempts,
-          elapsedMs: Date.now() - startedAt });
+          hedge: HEDGE, result: resultKind, precheckTrust: dgate.trust, proofEvidence: r.proof || null, probeNotes: notes, attempts,
+          phase: phaseSnap(), elapsedMs: Date.now() - startedAt });
+    // 响应结束（正常写完 / 断开）时补一次流回传耗时：这是唯一能解释
+    // 「elapsed − attempts.ms 尾部 1.7s」的段，必须在 finish/close 里采。
+    // 2026-11-05 审查修复：deliver 可能因指纹重发被调用多次（同一 res），
+    // 用 once + 标志避免重复注册导致同一条请求被采样多次（分位数会偏）。
+    if (!res.__phaseNoted) {
+      res.__phaseNoted = true;
+      res.once('finish', () => { if (tPhase.headersAt) notePhase(phaseSnap()); });
+      res.once('close', () => { if (tPhase.headersAt && !res.writableEnded) notePhase(phaseSnap()); });
+    }
     // 客户端断开即释放上游流，避免连接一直挂在这里。
     // ★ P1-1：计数统一由 handle 顶部的 close 监听负责（那里还要 abort 整条链）。
     // 这里若再 ++，一次断开会被两个监听各记一次 → abortedByClient 虚高一倍。
@@ -3283,6 +3607,7 @@ async function handle(req, res) {
       // 2026-11-04：本次放行所依据的 canary 结果（便于在客户端侧直接看到'模型族是否被验证过'）
       ...(lastCanaryHeader() ? { 'x-gate-canary': lastCanaryHeader() } : {}),
     });
+    tPhase.headersAt = Date.now();   // 交付闸写完响应头：此后的耗时都算"回传 + 客户端消费"
     for (const c of r.buffered) { try { res.write(c); } catch { break; } }
     // 若 peek 时流已结束，pipe 不会再触发 'end'，这里兜底收尾，避免客户端挂起
     if (r.stream.readableEnded || r.stream.destroyed) { try { res.end(); } catch {} return; }
@@ -3356,7 +3681,12 @@ async function handle(req, res) {
   // pgate.precheck 恒为 undefined，重验分支永不命中（实测 thirdRevalidated=0）。
   const pgate = { allowAllLanes: decision.allowAllLanes, trust: decision.trust, reason: decision.source,
                   precheck: decision.precheck, proof: decision.proof };
+  // 2026-11-05：带上逐车道预检结论（**已落定**则直接用，不等；未落定则留空，退回全局判定）。
+  // 交付闸用它回答"赢下这次响应的那条车道自己有没有通过预检"，而不是全局布尔。
+  if (laneBox.byLane) { pgate.byLane = laneBox.byLane; delete laneBox.byLane; }
+  else pgate.byLane = null;
   currentTrust = pgate;
+  tPhase.precheckDone = Date.now();   // 预检结论落定（缓存命中同样算"落定"，等待成本已付）
 
   let candidates = pgate.allowAllLanes
     ? order.slice()
@@ -3735,6 +4065,14 @@ async function handle(req, res) {
 }
 
 if (!KEY) { console.error('[oc-gate] OPENCODE_GO_API_KEY 缺失，拒绝启动'); process.exit(1); }
+// 2026-11-05：业务上游不允许直接指官方（判据会失去意义，且与用户明确要求冲突）。
+// 注意：这不影响证据探针 —— canary/EV 仍会用 DEEPSEEK_API_KEY 打 api.deepseek.com 做基线对照，
+// 那是"测"，不是"路由"。缺基线时 canary 会按 canary_unproven 拒绝，不会静默放行。
+if (HOST_IS_OFFICIAL && !ALLOW_OFFICIAL_HOST) {
+  console.error('[oc-gate] GATE_HOST 指向官方 api.deepseek.com：本项目不做官方直连代理（用户硬约束）。');
+  console.error('           要临时放开请显式设置 GATE_ALLOW_OFFICIAL_HOST=1，并自行承担全部后果。');
+  process.exit(1);
+}
 // ★ P1-4：CHAIN 全部撞上 FORBIDDEN 时 ALLOWED 为空，后续 ALLOWED[0] 会变成 undefined，
 // 探针 body.model=undefined → 所有请求静默退化成 503，而日志里看不出是配置写错了。
 // 这种配置错误必须在启动时就拒绝，不能让它带着空候选链跑起来。
@@ -3869,12 +4207,33 @@ server.listen(PORT, '127.0.0.1', () => {
                                   source: 'proof_refresh', ms: r.ms ?? null };
               try { log({ ts: new Date().toISOString(), result: 'STARTUP_SELFTEST_FILLED', ...startupSelfTest }); } catch {}
             }
-            return;
+          } else {
+            metrics.proofRefreshMiss = (metrics.proofRefreshMiss || 0) + 1;
+            log({ ts: new Date().toISOString(), result: 'PROOF_REFRESH_MISS', proto: p, verdict: r?.verdict,
+                  source: r?.source,
+                  detail: (r?.results || []).map(x => x.id + ':' + x.verdict + (x.detail ? '(' + x.detail + ')' : '')).join(',') });
           }
-          metrics.proofRefreshMiss = (metrics.proofRefreshMiss || 0) + 1;
-          log({ ts: new Date().toISOString(), result: 'PROOF_REFRESH_MISS', proto: p, verdict: r?.verdict,
-                source: r?.source,
-                detail: (r?.results || []).map(x => x.id + ':' + x.verdict + (x.detail ? '(' + x.detail + ')' : '')).join(',') });
+          // ★ 2026-11-05 审查修复（实测复现的真 bug）：车道级预检的缓存键是 `proto@lane`，
+          // 而上面这行只刷 `proto` —— 于是**某条车道的 fail 结论永远不会被重探覆盖**：
+          // handle 每次都读缓存的 fail → 该车道永久不可用，即使上游早已恢复。
+          // 实测（双车道 mock，lane-a 探针先坏后好）：20 秒后仍然 503，probes 从 9 涨到 14。
+          // 修法：多车道时对每条车道也做一次 force 探针，让它自己的缓存能被刷新。
+          // 单车道（ALLOWED.length<=1）不额外发探针，保持原有探针数量不变。
+          if (PERLANE_PRECHECK && ALLOWED.length > 1) {
+            await Promise.all(ALLOWED.map(async (m) => {
+              try {
+                const rl = await precheck(p, { force: true, lane: m });
+                if (rl?.verdict === 'pass') metrics.lanePrecheckRecovered = (metrics.lanePrecheckRecovered || 0) + 1;
+                else {
+                  metrics.lanePrecheckMiss = (metrics.lanePrecheckMiss || 0) + 1;
+                  log({ ts: new Date().toISOString(), result: 'LANE_PRECHECK_MISS', proto: p, lane: m,
+                        verdict: rl?.verdict, source: rl?.source });
+                }
+              } catch (e) {
+                metrics.lanePrecheckMiss = (metrics.lanePrecheckMiss || 0) + 1;
+              }
+            }));
+          }
         } catch (e) {
           metrics.proofRefreshMiss = (metrics.proofRefreshMiss || 0) + 1;
           try { log({ ts: new Date().toISOString(), result: 'PROOF_REFRESH_ERROR', proto: p, error: String(e?.message || e) }); } catch {}

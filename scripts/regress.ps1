@@ -31,7 +31,7 @@ $NodePath = $nodeCmd.Source
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Gate = Join-Path $Root 'gate\oc-gate.mjs'
-$LogDir = Join-Path $Root 'gate\logs'
+$LogDir = Join-Path $Root 'gate\logs\tests'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 Write-Host ('=== 0. 脚本编码检查（Windows 专属坑）=== 运行时: ' + (& $NodePath --version))

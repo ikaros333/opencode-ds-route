@@ -316,3 +316,61 @@ EV15(proto)  ok = status===400 && /Invalid max_tokens value/            && !/^\s
 
 `msg_` + 32hex（36 位），实测 5/5。已在 `shapeOf` 单列 `msg_hex`——
 **行为不变**（仍归 third 拒绝），只是把信号从含糊的 `other` 变成可读名称。
+## B24 逐响应骨架证据：server 头 + 顶层键顺序（2026-11-05 标定）
+
+### 起因
+
+`id` 形态只回答"这条响应是不是我方改写过的"，回答不了"这是谁在回"。
+要判正，需要**每响应都有、不需要额外请求、且与业务流量完全同桶**的证据。
+
+### 实测（真实上游，各 3/3 稳定）
+
+| 观测点 | 官方 `api.deepseek.com` | 中转 `opencode.ai/zen/go` |
+|---|---|---|
+| 顶层键数 | **35** | **18**（带 `reasoning`）/ **17**（不带） |
+| 键顺序 | serde 结构体声明顺序：`id,object,created_at,status,background,completed_at,…` | 另一套顺序：`id,object,created_at,status,error,incomplete_details,…` |
+| `server` 头 | **`openresty`** | **`cloudflare`** |
+| `cf-ray` / `x-zen-model` / `x-opencode-log-id` | 无 | 有 |
+| `x-ds-trace-id` | 有 | 无 |
+
+两者键集关系：**中转是官方的严格子集**（官方独有 17 键：`background`,`service_tier`,`text`,`truncation`,`top_logprobs`,…；中转独有 0 键）。
+
+### 判据
+
+```
+keyOrderVerdict(顶层键序列):
+  ① 键数 < 10 → unknown（少键不判）
+  ② 键集覆盖率（能对到基线里的键）< 85% → 该项 0 分
+  ③ LIS(按基线位置) / 键数 ≥ 95% → 该基线命中
+  取官方/中转较高分；两边都像或都不像 → unknown
+```
+
+**只扫前 12 个顶层键**：判形只需前缀顺序，而 `MAX_BODY` 上限 24 MiB —— 全量字符扫描在最大包上约 60 ms，
+会把「交付闸 p50 = 1 ms」直接吃掉。限 12 键 + 字符串整段跳过（`indexOf`）后，24 MB body 实测 **8 ms**。
+
+**为什么用 LIS 而不是全等**：键集是**条件回显**的——请求里没有 `reasoning` 时上游就不返回该键。
+第一次实现要求"长度全等"，结果真实流量（17 键）全被判 unknown（实测复现）。改成相对顺序 + 覆盖率后，
+17/18 键中转 → `relay`，30/35 键官方 → `official`，乱序 35 键 → `unknown`（不误杀）。
+
+### 与既有证据的关系
+
+| 层 | 看什么 | 强度 |
+|---|---|---|
+| L0-2/L0-3（车道级） | 头：`x-ds-trace-id` / `cf-ray` 等 | 强负向，正向需 trace |
+| 本判据（**逐响应**） | 头 `server` + 体 **键顺序** | 官方骨架 → `verified`；中转骨架/头 → `unverified`；都不像 → `unknown` |
+
+落地在 `proof`（`x-gate-proof` 响应头 + `health.evidence.proof` + 台账 `proofEvidence`），**不参与放行/拒绝**，
+只决定"这次交付被标成什么等级的官方痕迹"。
+
+### 边界（必须承认）
+
+- **可伪造**：中转只要按 serde 顺序重排 35 个字段就能过关。但那等于复刻官方信封（含 17 个它现在没有的字段），
+  成本高；而且**一旦出现"中转头 + 官方骨架"，会触发 `ALERT_RELAY_MIMICS_OFFICIAL`**——把"伪装"本身变成信号。
+- **不是判正**：在本机唯一可用车道（flash）上，它永远只能给出 `unverified`。这是诚实标注，不是故障。
+- 官方改结构体顺序 → `OFFICIAL_TOP_KEY_ORDER` 必须重标定；漂移表现为 `keyOrder.unknown` 上升。
+
+### 实测样本（生产重启后第一条）
+
+```json
+{"verified":0,"unverified":1,"keyOrder":{"official":0,"relay":1,"unknown":0},"server":{"relay":1},"relayMimicsOfficial":0}
+```

@@ -1,3 +1,248 @@
+### 硬约束固化（2026-11-05，用户重申）
+
+两条方向性约束不再只靠口头/记忆，已写进代码与测试：
+
+| 约束 | 机器化位置 | 行为 |
+|---|---|---|
+| 不用 `deepseek-v4-pro` | `FORBIDDEN` 集合（`oc-gate.mjs`） | 配进 `GATE_CHAIN` 会被剔除；若整条链因此为空 → **启动即拒绝**（不静默 503） |
+| 不用 `api.deepseek.com` 作业务上游 | `GATE_ALLOW_OFFICIAL_HOST`（默认 `false`） | `GATE_HOST` 指向 `*.deepseek.com` → **启动即拒绝**，需显式设 `1` 才放开 |
+
+> **不影响的边界**：证据探针（canary 基线 / EV1–EV15）仍会用 `DEEPSEEK_API_KEY` 打官方 API 做**对照**。
+> 那是"测"，不是"路由"。若连基线也不用，canary 会标 `no_baseline_key`，按现有语义**拒绝放行**
+> （`canary_unproven_no_baseline_key`），不是静默通过。
+
+**因此阶段三的 `GATE_UPSTREAMS` 失去目标**：opencode 侧只有 `deepseek-v4.1-flash` 与 `deepseek-v4-pro`
+两条 DS 车道，后者被禁；跨 host 也被禁 → 当前订阅下**没有第二条可切的 DS 上游**。
+"判负即切换"的能力保留（多车道配置即生效，G32 覆盖），但在现有约束下它只会退化为"判负即 503"。
+后续改进应转向「判定质量与可用性」，而不是「换上游」。
+
+## 未发布（计划 v0.1.9）— 2026-11-05 第二次完整审查
+
+### 修掉的真 bug：车道级预检的 fail 缓存永久锁死
+
+**现象（实测复现）**：双车道 mock，`lane-a` 的探针先坏后好 →
+第 1 次请求 `503`，**6 s、13 s、20 s 之后仍然 503**（探针数从 9 涨到 14，说明探针在跑却没生效）。
+
+**根因**：车道级预检的缓存键是 `proto@lane`，而保活 tick 只刷 `proto`（无 lane）。
+`precheck()` 的缓存语义是「正向 fail 优先、且不重探」，于是那个车道的 fail 结论**永远无法被覆盖** →
+该车道永久不可用，即使上游早已恢复。单车道不触发（handle 与保活同 key），所以只有配多车道时才会中。
+
+**修法**：多车道时保活对每条车道各做一次 `force` 探针（`precheck(p, {force:true, lane:m})`），
+单车道（`ALLOWED.length <= 1`）不发额外探针、探针数与旧版完全一致。
+
+**验证**：`G34`（新增，4 条断言）——首请求 503 → 上游恢复 → 9 s 内回到 200，且台账出现车道级 pass 刷新。
+
+### 同轮加固
+
+- `metrics.lanePrecheckRecovered / lanePrecheckMiss` 显式初始化并计数；
+- `LANE_PRECHECK_MISS` 台账（区分"车道没恢复"与"保活没跑"）。
+
+## 未发布（计划 v0.1.9）— 2026-11-05 判正增强（A）
+
+**目标**：不换上游（用户硬约束），在唯一可用车道上把"这是谁在回"判得更准。
+
+### 新增两条逐响应判据（与业务流量同桶、不需额外请求）
+
+| 判据 | 官方 | 中转 | 稳定性 |
+|---|---|---|---|
+| `server` 响应头 | `openresty` | `cloudflare` | 各 3/3 |
+| **顶层键顺序** | 35 键 serde 顺序 | 18（或 17，`reasoning` 条件回显）键另一套顺序 | 各 3/3 |
+
+判法用 **LIS（最长递增子序列）+ 键集覆盖率**，不要求长度全等——第一次实现要求全等，
+真实流量（17 键）全被判 `unknown`，已修正为：键数<10 不判、覆盖率≥85%、LIS≥95%。
+
+### 效果（诚实版）
+
+- **生产实测**：`x-gate-proof` 从"无依据的 `unknown`"变成**有依据的 `unverified`**
+  （`keyOrder:{relay:1}` + `server:{cloudflare:1}`）。这是标注质量提升，不是"让 flash 变官方"。
+- 在 flash 车道上**永远不可能判 `verified`**——它本来就是中转。想要 `verified` 只有换上游（被禁）。
+- 新增能力：**伪装升级告警** `RELAY_MIMICS_OFFICIAL` —— 中转头（cf-ray/cloudflare）同时出现官方 35 键骨架时触发。
+  这把"它开始模仿官方信封"本身变成信号，而不是等它模仿成功。
+
+### 不参与放行
+
+`proof` 只影响交付标注（`x-gate-proof` / `health.evidence.proof` / 台账 `proofEvidence`），
+**不改变任何 200/503 判定**。所以本轮零可用性风险。
+
+### 验证
+
+`verify` **534 / 0**（AP1–AP15）、`coverage` **197 / 0**（G33 覆盖官方/中转/伪装三态）、`regress` 全绿。
+
+## 未发布（计划 v0.1.9）— 2026-11-05 阶段一/二：可诊断性 + 判负即切换
+
+**先纠正上一轮的一个错误结论**：说「缺 `GATE_UPSTREAMS` 才能切换」不准确。
+实测（mock 首车道 HEX32）证明**同 host 多车道本来就能判负换道**（`attempts=2`，第三形态 → 次车道 → 200）。
+跨 host 才需要 `GATE_UPSTREAMS`。
+
+### 阶段一（P0，已完成）
+
+**① 客户端中止归类**：`AbortError` 此前一律记 `HANDLER_ERROR`，而文档写「出现即 bug」——
+24h 内实测误报 2 次。现在记 `CLIENT_ABORTED`（带 path/elapsedMs），并且在 `res.on('close')` 里落台账：
+内层 `if (clientGone.signal.aborted) return` 会吞掉异常，顶层 catch 只兜未捕获路径，**close 那条才是主记录**。
+
+**② 分段计时**：台账只有 `elapsedMs`，`elapsed − Σattempts.ms` 的 p90 有 1.7s 无法归因。
+现在四段采样（保留最近 300 条）：
+
+| 段 | 口径 |
+|---|---|
+| `precheckMs` | 请求进来 → 预检结论落定（缓存命中同样算落定） |
+| `upstreamMs` | 预检完 → 上游响应头 |
+| `gateMs` | 响应头 → 交付闸写完响应头 |
+| `streamMs` | 写完头 → 响应结束（流式回传 + 客户端消费） |
+
+`/gate/health.phase` 给 p50/p90；`PASS` 台账带 `phase` 快照。测试断言「四段之和 ≈ 总耗时」（不重不漏）。
+
+### 阶段二（已完成）
+
+**③ 车道级预检（per-lane）**：`runShapeProbe(lane)` / `precheck(proto,{lane})`，
+缓存键 `proto@lane`；新增 `precheckLanes()` 编排：
+
+- 单车道（或 `GATE_PERLANE_PRECHECK=0`）→ **直接退化为原来的 `precheck(proto)`**，行为逐字节不变；
+- 多车道 → 并行探每个车道，聚合语义「任一 pass 即整体 pass」，全 fail 才 fail；
+- 每条 `PRECHECK` 台账记 `lane`，可归因。
+
+**④ 交付闸按「赢下车道」判定**：`pgate.byLane` 带上逐车道结论，`deliver()` 用
+`dgate.byLane.get(model).verdict === 'pass'` 决定是否交付，而不是全局 `allowAllLanes`。
+这修掉了「首车道预检 fail → 整条请求被打死、即使次车道已通过预检并被选中」这个结构缺陷。
+
+**⑤ 影子观测脚本** `scripts/multilane-shadow.mjs`：在副端口起「官方信封优先」双车道，
+按间隔发极小请求采样 winner / attempts / idShape，产物写 `gate/logs/tests/`，不动生产。
+
+### 实测（真实上游，影子端口）
+
+- `deepseek-v4-pro` 车道返回 **裸 UUID4 + 26 字段 → `verdict=official`**（`IMPL_VECTOR` 显示 `goStack=false`，
+  即走原生校验）；`deepseek-v4.1-flash` 恒为 `resp_uuid4` → 只能是 `PASS_BY_PROOF`。
+  **结论：形态可区分，且 pro 车道在现有判据下被判 positive**——这为「判负即切换」提供了真实目标。
+  影子观测 4/4 轮全部落 pro（`scripts/multilane-shadow.mjs`，产物在 `gate/logs/tests/`）。
+- 判负换道端到端（G32，mock 驱动）：首车道 HEX32 → 次车道交付 → 200，`attempts=2`，
+  `BLOCKED_PRECHECK_NOT_PASS=0`，两条车道各有 `PRECHECK lane=` 记录。
+- **分段计时的第一组真相**（生产，重启后 3 条真实请求）：
+  `precheck p50 1ms / p90 12ms`、`upstream p50 1171ms / p90 3474ms`、**`gate p50 1ms / p90 1ms`**、
+  `stream p90 1353ms`。→ 此前 `elapsed − Σattempts.ms` 的 1.7s 尾部**不是门控开销**，
+  而是上游生成 + 流式回传；门控自身在毫秒级。
+
+### 验证
+
+verify **514 / 0**（新增 AO1–AO10）、coverage **190 / 0**（新增 G31 中止归类+分段、G32 判负即切换）、
+`regress -IncludeSoak` **全部通过**（含修掉的 `R1 热启动` 相对判据抖动：加 4s 绝对兜底）。
+
+## 未发布（计划 v0.1.9）— 2026-11-05 事故修复：证据过期导致全站 503
+
+**16:26 全站 503，不是判据判负，是"证据过期"。** 这一轮修的是可用性与可诊断性，
+同时堵掉一个 fail-open 隐患。
+
+### 事故复盘
+
+| 时刻 | 事件 |
+|---|---|
+| 13:42:49 | 刷新任务写入快照（正常） |
+| 14:42 / 15:42 | 计划任务未产出新快照（`StartWhenAvailable` 未开 → 错过不补跑） |
+| 15:42:49 | 快照越过 `GATE_EVIDENCE_MAX_AGE_MS=7200000`（2h）→ 此后任何 responses 请求都会被拒 |
+| 16:26:47 | 第一条业务请求 → `503 gate_assurance_unmet`（`reason=snapshot_missing_or_stale`，`ageMs=9,838,540`） |
+
+关键事实：报文里 `canary:{score:10,max:10}`、`proto_evidence:true` 都是好的——**拦人的是"过期"，不是"不合格"**；
+而报文同时打印 `assurance:"label"`，看起来像"标签模式却拦截"的 bug，实际拦截者是 `canary_policy:"require"`。
+
+### 修复 1：门控侧自愈（不再需要人工救）
+
+`GATE_EVIDENCE_AUTO_REFRESH`（默认开）：判定 stale/missing 时，**在后台**用同进程调用
+`runEvidence()` + `scoreEvidence()` + `writeSnapshot()` 补一次证据，不 spawn 子进程（保持"0 依赖 / 无子进程"审计口径），
+也不阻塞本次响应（本次仍 fail-closed）。冷却 `GATE_EVIDENCE_REFRESH_MIN_MS`（默认 2 min），失败写台账
+`EVIDENCE_REFRESH_FAIL`。
+效果：同类故障从"小时级停摆"变成"一次刷新自愈"。实测（真实上游）：
+整轮 `runEvidence` **48.1s**，自愈快路径（跳过 EV7/EV8/EV10，canary 10→4）**23.0s**，
+自愈完成后 `stale=false`、`canary=4/4`、下一次请求 `200 pass-by-proof`。
+快路径被跳过项打 `skippedReason=fast_refresh`，不进分母，不会把"没测"当"不达标"。
+
+### 修复 2：报文说清"谁拦的"
+
+`gate_assurance_unmet` 报错体新增 `blocked_by`（`canary_evidence` / `canary` / `canary_unproven` / `l0` /
+`assurance_strict` / `validator`）、`refresh_started`、`evidence_max_age_ms`、`retryable:true`；
+响应头新增 `x-gate-refresh: started`。文案从「官方性证据未达标」改为「被【<谁>】判定不可放行（<原因>）」。
+台账 `ASSURANCE_UNMET` 同步记录 `blockedBy` 与 `canarySkipReason`。
+
+### 修复 3：canary `skipped` 的 fail-open 洞
+
+`skipped` 有两种来源，旧实现都当通过：目标即官方（合理）、**缺 `DEEPSEEK_API_KEY` 基线**（不合理 ——
+无法证明模型族，却放行）。实测复现：在没继承该变量的终端里手工跑 `audit-lane --write`，
+快照变成 `canary 0/0 skipped`，而 `require` 依旧放行，等于"防换模型"这条硬闸静默失效。
+现在 `EV13` 记录 `skippedReason`，只有 `official_target` 允许放行；
+`no_baseline_key` / 旧快照的 `legacy_unknown` → `503 canary_unproven_*`。
+
+### 修复 4：计划任务不再静默停摆
+
+`scripts/install-refresh-task.ps1` 注册后显式设置 `StartWhenAvailable=True`、`DisallowStartIfOnBatteries=False`、
+`StopIfGoingOnBatteries=False`、`ExecutionTimeLimit=PT10M`、`MultipleInstances=IgnoreNew`。
+（原先这几项是系统默认：错过不补跑，正是本次停摆的成因。）
+
+### 修复 5：`ocg doctor` 会自己喊
+
+新增三行体检：**证据快照**（新鲜度 `age/maxAge` + canary 分数）、**证据自愈**（开关/尝试次数/最近结果/失败原因）、
+**canary 基线**（`skippedReason≠official_target` 直接报 ❌）。此前这三项全无，所以停摆两小时无人知晓。
+
+### 测试
+
+- `test-coverage` 新增 **G30**（9 项）：过期 → 503 + `blocked_by` + `x-gate-refresh` → 后台刷新完成 → 快照转新鲜 →
+  理由从"过期"变"缺基线"；旧快照 `legacy_unknown` 拒绝；`official_target` 放行（直连不自锁）。
+  同时修正套件自身缺陷：`mock.close()` 原先写在所有用例之前，导致后追加的 G29/G30 连不上 mock（ECONNREFUSED）。
+- `verify-patch` 新增 **AM1–AM18**，覆盖自愈开关/冷却/单飞/写回/失败留痕/`blocked_by`/health 字段/EV13 语义。
+- 离线：**481 / 0**（verify）与 **175 / 0**（coverage）。
+
+## 未发布（计划 v0.1.9）— 2026-11-05 审计修复
+
+**这一轮不加判据，只修「能骗过测试的缺陷」。** 起因：`regress.ps1 -IncludeSoak` 对真实上游必红，
+顺藤摸出 11 处不一致——文档承诺 vs 代码行为、测试 vs 生产、字段名 vs 语义。
+
+### 修复：`test-risk.mjs` 两处真 bug（regress -IncludeSoak 失败的根因）
+
+| 缺陷 | 现象（复现） | 修法 |
+|---|---|---|
+| 不带 `x-gate-token` | 生产与影子都显式启用了 `GATE_TOKEN` → 每个请求 401，`R1 首请求成功` 直接 FAIL | 与其他套件一致，从 `process.env.GATE_TOKEN` 取并发送 |
+| `Math.max(...samples)` | 401 是毫秒级返回，60 s soak 攒出十几万样本 → 展开传参 `RangeError: Maximum call stack size exceeded`，真正的失败原因被爆栈掩盖 | 改 `reduce`；样本数与「连续失败」都设上限；首个请求失败即中止并打印鉴权提示 |
+
+### 新增：按声明长度提前拒绝（不再被「只发头不发体」占住槽位）
+
+`Content-Length` 超 `GATE_MAX_BODY` 时立刻 413（报错体带 `declared: true`），不必等 body 到齐。
+旧实现只在**实际收到**超限字节后才拒，于是 6 条挂起连接就能占满 `MAX_CONC` 槽位（默认要等
+`GATE_BODY_IDLE_TIMEOUT_MS=120 s`），也与 README「超限即 413 + x-gate-fatal」不一致。
+
+### 修正：health / 台账字段「同名不同义」
+
+| 旧字段 | 问题 | 现在 |
+|---|---|---|
+| `deliverableShapes` | 恒含 `resp_`，但那只在 `GATE_RESP_SHAPE_STRICT=0` 回退时才生效 → 会被读成「任意 resp_ 都放行」 | 新增 `respShapeStrict` + `deliverableShapesEffective`（严格模式自动剔除 `resp_`） |
+| `ttl` | 实际是 matrix 探测结论的复用窗口，与旁边 `precheckTtlMs`（15 s）极易混读 | 改名 `matrixTtlMs` |
+| `usageKeysRequired` | 恒返回中转 7 键（含 `cost`/`opencode`），像是「必须含 cost 才合格」——正好相反 | 按最近实测剖面返回（官方 5 键 / 中转 7 键），并新增 `usageKeysByProfile` 全量表 |
+| 台账 `proofTrust` | 取的是预检结论（`trust='full'` 表示预检 pass），却与 health 的 proof 信任同名 → 台账 full / health unknown 看似矛盾 | 台账改 `precheckTrust`；health 的 `proofTrust` 语义不变 |
+
+### 修正：日志轮转不再污染共享目录
+
+旧实现固定写 `LOG_DIR` + `gate-<ts>.jsonl`：影子/测试实例（`GATE_LOG_FILE` 指到别处）一旦超过
+`GATE_LOG_CAP`，自己的历史块会落进共享 `gate/logs`，还会被对方的 prune 顺手删掉——
+实测有 4 个 5 MB 的 8799 残留块躺在生产目录里。现在轮转只落在台账自己所在目录、只 trim 同前缀。
+
+### 测试卫生
+
+- 测试台账统一写 `gate/logs/tests/`（原先 900+ 个 `cov-*.jsonl` 与生产台账同目录）；
+- `G6 快照损坏` 用例原先改写的是**生产** `gate/logs/matrix.json`，而该实例读的是自己的
+  `GATE_SNAPSHOT` → 既污染生产又其实没测到目标路径；现在改写实例自己的快照；
+- `test-risk` 的「超上限」用例改为从 `/gate/health` 读实际上限（生产 24 MiB / 出厂 16 MiB 都成立），
+  并新增 `R3b` 声明长度攻击用例。
+
+### 文档（此前与代码不符）
+
+- README 版本与下载包名对齐 `v0.1.8`（此前 README 写 `v0.1.7`，CI「版本一致性」自 `e91d23e` 起连续失败）；
+- README 请求体上限段落澄清：**出厂默认 16 MiB**，24 MiB 需按四参数联动 `setx`（`install.ps1` 不覆盖）；
+- `.env.example` 的 `GATE_PRECHECK_TTL_MS` 注释 90000 → 15000（与代码一致）；
+- `docs/CONFIG.md`：`GATE_PROBE_DEADLINE_MIN` 5000 → 8000；413 说明补 `declared`；轮转说明补齐；
+- CI 步骤名与 README 不再写死断言数（写死过两次，之后都漂了）。
+
+### 验证
+
+- 离线：`verify-patch` **463 / 0**、`test-coverage` **165 / 0**（新增 G29 覆盖声明长度闸与 health 语义）；
+- 真实上游：`regress.ps1 -IncludeSoak` **全部通过**（suite 26 / pollution 11 / security 20 / cache 8 /
+  multimodal 7 / real 18 / risk 17，均 0 失败）。
+
 ## v0.1.8 — 2026-11-04
 
 **不是"又多了一批判据"，而是把「能不能证明这条通道是官方」这件事第一次说清楚了。**
