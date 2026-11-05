@@ -59,13 +59,24 @@ foreach ($k in $defaults.Keys) {
 # --- 注册任务 ---
 # 关键：audit-lane 在「非官方车道」上退出码是 2（表示端点不是官方，不是故障），
 # 末尾必须 & exit 0，否则计划任务每小时都显示"失败"，把真正的故障掩盖掉。
-$cmd = 'cmd /c cd /d "' + $repo + '" && node bin\ocg.mjs audit-lane --write >> "' + $logFile + '" 2>&1 & exit 0'
+# 2026-11-06：改成**无窗口**执行。
+# 原来的 `cmd /c ...` 在「只在用户登录时运行（Interactive）」下，每 N 分钟都会弹出一个控制台窗口
+# （就是用户看到的那块黑框）。改用 conhost --headless 包裹 powershell ——
+# 与「OpenCodeDS Route Gate」任务同一写法，控制台没有可见窗口。
+# 实测：任务 Running→Ready、LastTaskResult=0x0、evidence.at 正常更新、全程无可见窗口。
+$cmd = 'conhost --headless powershell -Command "... audit-lane --write"'
+$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$inner = "Set-Location '" + $repo + "'; node bin\ocg.mjs audit-lane --write >> '" + $logFile + "' 2>&1; exit 0"
+$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') `
+  -Argument ('--headless "' + $psExe + '" -NoProfile -ExecutionPolicy Bypass -Command "' + $inner + '"')
 
-schtasks /create /tn $TaskName /tr $cmd /f /sc minute /mo $IntervalMinutes 2>&1 | Out-Null
+# 先用 schtasks 建任务骨架（省得自己拼触发器的每 N 分钟语义），再立刻把动作换成无窗口版本。
+schtasks /create /tn $TaskName /tr 'cmd /c echo placeholder' /f /sc minute /mo $IntervalMinutes 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
   Write-Host "[bad] schtasks 创建失败（可能需要管理员权限，或任务名已被占用）" -ForegroundColor Red
   exit 1
 }
+Set-ScheduledTask -TaskName $TaskName -Action $action | Out-Null
 
 # --- 2026-11-05：把「静默停摆」这一类故障堵掉 ---
 # 事故：任务某次运行返回 0x800710E0（请求被拒绝），而 StartWhenAvailable 未开 → 错过的那次不补跑；
@@ -79,6 +90,7 @@ try {
   $s.StopIfGoingOnBatteries = $false
   $s.ExecutionTimeLimit = 'PT10M'          # 单次上限
   $s.MultipleInstances = 'IgnoreNew'       # 重叠时保留正在跑的那个
+  $s.Hidden = $true                        # 2026-11-06：任务列表里也不显眼（窗口本身已由 conhost --headless 消掉）
   Set-ScheduledTask -TaskName $TaskName -Settings $s | Out-Null
   $chk = (Get-ScheduledTask -TaskName $TaskName).Settings
   Write-Host ("[ok] 任务设置：StartWhenAvailable={0} DisallowStartIfOnBatteries={1} ExecutionTimeLimit={2}" -f $chk.StartWhenAvailable, $chk.DisallowStartIfOnBatteries, $chk.ExecutionTimeLimit)
