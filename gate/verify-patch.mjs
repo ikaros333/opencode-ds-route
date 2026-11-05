@@ -659,6 +659,21 @@ has('AJ8 assurance 按协议取证据', 'const protoEvidence = proto === ');
 has('AJ9 unknown 不拦（三态）', "protoEvidence === undefined ? 'unknown'");
 has('AJ10 health 暴露 canaryPolicy', 'canaryPolicy: CANARY_POLICY');
 
+// ===== 2026-11-05：EV14/EV15 文本级判据 + 漂移告警 =====
+console.log('\n=== AK. 文本级判据 / 漂移告警 ===');
+hasIn(evLines, 'AK1 EV14 假模型探针', "add('EV14'");
+hasIn(evLines, 'AK2 EV14 三协议', "['responses', '/v1/responses'");
+hasIn(evLines, 'AK3 EV15 边界探针', "add('EV15'");
+hasIn(evLines, 'AK4 官方名单文案正则', 'The supported API model names are');
+hasIn(evLines, 'AK5 中转包装前缀正则', 'Upstream request failed');
+hasIn(evLines, 'AK6 validate 结构化输出', 'const validate = (() => {');
+hasIn(evLines, 'AK7 unknown 语义（没跑过）', "ran.length === 0 ? 'unknown'");
+hasIn(evLines, 'AK8 L0-1 记录模型集合', '{ models: modelIds }');
+hasIn(cliLines, 'AK9 漂移检测函数', 'function detectDrift');
+hasIn(cliLines, 'AK10 翻转告警类型', "'VALIDATOR_FLIP'");
+hasIn(cliLines, 'AK11 模型漂移告警类型', "'MODEL_SET_DRIFT'");
+hasIn(lines, 'AK12 msg_hex 形态识别', "return 'msg_hex'");
+hasIn(lines, 'AK13 health 暴露 validate', 'validate: ev.validate || null');
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);

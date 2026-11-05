@@ -162,6 +162,51 @@ function pickEvidenceKey(host) {
   return process.env.OPENCODE_GO_API_KEY || process.env.DEEPSEEK_API_KEY || '';
 }
 
+// ---------------- 2026-11-05：证据漂移检测 ----------------
+function detectDrift(file, scored) {
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return []; }
+  const alerts = [];
+  const lines = [];
+
+  // 1) 校验可达性翻转（按协议）
+  const pv = prev.validate || {};
+  for (const proto of ['responses', 'messages', 'chat']) {
+    const a = pv[proto]?.status, b = scored.validate?.[proto]?.status;
+    if (a && b && a !== b) {
+      alerts.push({ kind: 'VALIDATOR_FLIP', proto, from: a, to: b,
+        score: `${scored.validate[proto].score}/${scored.validate[proto].max}`,
+        relayWrap: scored.validate[proto].relayWrap });
+    }
+  }
+
+  // 2) 模型集合漂移
+  const pm = prev.l0?.items?.find((x) => x.id === 'L0-1')?.models;
+  const cm = scored.l0?.items?.find((x) => x.id === 'L0-1')?.models;
+  // 首次运行（上一份快照还没有 models 字段）视为基线未知，不告警
+  if (Array.isArray(pm) && cm && pm.length > 0) {
+    const added = cm.filter((x) => !pm.includes(x));
+    const removed = pm.filter((x) => !cm.includes(x));
+    if (added.length || removed.length) alerts.push({ kind: 'MODEL_SET_DRIFT', added, removed, count: `${pm.length}→${cm.length}` });
+  }
+
+  if (alerts.length) {
+    const at = new Date().toISOString();
+    for (const a of alerts) lines.push(JSON.stringify({ at, ...a }));
+    const logFile = process.env.GATE_LANE_ALERTS || path.join(ROOT, 'gate', 'logs', 'lane-alerts.jsonl');
+    try { fs.appendFileSync(logFile, lines.join('\n') + '\n'); } catch {}
+    console.log('\n[ocg] ⚠ 证据漂移：');
+    for (const a of alerts) {
+      if (a.kind === 'VALIDATOR_FLIP') console.log(`   VALIDATOR_FLIP ${a.proto}: ${a.from} → ${a.to}（${a.score}${a.relayWrap ? ', 中转包装 ' + a.relayWrap : ''}）`);
+      else {
+        const brief = (arr) => arr.length > 5 ? arr.slice(0, 5).join(',') + '…(+' + (arr.length - 5) + ')' : arr.join(',');
+        console.log(`   MODEL_SET_DRIFT ${a.count}` + (a.added.length ? `  新增: ${brief(a.added)}` : '') + (a.removed.length ? `  移除: ${brief(a.removed)}` : ''));
+      }
+    }
+  }
+  return alerts;
+}
+
 async function cmdAuditLane(rest) {
   const { runEvidence, scoreEvidence, writeSnapshot } = await import('../gate/evidence.mjs');
   const has = (k) => rest.includes('--' + k);
@@ -213,13 +258,27 @@ async function cmdAuditLane(rest) {
         console.log(`    ${m2} ${it.id}  ${it.detail}`);
       }
     }
-    if (scored.validator) {
+    if (scored.validate) {
+      console.log('\n  VA 校验可达性（2026-11-05 文本级判据）');
+      for (const proto of ['responses', 'messages', 'chat']) {
+        const v = scored.validate[proto];
+        if (!v) continue;
+        const mk = v.status === 'pass' ? '✅' : (v.status === 'fail' ? '❌' : '⊘');
+        console.log(`    ${mk} ${proto.padEnd(9)} ${v.score}/${v.max}  status=${v.status}` +
+          (v.officialText.length ? '  官方文案:' + v.officialText.join(',') : '') +
+          (v.relayWrap ? `  中转包装:${v.relayWrap}` : ''));
+      }
+      console.log('        （官方必拒非法参数；出现 Upstream request failed 前缀即中转包装）');
+    }    if (scored.validator) {
       console.log(`\n  校验器可达：responses=${scored.validator.responses ? '是' : '否'}  messages=${scored.validator.messages ? '是' : '否'}  → ${scored.validator.reachable ? '可达（判正）' : '不可达（无法判正）'}`);
       console.log(`  assurance 档：${scored.assurance}   （probe=需校验器可达；strict=需 L0 全过 + 逐响应官方痕迹）`);
     }
   }
   if (has('write')) {
     const out = process.env.GATE_EVIDENCE_FILE || path.join(ROOT, 'gate', 'logs', 'lane-evidence.json');
+    // 2026-11-05：写快照前先与上一份对比，产出 VALIDATOR_FLIP / MODEL_SET_DRIFT 告警。
+    // 目的：把"校验器状态翻转"（实测 24h 内 0/5 ↔ 5/5）从"事后才发现"变成台账事件。
+    detectDrift(out, scored);
     writeSnapshot(out, scored);
     console.log(`\n[ocg] 快照已写入 ${out}`);
   }

@@ -551,6 +551,9 @@ const shapeOf = (id) => {
   if (/^gw-/.test(id)) return 'gw-';
   if (/^\d+$/.test(id)) return 'numeric';
   if (/^[0-9a-f]{32}$/i.test(id)) return 'HEX32';
+  // 2026-11-05：messages 的第三种 id 生成器（实测 5/5）：msg_ + 32hex（36 位）。
+  // 行为不变（仍归 third），只是把信号从含糊的 'other' 变成可读的 'msg_hex'。
+  if (/^msg_[0-9a-f]{32}$/i.test(id)) return 'msg_hex';
   return 'other';
 };
 
@@ -2729,6 +2732,7 @@ async function handle(req, res) {
                  validator: ev.validator || null, assurance: ev.assurance || 'none',
                  assurancePolicy: ASSURANCE, l0Policy: L0_POLICY, canaryPolicy: CANARY_POLICY,
                  canary: ev.canary ? { score: ev.canary.score, max: ev.canary.max, ok: ev.canary.ok } : null,
+                 validate: ev.validate || null,
                  proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0 },
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };

@@ -219,7 +219,7 @@ await new Promise(r => mock.listen(MP, '127.0.0.1', r));
 const children = [];
 async function startGate(port, env = {}) {
   const child = spawn(process.execPath, [GATE], {
-    env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: 'test-key', GATE_PORT: String(port),
+    env: { ...process.env, GATE_ASSURANCE: '', GATE_CANARY_POLICY: '', GATE_L0_POLICY: '', GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: 'test-key', GATE_PORT: String(port),
            GATE_HOST: '127.0.0.1', GATE_HOST_PORT: String(MP), GATE_HOST_SCHEME: 'http',
            GATE_REFRESH_MS: '0', GATE_PRECHECK_TTL_MS: '0',   // 测试要每请求实测，不吃生产 TTL
            GATE_SNAPSHOT: path.join(import.meta.dirname, 'logs', `cov-${port}.json`),
@@ -346,7 +346,7 @@ try {
   console.log('\n=== G5 缺 KEY 时拒绝启动 ===');
   {
     const child = spawn(process.execPath, [GATE], {
-      env: { ...process.env, GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4),
+      env: { ...process.env, GATE_ASSURANCE: '', GATE_CANARY_POLICY: '', GATE_L0_POLICY: '', GATE_TOKEN: '', GATE_TOKEN_DISABLED_FOR_TEST: '1', OPENCODE_GO_API_KEY: '', GATE_PORT: String(P0 + 4),
              GATE_LOG_FILE: path.join(import.meta.dirname, 'logs', 'cov-missing-key.jsonl') },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -1134,7 +1134,45 @@ try {
     const g5 = await runC({ __snap: skipCy, GATE_CANARY_POLICY: 'require' });
     check('G26 canary skipped（直连）+ require → 200（不自锁）', g5.status === 200, `status=${g5.status}`);
   }
-} finally {
+
+  // ★ 2026-11-05：EV14/EV15 文本级判据（离线打分，不起门控）
+  console.log('\n=== G28 文本级校验判据打分 ===');
+  {
+    const { scoreEvidence } = await import('./evidence.mjs');
+    const mkEv = (items) => ({ at: new Date().toISOString(), items });
+    // 官方形态：EV14 三协议全命中，EV15 两协议命中，均无包装前缀
+    const official = scoreEvidence(mkEv([
+      { id: 'EV14', ok: true, detail: '官方名单文案 3/3', rows: [
+        { proto: 'responses', hit: true, wrapped: false, status: 400 },
+        { proto: 'messages', hit: true, wrapped: false, status: 400 },
+        { proto: 'chat', hit: true, wrapped: false, status: 400 }] },
+      { id: 'EV15', ok: true, detail: '边界文案 2/2', rows: [
+        { proto: 'messages', hit: true, wrapped: false, status: 400 },
+        { proto: 'chat', hit: true, wrapped: false, status: 400 }] },
+    ]));
+    check('G28 官方形态 → validate 三协议全 pass',
+      official.validate.responses.status === 'pass' && official.validate.messages.status === 'pass' && official.validate.chat.status === 'pass',
+      `r=${official.validate.responses.status} m=${official.validate.messages.status} c=${official.validate.chat.status}`);
+
+    // 中转形态：全部带 Upstream request failed 包装
+    const relay = scoreEvidence(mkEv([
+      { id: 'EV14', ok: false, detail: '官方名单文案 0/3', rows: [
+        { proto: 'responses', hit: false, wrapped: true, status: 400 },
+        { proto: 'messages', hit: false, wrapped: true, status: 400 },
+        { proto: 'chat', hit: false, wrapped: true, status: 400 }] },
+      { id: 'EV15', ok: false, detail: '边界文案 0/2', rows: [
+        { proto: 'messages', hit: false, wrapped: true, status: 400 },
+        { proto: 'chat', hit: false, wrapped: true, status: 400 }] },
+    ]));
+    check('G28 中转形态 → validate 三协议全 fail', 
+      relay.validate.responses.status === 'fail' && relay.validate.messages.status === 'fail' && relay.validate.chat.status === 'fail',
+      `r=${relay.validate.responses.status} m=${relay.validate.messages.status} c=${relay.validate.chat.status}`);
+    check('G28 中转形态 → relayWrap 计数被记录',
+      relay.validate.messages.relayWrap === 2 && relay.validate.chat.relayWrap === 2,
+      `m=${relay.validate.messages.relayWrap} c=${relay.validate.chat.relayWrap}`);
+    check('G28 空证据 → validate 三协议 unknown',
+      scoreEvidence(mkEv([])).validate.responses.status === 'unknown', 'absent→unknown');
+  }} finally {
   stopAll();
   mock.close();
 }

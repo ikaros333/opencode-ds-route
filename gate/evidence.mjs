@@ -19,6 +19,7 @@ export const L2_IDS = ['EV7', 'EV8', 'EV9'];
 // 2026-11-04：L0 端点指纹（零成本判负）+ MX messages 协议判据（唯一可判正判负的协议）
 export const L0_IDS = ['L0-1', 'L0-2', 'L0-3', 'L0-4', 'L0-5'];
 export const MSG_IDS = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'];
+export const VALIDATE_IDS = ['EV3', 'EV4', 'EV14', 'EV15', 'M6'];   // 2026-11-05：校验可达性
 export const OFFICIAL_OWNERS = ['deepseek'];
 
 function request(t, { method = 'POST', path: p, body = null, headers = {}, timeoutMs = 15000, auth = 'bearer' }) {
@@ -111,6 +112,57 @@ export async function runEvidence(o) {
     const m = msgOf(r);
     const ok = r.status === 400 && re.test(m);
     add(id, ok, r.status === 0 ? 'net:' + r.err : (ok ? '范围校验命中' : 'HTTP ' + r.status + ' ' + m.slice(0, 40)));
+  }
+
+  // ---------------- 2026-11-05：EV14 / EV15 文本级校验判据 ----------------
+  // 实测（2026-11-05，官方/中转各 3 次 × 5 探针，15/15 稳定）：
+  //   官方  假模型 → 400「The supported API model names are deepseek-…」（无包装）
+  //   中转  假模型 → 400「Upstream request failed: Model is unavailable.」（有包装）
+  //   官方  max_tokens:0 → 400「Invalid max_tokens value, the valid range…」（无包装）
+  //   中转  max_tokens:0 → 400「Upstream request failed: [invalid_request_error] …」
+  // 关键：不能只看状态码或文案，必须**同时**要求「无 Upstream request failed 前缀」——
+  //      当天实测有探针在中转侧也返回 400 与官方文案（中转会转发部分参数校验）。
+  {
+    const OFFICIAL_MODELS_TXT = /The supported API model names are/i;
+    const OFFICIAL_MT_TXT = /Invalid max_tokens value/i;
+    const RELAY_WRAP = /^\s*Upstream request failed\s*[:：]/i;
+    const msgPath = /(^|\.)deepseek\.com$/i.test(t.host) ? '/anthropic/v1/messages' : '/v1/messages';
+    const mHeaders = { 'x-api-key': t.key, 'anthropic-version': '2023-06-01' };
+    const FAKE = 'no-such-model-xyz-9f3a';
+    const judge = (r, re) => {
+      const m = msgOf(r);
+      return { hit: r.status === 400 && re.test(m) && !RELAY_WRAP.test(m),
+               wrapped: RELAY_WRAP.test(m), status: r.status, msg: m.slice(0, 60) };
+    };
+
+    const probes14 = [
+      ['responses', '/v1/responses', {}, { model: FAKE, input: 'hi', max_output_tokens: 4, reasoning: { effort: 'none' } }],
+      ['messages', msgPath, mHeaders, { model: FAKE, max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] }],
+      ['chat', '/v1/chat/completions', {}, { model: FAKE, max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] }],
+    ];
+    const rows14 = [];
+    for (const [proto, p, headers, body] of probes14) {
+      const r = await request(t, { method: 'POST', path: p, headers, body, timeoutMs: timeout });
+      rows14.push({ proto, ...judge(r, OFFICIAL_MODELS_TXT) });
+    }
+    const ok14 = rows14.filter((x) => x.hit).length;
+    add('EV14', ok14 === 3, `官方名单文案 ${ok14}/3` +
+      (ok14 < 3 ? '  ' + rows14.filter((x) => !x.hit).map((x) => `${x.proto}:${x.wrapped ? '包装前缀' : 'st' + x.status}`).join(',') : ''),
+      { rows: rows14 });
+
+    const probes15 = [
+      ['messages', msgPath, mHeaders, { model: t.model, max_tokens: 0, messages: [{ role: 'user', content: 'hi' }] }],
+      ['chat', '/v1/chat/completions', {}, { model: t.model, max_tokens: 0, messages: [{ role: 'user', content: 'hi' }] }],
+    ];
+    const rows15 = [];
+    for (const [proto, p, headers, body] of probes15) {
+      const r = await request(t, { method: 'POST', path: p, headers, body, timeoutMs: timeout });
+      rows15.push({ proto, ...judge(r, OFFICIAL_MT_TXT) });
+    }
+    const ok15 = rows15.filter((x) => x.hit).length;
+    add('EV15', ok15 === 2, `边界文案 ${ok15}/2` +
+      (ok15 < 2 ? '  ' + rows15.filter((x) => !x.hit).map((x) => `${x.proto}:${x.wrapped ? '包装前缀' : 'st' + x.status}`).join(',') : ''),
+      { rows: rows15 });
   }
 
   // EV5 TLS 证书 / EV6 ALPN
@@ -216,8 +268,11 @@ export async function runEvidence(o) {
       } catch {}
     }
     const ownOk = owners.length > 0 && owners.every((o) => OFFICIAL_OWNERS.includes(o));
+    // 2026-11-05：把完整模型集合写进 extra，供 audit --write 做 MODEL_SET_DRIFT 对比
+    let modelIds = [];
+    try { const j2 = JSON.parse(r.body); modelIds = (Array.isArray(j2.data) ? j2.data : []).map((m) => String(m.id || '')).filter(Boolean); } catch {}
     add('L0-1', ownOk && count > 0 && count <= 5,
-      `HTTP ${r.status} 条目=${count} owned_by=${owners.join('|') || '-'}`);
+      `HTTP ${r.status} 条目=${count} owned_by=${owners.join('|') || '-'}`, { models: modelIds });
   }
 
   // 一次真实小请求，读取响应头（L0-2 / L0-3 共用）
@@ -363,9 +418,36 @@ export function scoreEvidence(ev) {
     return 'unknown';
   })();
 
+  // 2026-11-05：validate 结构化（每协议：这条通道此刻是否走官方校验）
+  //   signals 记录该协议下哪些探针命中；relayWrap 记录"中转包装前缀"这一负向特征。
+  const validate = (() => {
+    const r14 = byId.EV14?.rows || [];
+    const r15 = byId.EV15?.rows || [];
+    const pick = (r, proto) => r.find((x) => x.proto === proto);
+    const mk = (signals0, wraps) => {
+      // 只统计"真的跑过"的探针（ok 为 boolean）；一个都没跑 → unknown，跑了但全不中 → fail
+      const ran = signals0.filter((s) => typeof s.ok === 'boolean');
+      const pass = ran.filter((s) => s.ok === true).length;
+      return { status: ran.length === 0 ? 'unknown' : (pass > 0 ? 'pass' : 'fail'),
+               score: pass, max: ran.length,
+               relayWrap: wraps.filter((x) => x && x.wrapped).length,
+               signals: ran.map((s) => ({ id: s.id, ok: s.ok })),
+               officialText: ran.filter((s) => s.ok).map((s) => s.id) };
+    };
+    const R = pick(r14, 'responses'), M14 = pick(r14, 'messages'), C14 = pick(r14, 'chat');
+    const M15 = pick(r15, 'messages'), C15 = pick(r15, 'chat');
+    return {
+      responses: mk([{ id: 'EV3', ok: byId.EV3?.ok }, { id: 'EV4', ok: byId.EV4?.ok }, { id: 'EV14', ok: R?.hit }], [R]),
+      messages: mk([{ id: 'M6', ok: byId.M6?.ok }, { id: 'EV14', ok: M14?.hit }, { id: 'EV15', ok: M15?.hit }], [M14, M15]),
+      chat: mk([{ id: 'EV14', ok: C14?.hit }, { id: 'EV15', ok: C15?.hit }], [C14, C15]),
+      at: ev.at || null,
+    };
+  })();
+
   // 2026-11-04：校验器可达性（判正）。V1 = responses 官方范围文案；V2 = messages 官方范围文案。
-  const v1 = !!(byId.EV3?.ok && byId.EV4?.ok);
-  const v2 = !!byId.M6?.ok;
+  // 2026-11-05：扩展为包含 EV14/EV15 文本级判据（任一条命中即算可达）。
+  const v1 = !!(byId.EV3?.ok && byId.EV4?.ok) || validate.responses.status === 'pass';
+  const v2 = !!byId.M6?.ok || validate.messages.status === 'pass';
   const validator = { responses: v1, messages: v2, reachable: v1 || v2 };
 
   // 2026-11-04：assurance 四档（供门控 GATE_ASSURANCE 使用）
@@ -396,6 +478,7 @@ export function scoreEvidence(ev) {
                items: (ev.items || []).filter((x) => x.id === 'EV13') };
     })(),
     validator,
+    validate,
     assurance: level,
     endpoint: { ...l1, verdict, items: (ev.items || []).filter((x) => L1_IDS.includes(x.id)) },
     impl: { ...l2, profile: implProfile, items: (ev.items || []).filter((x) => L2_IDS.includes(x.id)) },

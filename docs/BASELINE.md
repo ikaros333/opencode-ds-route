@@ -253,3 +253,66 @@ canary 的判别力实测（同一随机串）：
 | 多轮工具 input_tokens | 未测 | **官方 191 vs 中转 63**（差 -128） |
 
 而 responses 多轮工具 **319 = 319（3/3 一致）**，是三个协议里最忠实的通道。
+
+## B23 文本级校验判据（EV14 / EV15）与漂移告警（2026-11-05 标定）
+
+### 起因：判据在 24 小时内翻转
+
+| 时间 | responses 参数校验 | messages 参数校验 |
+|---|---|---|
+| 11-04 白天 | ❌ 0/5（全 200） | ✅ 16/16 |
+| 11-05 10:42 | ❌ 0/5 | ❌ 0/5 |
+| 11-05 11:25 | ✅ **5/5** | ❌ 0/5 |
+
+→ 同一条判据会在两个状态之间横跳，**任何把它当硬闸的设计都会周期性全站 503**。
+
+### 新判据：官方「模型清单文案」vs 中转「包装前缀」
+
+实测（官方/中转各 3 次 × 5 探针 = 15/15 稳定）：
+
+| 探针 | 官方 | 中转 |
+|---|---|---|
+| 假模型 · responses | 400 `The supported API model names are deepseek-…` | 400 `Upstream request failed: Model is unavailable.` |
+| 假模型 · messages（`/anthropic/v1/messages`） | 同上官方文案 | 同上包装 |
+| 假模型 · chat | 同上官方文案 | 同上包装 |
+| `max_tokens:0` · messages | 400 `Invalid max_tokens value, the valid range…` | 400 `Upstream request failed: [invalid_request_error] …` |
+| `max_tokens:0` · chat | 同上 | 同上 |
+
+**判据**：
+
+```
+EV14(proto)  ok = status===400 && /The supported API model names are/ && !/^\s*Upstream request failed[:：]/
+EV15(proto)  ok = status===400 && /Invalid max_tokens value/            && !/^\s*Upstream request failed[:：]/
+```
+
+**为什么必须加"无包装前缀"**：当天实测中转对 `temperature:9` 会转发官方校验（返回官方文案），
+但对假模型 / `max_tokens:0` 用自己的包装错误。只靠状态码或文案会误判。
+
+### 打分（`validate`，每协议三态）
+
+| status | 含义 |
+|---|---|
+| `pass` | 至少一条官方文案命中（且无包装） |
+| `fail` | 探针都跑了，但全部被判负（或全部带包装前缀） |
+| `unknown` | 一条都没跑（不能把"没测过"当成"不达标"） |
+
+同时记录 `relayWrap`（该协议下带包装前缀的探针数）——这是**跨协议稳定的负向特征**。
+
+### 漂移告警
+
+`ocg audit-lane --write` 在写快照前与上一份对比，产出：
+
+| 告警 | 触发条件 |
+|---|---|
+| `VALIDATOR_FLIP` | 任一协议 `validate.status` 变化（pass↔fail） |
+| `MODEL_SET_DRIFT` | `/v1/models` 集合增删（记录新增/移除名单） |
+
+写 `gate/logs/lane-alerts.jsonl`。首次运行（上一份快照没有对应字段）视为基线未知，不告警。
+
+实测样例（11-05）：`VALIDATOR_FLIP messages: pass → fail（0/3, 中转包装 2）`、
+`MODEL_SET_DRIFT 28→29 新增: hy4`。
+
+### messages id 的第三种形态
+
+`msg_` + 32hex（36 位），实测 5/5。已在 `shapeOf` 单列 `msg_hex`——
+**行为不变**（仍归 third 拒绝），只是把信号从含糊的 `other` 变成可读名称。
