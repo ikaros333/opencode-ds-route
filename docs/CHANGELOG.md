@@ -16,6 +16,184 @@
 "判负即切换"的能力保留（多车道配置即生效，G32 覆盖），但在现有约束下它只会退化为"判负即 503"。
 后续改进应转向「判定质量与可用性」，而不是「换上游」。
 
+## 未发布（计划 v0.1.9）— 2026-11-06 体级判据三层落地（L2/L3/L4）
+
+**目标锚定**：在使用 opencode go 套餐的 `deepseek-v4.1-flash` 前提下，
+**降低路由到第三方/自部署 DS 模型的概率**。判据全部来自响应体（不依赖响应头），
+因为头部判据（`cf-ray` 一票否决）对这条车道恒判 `unverified`，没有区分力。
+
+### 实测基线（真实上游，2026-11-06）
+
+| 观测 | 结果 |
+|---|---|
+| `resp_uuid4` 内部的 32 hex 是否符合 UUID4 位模式 | **70/70**（第13位恒=4，第17位均匀分布 8/9/a/b）；历史台账 **8182/8182** |
+| `cached_tokens` 是否为 128 的整数倍 | **70/70**，取值全集 `{0,128,256,384,512,640,6912}`；283→256、455→384、710→640 均向下取整 |
+| 缓存是全局前缀还是 session 隔离 | **全局**（换 session 后分布完全一致，B1/B2/B3 三组对照） |
+| 流式内容传输窗口 | **0.22–0.31s**（首字节 1.6–2.0s，内容传输只占 0.3s） |
+| `usage` 在流式中的位置 | **最后一个事件**（`response.completed` / `response.incomplete`） |
+| 同一 prompt 的 `input_tokens`：flash vs pro | **53 vs 106** ⇒ usage 是网关按模型倍率估算的，**不能作身份证据** |
+
+### L2 缓存块对齐（`GATE_CACHE_BLOCK_ALIGN`，默认 label）
+
+`fingerprint()` 新增 `cacheBlockMisaligned`：`cached_tokens > 0 && cached % 128 !== 0`。
+
+- 挡什么：vLLM 默认 `block_size=16`、SGLang 默认 1 ⇒ **默认配置的同权重自部署必然对不上**
+- 默认 `label`（只记录 + 计数）而不是 `hard`：同 model 重发不改变落点（32 次对照零差异），升 hard 只会白烧配额
+- `cached = 0` 视为对齐并短路 —— 它天然符合 `%128`，不能误报（盲区交给 L4）
+- 台账 `CACHE_BLOCK_MISALIGNED` 记 `cached / block / remainder / policy`；health 暴露 `cacheSemantics.{aligned,misaligned}`
+
+### L3 流式缓冲（`GATE_STREAM_BUFFER`，默认关）
+
+`cached_tokens` 只在流的最后一个事件里 ⇒ 等拿到时内容已转给客户端。L3 的做法是
+**先读完整条 SSE 流 → 判定 → 一次性写出**，不合规则 503 且**一个字节都不交付**。
+
+- 判定：`resp_uuid4` 内部 UUID4 位模式 + `cached % 128`；两者任一不过即拒
+- 代价（实测）：首字节 1.6s → **1.9s（+0.22~0.31s）**；**UI 渐进显示消失**
+- `GATE_STREAM_BUFFER_MAX`（4 MB）超限 → fail-open 并记 `STREAM_BUFFER_SKIP`
+- **默认关**：它改变的是体验特性，必须显式选择。关闭时该块整体跳过，行为逐字节不变
+- 埋点：`STREAM_BUFFER_{PASS,REJECT,SKIP}` + health `streamBuffer.{enabled,buffered,passed,rejected,skipped}`
+
+### L4 缓存语义探针（`GATE_CACHE_PROBE_MS`，默认 10 分钟）
+
+补 L2 的结构性盲区：**完全不做缓存的实现会把 cached 恒报 0，而 0 天然符合 `%128`**。
+只有「同一长前缀连发两次」才能暴露 —— 第二次仍为 0 ⇒ 该实现根本没有缓存。
+
+- 判据：取两次的 `max(cached)`；`==0` → `no_cache_impl`；`%128 != 0` → `block_misaligned`
+- 只观测 + `ALERT_CACHE_SEMANTICS_DRIFT`，**不接熔断**（单车道熔断等于停服）
+- 成本：单轮 604 token ⇒ 10 分钟频率约 **96K token/天**
+
+### 明确不做（附实测依据）
+
+| 不做 | 实测依据 |
+|---|---|
+| 前置探针"抢跑"（探针先于业务首字节返回） | 探针 1873ms vs 业务首字节 1657ms ⇒ **窗口 −216ms，不存在** |
+| 缓存精确公式 `(input≥256)?floor(input/128)*128:0` | 30 样本仅 **40%** 符合；命中量由**历史前缀**决定，不是当前 input 的函数 |
+| 车道切换 / 同 model 重发 | 32 次对照零差异；8182 次历史只有 `resp_uuid4` 一种形态 |
+| 用 `resp_uuid4` 位模式抗蓄意伪造 | 只需写对 2 个字符即可 100% 通过（实测构造 1000/1000） |
+
+### 能力边界（红队模拟实测）
+
+| 场景 | 判定 |
+|---|---|
+| 异模型顶包（GLM/GPT/Qwen） | ✅ REJECT（`R_id`） |
+| 同权重自部署 + vLLM（块 16） | ✅ REJECT（`R_cache`） |
+| 同权重自部署 + SGLang（块 1） | ✅ REJECT（`R_cache`） |
+| 无缓存实现（cached 恒 0） | ⚠️ 逐响应判据放行 → 由 L4 探针发现（≤10 分钟） |
+| 刻意伪装 128 块 + 合规 id | ❌ 不可判（与官方不可区分） |
+| 区分"官方托管" vs "第三方托管" | ❌ 不可判（缺 `x-ds-trace-id`，历史上从未出现过） |
+
+### 验证
+
+`test-bodyproof.mjs` **31 / 0**（新增，mock 驱动，不需要 key），注册进 `regress.ps1`；
+`verify-patch` **573 / 0**（P1-2 计数 7→8、Q77 计数 1→2，均为新增代码所致）；
+`test-coverage` **201 / 0**；`test-429` **37 / 0**。
+
+## 未发布（计划 v0.1.9）— 2026-11-06 429 归因修复（三条真 bug）
+
+**触发**：用户截图 `gate_upstream_rate_limited` + 上游 `[prefill_cap_refused] the cell is at capacity`，
+等待 3 分 41 秒后被拒。实测 6 条 429 平均 **36.1 秒/条**，其中 10 秒是纯等待。
+
+### ⑦ 容量类的 30 秒等待被 5 秒上限砍掉（同一类文案错误的延续）
+
+**触发**：用户 17:03 截图报 `gate_upstream_capacity`，文案写「门控也已按 retry-after **重试过 0 次**（上限 1 次）」，
+而上游那条报文是 `retry-after: 30`。
+
+两处问题：
+
+1. **文案**：真实原因是"上游要等 30 秒、而门控只肯等 5 秒，所以没等"，不是"重试次数用尽"。
+   这与本轮 ① 修的是同一类错误，只是漏在了容量分支。现在拆成
+   `capacity_wait_exceeded` / `capacity_retries_exhausted`，文案分别说明。
+2. **策略**：容量类误用了通用上限 `GATE_RATE_LIMIT_MAX_WAIT_MS`(5s)。门控总预算 90 秒、
+   留 30 秒给上游生成，**30 秒的等待完全等得起**。新增 `GATE_CAPACITY_MAX_WAIT_MS`(默认 35s)，
+   并加剩余预算约束（`remainMs() - MIN_UPSTREAM_BUDGET_MS - 2000`）。
+
+实测（`gate/test-429.mjs` 用例 ①c / ①d）：
+- 容量要 30s、上限 1s → 1 次尝试、文案「要求等待 30s；门控上限是 1s；本次没有等」、`retry-after: 30` 透传；
+- 容量要 2s、上限 35s → **确实等 2s 再重试**（耗时 2015ms，2 次尝试）。
+### ⑥ 测试健壮性：上游 429 不再伪装成产品回归
+
+`test-suite` / `test-pollution` 的首个基线请求是**单发无容错**的，
+而上游过载窗口里 429 占比可达 40%（实测直连 5 次图片请求遇到 2 次 `[overloaded]`）。
+结果是：同一份代码反复跑，红的套件在 `test-suite` / `test-pollution` / `test-multimodal` 之间漂移。
+
+处理（**跳过 ≠ 通过**）：
+
+- 基线请求对 429 重试最多 4 次（间隔 1.5s）；
+- 仍 429 → 打印 `SKIP …这是上游过载，不是产品回归` 并 `exit 77`；
+- `scripts/regress.ps1` 把退出码 **77 计为 skipped**，单独计数并在汇总里显式打印
+  `通过（N 套因上游 429 跳过，未验证）`，**不会**显示成"全部通过"。
+
+这样既不把上游问题算成产品回归，也不会靠"反复重跑到绿"把它藏起来。
+### ① 文案二义（此前会把人引向错误参数）
+
+旧实现一个 `res.end` 服务两条路径，报文都是「上游限流，且要求的等待超过门控上限」。
+mock 复现（`gate/test-429.mjs`）：
+
+| 场景 | 旧行为 | 实际情况 |
+|---|---|---|
+| `retry-after 1s`，上限 1s | 重试 3 次后报「等待超过上限」 | **1 ≤ 1 通过**，卡的是重试次数 → 文案是假话 |
+| `retry-after 30s`，上限 1s | 报同一句 | 这里才成立 |
+
+现在分三支，并在响应头 `x-gate-reason` 明确标注：
+
+| reason | type | 建议动作 |
+|---|---|---|
+| `capacity_refused` | `gate_upstream_capacity` | 调 `GATE_CAPACITY_RETRY`（0~2） |
+| `wait_exceeded` | `gate_upstream_rate_limited`（保留原 type） | 可调 `GATE_RATE_LIMIT_MAX_WAIT_MS` |
+| `retries_exhausted` | `gate_upstream_rate_limited_retries` | 可调 `GATE_LANE_RETRY` |
+
+### ② 容量满被当可重试（白烧 36 秒/条）
+
+`prefill_cap_refused` / `cell is at capacity` 改为**最多重试 1 次**（`GATE_CAPACITY_RETRY=1` 默认），
+之后立即返回 429 并透传 `retry-after`。
+
+为什么不是完全不重试：台账里 **07:40 `e7b1fdc8` 出现过 429 → 429 → 200**，说明重试确实能救回；
+纯快速失败会把可恢复的失败变成硬失败。折中后最坏耗时 36s → 约 24s；
+`GATE_CAPACITY_RETRY=0` 可降到约 9s，`GATE_CAPACITY_FAILFAST=0` 完全回退旧行为。
+
+> 安全性：这属于**重试策略**，不是身份判据；识别失败 = 旧行为，最坏只多等 10 秒，不会误拒。
+> （与 2026-10-27 两次全站 503 的根因不同：那两次是把错误文案当**放行判据**。）
+
+### ③ 曾返回 429 却报「不可达」
+
+旧 `noteConnFail` 只要某次 `status=0` 就把车道记入 `connFailedLanes` 且不去除。
+同一车道先 429、后超时 → 命中 `upstreamDown()` → 报
+`gate_upstream_unreachable`「所有候选车道都没有返回任何 HTTP 响应」（实测 131 秒那条）。
+
+现在加 `sawHttpLanes`：拿到过任意 HTTP 响应（`status>0`）的车道**不计入**不可达；
+终局新增 `gate_upstream_slow`（有响应但最后一次超时/硬上限），文案明说"不是连不上，是上游过载"。
+
+### ⑤ 429 有三类语义（本轮新发现，直接决定重试价值）
+
+直接问上游（不经门控）实测到的 429 原文：
+
+```
+[prefill_cap_refused] the cell is at capacity        ← 容量满
+[overloaded] the server is overloaded                ← 服务过载（实测 图片#1 429 → 图片#2 200，重试有效）
+```
+
+加上真·限流，共三类。门控现在把它们分开：
+
+| 分类 | 判定 | 策略 | 计数 |
+|---|---|---|---|
+| `capacity` | `prefill_cap_refused` / `cell is at capacity` | 最多 `GATE_CAPACITY_RETRY`（默认 1）次 | `byClass.capacity` |
+| `overloaded` | `[overloaded]` / `server is overloaded` | 按 `retry-after` 正常重试（实测有效） | `byClass.overloaded` |
+| `other` | 其余 | 同上 | `byClass.other` |
+
+`/gate/health.rateLimitBreakdown.byClass` 可见分布；每条 429 台账带 `cls` + `upstream` 原文摘要
+（此前普通 429 不记原文，事后无法区分是哪一类 —— 这是本轮补的观测缺口）。
+
+> 实测（16:05 本地，直连上游 5 次图片请求）：**429 两次，均为 `overloaded`**，且相邻请求成功。
+> 这说明回归套件偶发的 429 属于上游过载，与本轮改动无关。
+### ④ 删除死代码
+
+`oc-gate.mjs` 里有一个空的条件块（历史编辑残留），已删；verify `AQ14` 断言"只剩一个真分支"。
+
+### 验证
+
+`gate/test-429.mjs`（新增，6 用例 25 断言，自带 mock 不需要 key）全绿；
+`verify-patch` **562 / 0**（新增 AQ1–AQ15）；`regress -IncludeSoak` 全绿。
+
 ## 未发布（计划 v0.1.9）— 2026-11-05 第二次完整审查
 
 ### 修掉的真 bug：车道级预检的 fail 缓存永久锁死

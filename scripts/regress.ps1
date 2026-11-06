@@ -1,4 +1,4 @@
-﻿# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
+# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\regress.ps1
@@ -108,11 +108,15 @@ if (-not $ready) {
 Write-Host "  影子门控就绪：$base  tokenRequired=$($h.tokenRequired)  envToken=[" + $env:GATE_TOKEN + "]"
 
 $fail = 0
+$skip = 0
 function Run([string]$name, [string[]]$args) {
   Write-Host ''
   Write-Host "--- $name ---"
   & $NodePath (Join-Path $Root "gate\$name") @args
-  if ($LASTEXITCODE -ne 0) { $script:fail++; Write-Host "  FAIL  $name" -ForegroundColor Red }
+  # 2026-11-06：退出码 77 = 环境不配合（上游 429 过载）。既不算通过也不算失败，
+  # 单独计入 skip 并在汇总里打印 —— 避免"反复重跑到绿"把上游问题藏起来。
+  if ($LASTEXITCODE -eq 77) { $script:skip++; Write-Host "  SKIP  $name（上游 429，环境不配合）" -ForegroundColor Yellow }
+  elseif ($LASTEXITCODE -ne 0) { $script:fail++; Write-Host "  FAIL  $name" -ForegroundColor Red }
 }
 
 Run 'test-suite.mjs'      @($base)
@@ -120,6 +124,10 @@ Run 'test-pollution.mjs'  @($base)
 Run 'test-security.mjs'   @($base)
 Run 'test-cache.mjs'      @($base)
 Run 'test-multimodal.mjs' @($base)
+# 2026-11-06：429 三分类（自带 mock，不需要真实上游）
+Run 'test-429.mjs'         @()
+# 2026-11-06：体级判据（L2 缓存块 / L3 流式缓冲 / L4 缓存语义探针；自带 mock，不需要 key）
+Run 'test-bodyproof.mjs'   @()
 Run 'test-real.mjs'       @($base)
 if ($IncludeSoak) { Run 'test-risk.mjs' @([string]$ShadowPort) }
 else { Write-Host ''; Write-Host '--- test-risk.mjs（跳过 soak，用 -IncludeSoak 开启）---' }
@@ -129,5 +137,6 @@ Get-NetTCPConnection -LocalPort $ShadowPort -State Listen -ErrorAction SilentlyC
   ForEach-Object { try { Stop-Process -Id $_.OwningProcess -Force } catch {} }
 
 Write-Host ''
-if ($fail -eq 0) { Write-Host '===== 真实上游回归：全部通过 =====' -ForegroundColor Green; exit 0 }
-else { Write-Host "===== 真实上游回归：$fail 套失败 =====" -ForegroundColor Red; exit 1 }
+if ($fail -eq 0 -and $skip -eq 0) { Write-Host '===== 真实上游回归：全部通过 =====' -ForegroundColor Green; exit 0 }
+elseif ($fail -eq 0) { Write-Host "===== 真实上游回归：通过（$skip 套因上游 429 跳过，未验证）=====" -ForegroundColor Yellow; exit 0 }
+else { Write-Host "===== 真实上游回归：$fail 套失败（另 $skip 套跳过）=====" -ForegroundColor Red; exit 1 }

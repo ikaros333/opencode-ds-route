@@ -111,6 +111,11 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_HEDGE` | 1 | 对冲开关（预检通过后不再触发） |
 | `GATE_BLOCK_PROTOS` | `chat` | 追加封禁的协议列表（逗号分隔） |
 | `GATE_IMPL_VECTOR_MS` | 300000 | 实现指纹向量观测间隔（仅告警，不参与放行）；`0` = 关闭 |
+| `GATE_CACHE_PROBE_MS` | 600000 | **缓存语义探针间隔**（2026-11-06 新增，仅告警）。同一长前缀连发 2 次，断言第二次 `cached_tokens > 0` 且是 128 的倍数 —— 这是唯一能识破「该实现根本没有前缀缓存」的手段。单轮约 604 token（10 分钟频率 ≈ 96K token/天）；`0` = 关闭 |
+| `GATE_CACHE_BLOCK_ALIGN` | `label` | **缓存块对齐判据强度**（2026-11-06 新增）。`label` = 只记 `CACHE_BLOCK_MISALIGNED` + 计数，不改变交付；`require` = 升为 hard，进入 `GATE_FP_POLICY` 的 retry/block 流程。默认 label 的原因：同 model 重发不改变落点（实测 32 次对照零差异），升 hard 只会白烧配额 |
+| `GATE_CACHE_BLOCK_SIZE` | 128 | 缓存块大小（token）。实测官方 `cached_tokens` 恒为该值的整数倍（283→256、455→384、710→640 都向下取整）。vLLM 默认 16、SGLang 默认 1，改这个值只在换上游基线时才需要 |
+| `GATE_STREAM_BUFFER` | `0` | **流式缓冲**（2026-11-06 新增，**默认关**）。`1` = 先把整条 SSE 流读进内存、判定后再一次性写出；不合规 → 503（`stream_id_shape` / `stream_cache_block`）。代价实测：首字节 1.6s → 1.9s（+0.22~0.31s），且**UI 渐进显示消失**（dsh 是 `AsyncIterable<StreamChunk>` 逐 chunk 消费）。这是唯一会改变延迟特性的开关 |
+| `GATE_STREAM_BUFFER_MAX` | 4194304 | 流式缓冲上限（字节）。超过即放弃判定、原样透传并记 `STREAM_BUFFER_SKIP`（fail-open）—— 超大响应缓冲既费内存也无判定收益 |
 | `GATE_ALLOW_MESSAGES` | 未设置 | **`1` 才解封 `messages`**。上游 messages 侧已混入非 UUID4 id 池，解封前必须先重新标定 `MSG_FINGERPRINT` |
 
 ### 预检（决定能否交付）
@@ -120,6 +125,18 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PRECHECK` | 1 | `0` = 全断（没有判据就不交付） |
 | `GATE_PRECHECK_TTL_MS` | 15000 | 预检复用窗口（responses）。2026-10-29 由 90000 收紧：池切换是分钟级，90s 窗口会让预检结论与交付时刻错位 |
 | `GATE_PRECHECK_TTL_MS_MESSAGES` | 90000 | messages 窗口（协议已封禁） |
+| `GATE_CAPACITY_MAX_WAIT_MS` | `35000` | **容量类 429 的等待上限**（2026-11-06 补）：上游容量满时给的是 `retry-after: 30`，而通用上限只有 5 秒 → 之前**一次都不等、直接失败**。这里单独给 35 秒，并仍受剩余预算约束（等完必须还剩得下一次上游尝试）。要它等更久就调大这个值并确保 `GATE_TOTAL_BUDGET_MS` 足够 |
+| `GATE_CAPACITY_RETRY` | `1` | **容量类拒绝的重试次数**（2026-11-06）：上游 429 含 `prefill_cap_refused` / `cell is at capacity` 时最多重试这么多次（每次按 `retry-after` 等）。默认 1 保住恢复窗口（实测 `e7b1fdc8` 429→429→200 救回过），最坏耗时 36s→约 24s；`0` 立即放弃（约 9s）；`2` 旧行为 |
+| `GATE_CAPACITY_FAILFAST` | `1` | **容量类拒绝走专用策略**（2026-11-06）：上游 429 报文含 `prefill_cap_refused` / `cell is at capacity` 时，只按 `GATE_CAPACITY_RETRY` 重试（默认 1 次），之后立即返回 429 并透传 `retry-after`，不再走通用 `GATE_LANE_RETRY`。设 `0` 完全回退旧行为
+> **429 的三类语义**（2026-11-06 实测上游原文，重试价值完全不同）：
+> | 上游原文 | 分类 | 重试是否有效 | 门控策略 |
+> |---|---|---|---|
+> | `[prefill_cap_refused] the cell is at capacity` | `capacity` | 几乎无效（连续 16 分钟未恢复） | 最多 `GATE_CAPACITY_RETRY` 次后放弃 |
+> | `[overloaded] the server is overloaded` | `overloaded` | **有效**（实测相邻 429→200） | 按 `retry-after` 正常重试 |
+> | 其余 | `other` | 视情况 | 同上 |
+>
+> 分布见 `/gate/health.rateLimitBreakdown.byClass`，每条 429 台账带 `cls` 与 `upstream` 原文摘要。
+
 | `GATE_PERLANE_PRECHECK` | `1` | **车道级预检**（2026-11-05）：多车道时每条车道各出一条结论（缓存键 `proto@lane`），聚合语义「任一 pass 即整体 pass」。单车道时自动退化为旧行为，零回归；设 `0` 强制回退旧逻辑。**成本**：TTL（15 s）过期时探针数 = 车道数；保活（GATE_PROOF_REFRESH_MS，默认 25 s）也会按车道各刷一次（协议数 × (1 + N)），单车道不额外发探针 |
 | `GATE_DRAIN_MAX_MS` | 15000 | `POST /gate/admin/drain` 等待在途请求收尾的上限（ms）；空闲时立即完成，所以调大几乎不增加重启耗时 |
 | `GATE_OBS_TOKEN` | 空（关闭） | `/gate/*` 观测端点的独立鉴权 token；设了以后必须带 `x-gate-token`。与 `GATE_TOKEN` 解耦 |

@@ -20,9 +20,22 @@ async function post(path, body, raw) {
 const matrix = async () => JSON.parse(await (await fetch(BASE + '/gate/matrix')).text());
 
 // 0) 先预热到正常状态
+// 2026-11-06：上游会间歇性返回 429（[overloaded] / [prefill_cap_refused]）。
+// 单发基线在过载窗口里必然红，而那不是产品回归。这里对 429 重试几次；
+// 若始终 429，用 exit 77 表示"环境不配合（跳过）"——**跳过不等于通过**，
+// regress 会把它单独计为 skipped 并打印，不会伪装成绿。
 {
-  const r = await post('/v1/responses', { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
-  check('基线：正常请求成功', r.status === 200, `status=${r.status}`);
+  let r = null, tries = 0;
+  for (; tries < 4; tries++) {
+    r = await post('/v1/responses', { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+    if (r.status !== 429) break;
+    await new Promise(s => setTimeout(s, 1500));
+  }
+  if (r.status === 429) {
+    console.log(`SKIP  基线：正常请求成功                                     上游 429（${r.h?.get?.('x-gate-reason') || 'rate-limited'}），试了 ${tries} 次；这是上游过载，不是产品回归`);
+    process.exit(77);
+  }
+  check('基线：正常请求成功', r.status === 200, `status=${r.status} 尝试=${tries + 1}`);
 }
 
 // 1) 制造一次"坏请求"：不存在的路径 → 上游 404

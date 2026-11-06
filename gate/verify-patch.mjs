@@ -120,7 +120,7 @@ has('E1 client: bad_body', "type: 'gate_bad_body'");
 has('E2 client: unknown_path', "type: 'gate_unknown_path'");
 has('E3 route: 三分支归因(unreachable/all_third/no_route)', "const earlyType = allConnErr ? 'gate_upstream_unreachable'");
 has('E4 route: budget/no_route', ": exhausted ? 'gate_budget_exhausted' : 'gate_no_official_route'");
-has('E5 rate-limit', "type: 'gate_upstream_rate_limited'");
+has('E5 rate-limit（等待超限仍用原 type）', "'gate_upstream_rate_limited'");
 has('E6 upstream-4xx', "kind: 'upstream-4xx'");
 has('E7 lastSuccessAt 在成功时更新', 'lastSuccessAt = new Date().toISOString();');
 has('E8 latency 挂 finish+close（含 503/中断）', "res.on('finish', recordOnce);");
@@ -223,7 +223,7 @@ has('L21c 不可达判定', 'const upstreamDown = () =>');
 has('L21d 探针短路', "skipped: 'upstream_unreachable'");
 has('L21e 早期分支区分不可达', "allConnErr ? 'gate_upstream_unreachable'");
 has('L21f 拒绝原因三分', 'const reasonType = unreachable');
-has('L21g retry-after 区分', "'retry-after': unreachable ? '10' : '20'");
+has('L21g retry-after 三档区分', "'retry-after': unreachable ? '10' : slowTail ? '15' : '20'");
 has('L22 日志文件可配（测试不污染生产）', 'process.env.GATE_LOG_FILE');
 has('L22b 日志带实例标识', 'port: PORT, pid: process.pid');
 has('L23 配置数值安全解析', 'function num(name, def');
@@ -274,8 +274,10 @@ has('P0-2 覆盖 ECONNRESET/EOF 等', "new Set(['ECONNRESET', 'EPIPE', 'ECONNABO
 has('P0-2 心跳只计 clientResets', 'metrics.clientResets = (metrics.clientResets || 0) + 1;');
 // P1-1：交付阶段不再重复计 abortedByClient（handle close + 主循环 catch 共 2 处）
 has('P1-1 abortedByClient 只计 2 处', 'metrics.abortedByClient++;', { count: 2 });
-// P1-2：所有上游请求必须走 transport（probe / realRequest / 形态探针 / 实现向量探针 / 3 个预检 = 7）
-has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 7 });
+// P1-2：所有上游请求必须走 transport
+// （probe / realRequest / 形态探针 / 实现向量探针 / 3 个预检 / 缓存语义探针 = 8）
+// 2026-11-06：+1 来自 runCacheProbe 的 cacheProbeOnce（L4），它同样走 transport。
+has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 8 });
 has('P1-2 预检不再硬编码 https.request', 'const req = https.request(', { count: 0 });
 // P1-3：矩阵刷新与告警覆盖三条协议
 has('P1-3 刷新覆盖 chat', "for (const proto of ['responses', 'messages', 'chat'])");
@@ -429,7 +431,9 @@ has('Q68 排序时传入体积', 'candidates = preferHealthyLanes(candidates, pr
 has('Q74 UUID4 位模式校验存在', "const UUID4_BITS = (h) => typeof h === 'string'");
 has('Q75 只有显式 0 才回退（fail-closed）', "const RESP_SHAPE_STRICT = RESP_SHAPE_RAW !== '0';");
 has('Q76 shapeOf 产出 resp_bad', "return (m && UUID4_BITS(m[1])) ? 'resp_uuid4' : 'resp_bad';");
-has('Q77 resp_bad 不在可交付白名单', "'resp_bad'", { count: 1 });
+// 2026-11-06：count 由 1 改 2 —— 第二处是 L3 流式缓冲的台账标签
+// （`idShape: idOk ? 'resp_uuid4' : 'resp_bad'`），只用于记录被拒原因，不参与放行判定。
+has('Q77 resp_bad 不在可交付白名单', "'resp_bad'", { count: 2 });
 has('Q78 回退开关生效点', "if (!RESP_SHAPE_STRICT) return 'resp_';");
 has('Q79 非法取值记配置告警', 'GATE_RESP_SHAPE_STRICT="');
 
@@ -761,6 +765,35 @@ hasIn(lines, 'AN12 finish/close 采样回传段', "res.once('finish', () => { if
 hasIn(lines, 'AN12b 重发不重复采样', 'if (!res.__phaseNoted) {');
 hasIn(lines, 'AN13 health 暴露分段分位', 'phase: phaseView(),');
 hasIn(lines, 'AN14 分位计算只取近 PHASE_KEEP 条', 'const PHASE_KEEP = 300;');
+
+// ===== 2026-11-06：429 三分类 + 不可达要确证 =====
+console.log('\n=== AQ. 429 归因与不可达判定 ===');
+hasIn(lines, 'AQ1 容量快速失败开关', "flag('GATE_CAPACITY_FAILFAST', true)");
+hasIn(lines, 'AQ1b 容量重试次数可配（默认 1，实测救回过）', "num('GATE_CAPACITY_RETRY', 1, { min: 0, max: 8 })");
+hasIn(lines, 'AQ1c 容量重试留痕', "result: 'UPSTREAM_CAPACITY_RETRY'");
+hasIn(lines, 'AQ2 容量特征识别', 'const CAPACITY_RE = /prefill_cap_refused|cell is at capacity/i;');
+hasIn(lines, 'AQ3 容量识别只读 upstream 体前 2000 字', "capacityRefused = (r) => CAPACITY_RE.test(String(r?.passthrough?.body || '').slice(0, 2000));");
+hasIn(lines, 'AQ4 容量分支独立 type', "type: 'gate_upstream_capacity'");
+hasIn(lines, 'AQ5 容量分支有独立出口', "'x-gate-reason': whyCap,");
+hasIn(lines, 'AQ6 等待超限与重试用尽分流', "const why = wait > RATE_LIMIT_MAX_WAIT_MS ? 'wait_exceeded' : 'retries_exhausted';");
+hasIn(lines, 'AQ7 重试用尽有独立 type', "'gate_upstream_rate_limited_retries'");
+hasIn(lines, 'AQ8 响应头区分原因', "'x-gate-reason': why,");
+hasIn(lines, 'AQ9 曾收到响应即记录车道', 'if (r && r.status) sawHttpLanes.add(m);');
+hasIn(lines, 'AQ10 不可达排除曾响应的车道', 'const realFails = [...connFailedLanes].filter(m => !sawHttpLanes.has(m));');
+hasIn(lines, 'AQ11 有响应但太慢单独归类', ': slowTail ? \'gate_upstream_slow\'');
+hasIn(lines, 'AQ12 台账记录 sawHttp', 'exhausted, sawHttp,');
+hasIn(lines, 'AQ13 health 暴露 429 归因', 'rateLimitBreakdown: {');
+hasIn(lines, 'AQ14 空 if 死代码已删（只剩一个真分支）', 'if (!candidates.length) {', { count: 1 });
+hasIn(lines, 'AQ15 计数初始化', 'capacityRefused: 0, capacityRetried: 0, upstreamSlow: 0,');
+hasIn(lines, 'AQ16 429 语义分类器（capacity/overloaded/other）', "const rateLimitClass = (r) => {");
+hasIn(lines, 'AQ17 overloaded 特征', 'const OVERLOAD_RE = /\\[overloaded\\]|server is overloaded/i;');
+hasIn(lines, 'AQ18 台账记录 429 分类', 'cls: rlCls, upstream:');
+hasIn(lines, 'AQ19 health 暴露 429 分类分布', 'byClass: metrics.rlClass || {} },');
+hasIn(lines, 'AQ20 分类计数初始化', 'rlClass: { capacity: 0, overloaded: 0, other: 0 },');
+hasIn(lines, 'AQ21 容量等待上限独立可配', "num('GATE_CAPACITY_MAX_WAIT_MS', 35000, { min: 0, max: 120000 })");
+hasIn(lines, 'AQ22 容量等待受剩余预算约束', 'const roomForWait = remainMs() - MIN_UPSTREAM_BUDGET_MS - 2000;');
+hasIn(lines, 'AQ23 容量分支两种放弃原因分流', "const whyCap = !canWait ? 'capacity_wait_exceeded' : 'capacity_retries_exhausted';");
+hasIn(lines, 'AQ24 容量等待超限文案不再说重试次数', '它要求等待 ${Math.ceil(wait / 1000)}s');
 
 // ===== 2026-11-05 阶段二：车道级预检 + 判负即切换 =====
 console.log('\n=== AO. 车道级预检与判负即切换 ===');

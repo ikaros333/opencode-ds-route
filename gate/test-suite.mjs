@@ -53,9 +53,20 @@ const small = (model) => ({ model, input: 'hi', max_output_tokens: 8 });
 }
 
 // ---------- 2. 正常请求 ----------
+// 2026-11-06：上游会间歇性 429（[overloaded] / [prefill_cap_refused]）。这是环境，不是产品回归。
+// 首个业务请求对 429 重试几次；始终 429 就以 exit 77 跳过（regress 会记为 SKIP，不算通过）。
 {
-  const r = await call('/v1/responses', small('deepseek-flash'));
-  record('非流式 responses 成功', r.status === 200, `status=${r.status} verdict=${r.headers.get('x-gate-result')}`);
+  let r = null, tries = 0;
+  for (; tries < 4; tries++) {
+    r = await call('/v1/responses', small('deepseek-flash'));
+    if (r.status !== 429) break;
+    await new Promise(s => setTimeout(s, 1500));
+  }
+  if (r.status === 429) {
+    console.log(`SKIP  非流式 responses 成功                                     上游 429（${r.headers.get('x-gate-reason') || 'rate-limited'}），试了 ${tries} 次；这是上游过载，不是产品回归`);
+    process.exit(77);
+  }
+  record('非流式 responses 成功', r.status === 200, `status=${r.status} verdict=${r.headers.get('x-gate-result')} 尝试=${tries + 1}`);
   record('非流式判官方（official 或 proof 放行）',
     ['official', 'pass-by-proof'].includes(r.headers.get('x-gate-result'))
       && ['UUID4', 'resp_uuid4', 'resp_'].includes(r.headers.get('x-gate-id-shape')),

@@ -232,6 +232,10 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   fpSoft: 0, streamSoft: 0, breakerOpenCount: 0, bigBody: 0, bodyTooLarge: 0, proofVerified: 0, proofUnverified: 0,
   // 2026-11-05：车道级预检保活（多车道时每条车道各自的 fail 缓存能否被刷新）
   lanePrecheckRecovered: 0, lanePrecheckMiss: 0,
+  // 2026-11-06：429 三分类 + 有响应但太慢（旧版会误报成不可达）
+  capacityRefused: 0, capacityRetried: 0, upstreamSlow: 0,
+  // 2026-11-06：429 语义分布（capacity / overloaded / other）
+  rlClass: { capacity: 0, overloaded: 0, other: 0 },
   // 2026-11-05：逐响应骨架证据（判正增强）观测计数
   keyOrder: { official: 0, relay: 0, unknown: 0 }, proofServer: {}, relayMimicsOfficial: 0,
   // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
@@ -464,6 +468,23 @@ const FP_POLICY = (process.env.GATE_FP_POLICY || 'retry').toLowerCase();
 const FP_RETRIES = num('GATE_FP_RETRIES', 2, { min: 0, max: 5 });
 // 2026-11-02：大包不重发（1MB 请求上传三次 = 3× 成本与延迟）
 const FP_RETRY_MAX_BYTES = num('GATE_FP_RETRY_MAX_BYTES', 1048576, { min: 0, max: 64 * 1024 * 1024 });
+// ★ 2026-11-06：缓存块对齐判据的强度。
+//   label   : 只记 soft + 计数（默认）——先观测，不改变任何交付行为
+//   require : 升为 hard，进入 FP_POLICY 的 retry/block 流程
+// 实测依据：官方 cached_tokens 恒为 128 的倍数（70/70 样本；283→256、455→384、710→640 都按 128 向下取整），
+//   而 vLLM 默认 block_size=16、SGLang 默认 1 ⇒ 默认配置的同权重自部署必然对不上。
+// 之所以默认 label：同 model 重发不改变落点（32 次对照零差异），升级为 hard 只会白烧配额。
+const CACHE_BLOCK_ALIGN = (process.env.GATE_CACHE_BLOCK_ALIGN || 'label').toLowerCase();
+const CACHE_BLOCK_SIZE = num('GATE_CACHE_BLOCK_SIZE', 128, { min: 1, max: 4096 });
+// ★ 2026-11-06：流式缓冲（L3）。默认关。
+// 为什么需要它：cached_tokens 只在流的**最后一个事件**里，等拿到时内容已经转给客户端了
+// ⇒ 缓存块对齐这条判据对流式天生只能"事后"。
+// 打开后：gate 先读完整个 SSE 流到内存 → 判定 → 通过则一次性写出 / 不通过则 503。
+// 代价（实测）：首字节 1.6s → 1.9s（+0.22~0.31s，因为内容传输本身只占 0.3s）；
+//               **UI 渐进显示消失**（dsh 是 AsyncIterable<StreamChunk> 逐 chunk 消费）。
+// 默认关的原因就是最后这一条：它改变的是体验特性，必须由使用者显式选择。
+const STREAM_BUFFER = flag('GATE_STREAM_BUFFER', false);
+const STREAM_BUFFER_MAX = num('GATE_STREAM_BUFFER_MAX', 4 * 1024 * 1024, { min: 65536, max: 64 * 1024 * 1024 });
 // 2026-11-02 实测：opencode 车道的计费单价会在同一模型上来回变动（同一请求形态 01:0x 是 2×，
 // 04:1x 变成 1×，与实例轮换一致）。因此计费类判据默认只告警，不当硬判据。
 const BILLING_POLICY = (process.env.GATE_BILLING_POLICY || 'warn').toLowerCase();
@@ -584,6 +605,34 @@ const probeEwmaUpdate = (ms, timedOut = false) => {
   precheckEwmaMs = 0.7 * precheckEwmaMs + 0.3 * ms;
 };
 const RATE_LIMIT_MAX_WAIT_MS = num('GATE_RATE_LIMIT_MAX_WAIT_MS', 5000, { min: 0, max: 120000 });
+// 2026-11-06：容量类拒绝（prefill_cap_refused / "the cell is at capacity"）的重试策略。
+//
+// 实测依据（本机台账，含轮转文件）：
+//   · 06:42–06:58 连续 6 条请求、每条重试 2 次 → 12 次全失败（上游持续饱和 16 分钟）
+//   · 07:40 e7b1fdc8：429 → 429 → **200**（重试确实救回过）
+// 所以"完全不重试"会把可恢复的失败变成硬失败。折中：**只重试 1 次**（默认），
+// 既保住恢复窗口，又把最坏耗时从 36 秒压到约 24 秒；
+// 设 0 = 纯快速失败（9 秒），设 2 = 旧行为（36 秒）。
+const CAPACITY_RETRY = num('GATE_CAPACITY_RETRY', 1, { min: 0, max: 8 });
+// 2026-11-06：容量类 429 的**等待上限**必须与普通限流分开。
+// 实测：上游容量满时给的是 `retry-after: 30`，而通用上限是 5 秒 —— 于是"一次都不等、直接失败"。
+// 但门控总预算默认 90 秒、留 30 秒给上游生成，30 秒的等待完全等得起；等完再试才有机会成功。
+// 这里单独给 35 秒上限，并且**仍受剩余预算约束**（见下面的 roomForWait）。
+const CAPACITY_MAX_WAIT_MS = num('GATE_CAPACITY_MAX_WAIT_MS', 35000, { min: 0, max: 120000 });
+const CAPACITY_FAILFAST = flag('GATE_CAPACITY_FAILFAST', true);
+const CAPACITY_RE = /prefill_cap_refused|cell is at capacity/i;
+const capacityRefused = (r) => CAPACITY_RE.test(String(r?.passthrough?.body || '').slice(0, 2000));
+// 2026-11-06：429 至少有三类语义，重试价值完全不同（全部来自真实上游原文）：
+//   capacity   [prefill_cap_refused] the cell is at capacity      → 重试几乎无效（实测连续 16min）
+//   overloaded [overloaded] the server is overloaded               → 重试有效（实测 429→200 相邻成功）
+//   other      其余（含真·限流）                                     → 按 retry-after 重试
+const OVERLOAD_RE = /\[overloaded\]|server is overloaded/i;
+const rateLimitClass = (r) => {
+  const b = String(r?.passthrough?.body || '').slice(0, 2000);
+  if (CAPACITY_RE.test(b)) return 'capacity';
+  if (OVERLOAD_RE.test(b)) return 'overloaded';
+  return 'other';
+};
 // UUID4 / UUID_ANY 来自 baseline.mjs（判据常量唯一来源），此处不再本地定义
 const PEEK_CAP = 96 * 1024;      // 流式：读到这么多还没 id 就放弃判定（SSE 的 id 在头部）
 const PEEK_HARD_CAP = 2 * 1024 * 1024; // 非流式：硬上限，防止异常大的响应吃内存
@@ -1563,6 +1612,19 @@ function fingerprint(body, reqBody, model) {
       && u.total_tokens !== (u.input_tokens || 0) + (u.output_tokens || 0)) pushHard('arithmeticTotal');
   const cin = (u.input_tokens_details || {}).cached_tokens;
   if (typeof cin === 'number' && typeof u.input_tokens === 'number' && cin > u.input_tokens) pushHard('cacheGtInput');
+  // ★ 2026-11-06：缓存块对齐（infra 指纹，**只记 soft**）。
+  // 实测依据（真实上游 70/70 样本 + 30 样本矩阵）：
+  //   · 官方 cached_tokens 取值全集 = {0, 128, 256, 384, 512, 640, 6912}，**全部是 128 的整数倍**
+  //   · 即使 input=283、455、710 这类非整倍数，命中量也按 128 向下取整（283→256、455→384、710→640）
+  //   · 这条对齐来自 DeepSeek infra 的 cache block 配置；vLLM 默认 block_size=16、SGLang 默认 1
+  //     ⇒ **默认配置的同权重自部署必然对不上**
+  // 为什么是 soft 而不是 hard：cached=0 天然符合 %128，短路无成本；而 hard 会触发 retry，
+  // 实测同 model 重发不改变落点（32 次对照零差异），重发只会白烧配额。
+  // 所以这里只留证据 + 计数，由 GATE_CACHE_BLOCK_ALIGN=require 时才升级为 hard。
+  if (typeof cin === 'number' && cin > 0 && cin % 128 !== 0) {
+    if (CACHE_BLOCK_ALIGN === 'require') pushHard('cacheBlockMisaligned');
+    else soft.push('cacheBlockMisaligned');
+  }
   const rOut = (u.output_tokens_details || {}).reasoning_tokens;
   if (typeof rOut === 'number' && typeof u.output_tokens === 'number' && rOut > u.output_tokens) pushHard('reasoningGtOutput');
   for (const [side, req] of [['input', USAGE_DETAILS_REQUIRED.input], ['output', USAGE_DETAILS_REQUIRED.output]]) {
@@ -1940,6 +2002,107 @@ async function runImplVector() {
     log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_DRIFT', vector: vec, baseline: IMPL_VECTOR_2026_10_27 });
   } else {
     log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR', vector: vec });
+  }
+}
+
+/**
+ * ★ 2026-11-06：缓存语义探针（补「无缓存实现」盲区）
+ *
+ * 为什么需要它：`cached_tokens % 128 == 0` 这条判据有一个结构性盲区 ——
+ * 完全不做前缀缓存的实现会把 cached 恒报 0，而 0 天然符合 %128。逐响应判据看不出来。
+ * 只有「同一长前缀连发两次」才能暴露：第二次仍为 0 ⇒ 该实现根本没有缓存。
+ *
+ * 实测基线（真实上游，2026-11-06）：
+ *   · 同一 prompts 连发两次：run1 cached=0 → run2 cached=128（input=159/223 时）
+ *   · 长 prompt：input=6940 → run2 cached=6912 = 54×128
+ *   · input=283 → 256、455 → 384、710 → 640（都按 128 向下取整）
+ *   · **缓存是全局前缀缓存**：换 x-opencode-session 不影响命中分布（B1/B2/B3 三组一致）
+ *     ⇒ 探针不需要特殊 session，也不必担心"第一次一定是冷的"
+ *
+ * 判据（取两次里较大的命中量）：
+ *   maxCached == 0                    → no_cache_impl（该实现没有前缀缓存）
+ *   maxCached % CACHE_BLOCK_SIZE != 0 → block_misaligned（块大小与官方不同）
+ *   否则                              → ok
+ *
+ * 只观测 + 告警，**不接熔断**：单车道下熔断等于停服。
+ */
+// ★ 探针 prompt 长度必须越过最小前缀门槛（实测 minPrefixTokens = 256）。
+// 2026-11-06 首次上线踩到：用 repeat(12) → input=223 → 第二次仍 cached=0 →
+// 探针误报 no_cache_impl。对照实测数据：input=234 恒不命中，input=285 才命中 256。
+// 所以这里取 repeat(20) ≈ input 370，留足余量（实测该档 run2.cached=256，稳定）。
+const CACHE_PROBE_TEXT = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo '.repeat(20);
+const CACHE_PROBE_MIN_INPUT = 256;   // 低于此值 cached 必然为 0，不能据此判 no_cache_impl
+const CACHE_PROBE_STATE = { at: null, ok: null, reason: null, cached: 0, input: null, runs: 0, ms: 0 };
+
+function cacheProbeOnce(payloadObj) {
+  return new Promise((resolve) => {
+    const payload = Buffer.from(JSON.stringify(payloadObj), 'utf8');
+    const t0 = Date.now();
+    const req = transport.request({
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST',
+      timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      headers: { 'content-type': 'application/json', 'content-length': payload.length,
+                 authorization: `Bearer ${KEY}`, 'x-opencode-session': STABLE_SESSION },
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { if (body.length < 65536) body += d; });
+      res.on('end', () => {
+        let usage = null;
+        try { usage = JSON.parse(body).usage || null; } catch {}
+        resolve({ status: res.statusCode, ms: Date.now() - t0, usage });
+      });
+    });
+    req.on('error', () => resolve({ status: 0, ms: Date.now() - t0, usage: null }));
+    req.on('timeout', () => { try { req.destroy(); } catch {} resolve({ status: 0, ms: Date.now() - t0, usage: null }); });
+    req.end(payload);
+  });
+}
+
+async function runCacheProbe() {
+  if (!ALLOWED.length) return;
+  const body = { model: ALLOWED[0], input: CACHE_PROBE_TEXT, max_output_tokens: 2 };
+  const runs = [];
+  const t0 = Date.now();
+  for (let i = 0; i < 2; i++) {
+    const r = await cacheProbeOnce(body);
+    if (r.usage) runs.push(r);
+    if (i === 0) await new Promise(s => setTimeout(s, 400));
+  }
+  CACHE_PROBE_STATE.at = new Date().toISOString();
+  CACHE_PROBE_STATE.ms = Date.now() - t0;
+  CACHE_PROBE_STATE.runs = runs.length;
+  metrics.cacheProbes = (metrics.cacheProbes || 0) + 1;
+  if (!runs.length) {
+    CACHE_PROBE_STATE.ok = null;
+    CACHE_PROBE_STATE.reason = 'no_usage';
+    metrics.cacheProbeNoUsage = (metrics.cacheProbeNoUsage || 0) + 1;
+    log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE_SKIP', reason: 'no_usage', ms: CACHE_PROBE_STATE.ms });
+    return;
+  }
+  const caches = runs.map(r => (r.usage.input_tokens_details || {}).cached_tokens ?? 0);
+  const maxCached = Math.max(...caches);
+  const input = runs[0].usage.input_tokens ?? null;
+  CACHE_PROBE_STATE.cached = maxCached;
+  CACHE_PROBE_STATE.input = input;
+  let reason = 'ok';
+  // ★ 2026-11-06：分类前先确认探针本身有效。input 低于最小前缀门槛时 cached 必然为 0，
+  // 那不是「没有缓存」，是「这次的 prompt 太短」——必须单独归类，否则会误报 no_cache_impl。
+  if (input != null && input < CACHE_PROBE_MIN_INPUT) reason = 'probe_too_short';
+  else if (maxCached === 0) reason = 'no_cache_impl';
+  else if (maxCached % CACHE_BLOCK_SIZE !== 0) reason = 'block_misaligned';
+  CACHE_PROBE_STATE.reason = reason;
+  CACHE_PROBE_STATE.ok = reason === 'ok';
+  if (reason === 'ok') {
+    metrics.cacheProbeOk = (metrics.cacheProbeOk || 0) + 1;
+    log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE', input, cached: maxCached,
+          block: CACHE_BLOCK_SIZE, runs: runs.length, ms: CACHE_PROBE_STATE.ms });
+  } else {
+    metrics.cacheProbeFail = (metrics.cacheProbeFail || 0) + 1;
+    pushAlert('CACHE_SEMANTICS_DRIFT', { reason, input, cached: maxCached, block: CACHE_BLOCK_SIZE });
+    log({ ts: CACHE_PROBE_STATE.at, result: 'ALERT_CACHE_SEMANTICS_DRIFT', reason, input,
+          cached: maxCached, block: CACHE_BLOCK_SIZE, remainder: maxCached % CACHE_BLOCK_SIZE,
+          runs: runs.length, ms: CACHE_PROBE_STATE.ms });
   }
 }
 
@@ -2965,6 +3128,25 @@ async function handle(req, res) {
         idShape: lastShape.idShape || '', detail: lastShape.detail } : null,
       // 实现指纹向量（仅观测）：与基线不一致 → IMPL_VECTOR_DRIFT 告警，不影响放行
       implVector: implVector || null, implVectorBaseline: IMPL_VECTOR_2026_10_27,
+      // ★ 2026-11-06：缓存语义（infra 指纹）。ok=true 表示最近一次探针拿到
+      // 「同一长前缀第二次命中、且命中量是 block 的整数倍」——这是默认配置的自部署做不到的。
+      // ok=null 表示探针尚未跑过或上游没给 usage（不是失败）。
+      cacheSemantics: {
+        ...CACHE_PROBE_STATE,
+        block: CACHE_BLOCK_SIZE,
+        policy: CACHE_BLOCK_ALIGN,
+        aligned: metrics.cacheBlockAligned || 0,
+        misaligned: metrics.cacheBlockMisaligned || 0,
+      },
+      // ★ 2026-11-06：流式缓冲（L3）状态。关闭时 enabled=false，四个计数恒为 0。
+      streamBuffer: {
+        enabled: STREAM_BUFFER,
+        maxBytes: STREAM_BUFFER_MAX,
+        buffered: metrics.streamBuffered || 0,
+        passed: metrics.streamBufferPassed || 0,
+        rejected: metrics.streamBufferRejected || 0,
+        skipped: metrics.streamBufferSkipped || 0,
+      },
       serdeFamily: lastSerdeFamily, upstreamPrefix: UPSTREAM_PREFIX, precheckProfile: lastUpstreamProfile,
       evidence: (() => {
         const ev = readEvidenceSnapshot(EVIDENCE_FILE);
@@ -3034,6 +3216,9 @@ async function handle(req, res) {
       // 2026-11-05：分段耗时（最近 PHASE_KEEP 条的 p50/p90）—— 给"门控慢在哪"一个可核答案。
       // 口径：precheck=进来到预检结论｜upstream=预检完到上游响应头｜gate=响应头到写完响应头｜stream=写完头到响应结束
       phase: phaseView(),
+      // 2026-11-06：429 归因计数（capacityRefused = 上游容量满快速失败；upstreamSlow = 有响应但超时）
+      rateLimitBreakdown: { rateLimited: metrics.rateLimited || 0, capacityRefused: metrics.capacityRefused || 0, capacityRetried: metrics.capacityRetried || 0, upstreamSlow: metrics.upstreamSlow || 0, capacityRetryMax: CAPACITY_RETRY,
+        byClass: metrics.rlClass || {} },
       egressHost: `${HOST}:${HOST_PORT}`,
       tokenRequired: !!GATE_TOKEN,
       obsTokenRequired: !!OBS_TOKEN,
@@ -3395,8 +3580,99 @@ async function handle(req, res) {
     idShape: r.idShape, votes: r.votes, signals: r.signals, endpoint: r.endpoint, upstreamModel: r.upstreamModel, ms: r.ms, error: r.error });
 
   let currentTrust = null;
+
+  /**
+   * ★ 2026-11-06：把 SSE 流整体读进内存（L3 用）。
+   * 返回 { chunks, bytes, over, timedOut }：
+   *   over=true 表示超过 STREAM_BUFFER_MAX —— 此时**放弃判定**（fail-open），
+   *   因为大响应缓冲既费内存也拖时间，而判据本身对超大响应没有额外收益。
+   */
+  const drainSseToBuffer = (r) => new Promise((resolve) => {
+    const chunks = [...(r.buffered || [])];
+    let bytes = chunks.reduce((n, c) => n + (c.length || 0), 0);
+    // ★ 2026-11-06 修复（test-bodyproof 抓到）：peekBody 可能已经把整条流读到结束，
+    // 此时 `end` 事件早已触发过、不会再发，继续等只能靠 30s 超时 →
+    // 合规响应会被误判成 STREAM_BUFFER_SKIP（实测 4 个 L3 用例全部命中）。
+    // 所以必须先看流状态：已结束就直接用已缓冲的内容判定。
+    if (r.stream.readableEnded || r.stream.destroyed) {
+      return resolve({ chunks, bytes, over: bytes > STREAM_BUFFER_MAX, timedOut: false });
+    }
+    let over = false, timedOut = false;
+    const finish = () => {
+      try { r.stream.removeListener('data', onData); } catch {}
+      try { r.stream.removeListener('end', onEnd); } catch {}
+      try { r.stream.removeListener('error', onEnd); } catch {}
+      resolve({ chunks, bytes, over, timedOut });
+    };
+    const onData = (c) => {
+      chunks.push(c); bytes += c.length;
+      if (bytes > STREAM_BUFFER_MAX) over = true;
+    };
+    const onEnd = () => finish();
+    // 缓冲期间必须**收满整条流**：否则 usage 可能在未读到的事件里，判定会假通过。
+    // 超时兜底：probeDeadlineMs 之外再给 30s，避免上游挂死把请求永久卡住。
+    const guard = setTimeout(() => { timedOut = true; finish(); }, 30000);
+    guard.unref();
+    r.stream.on('data', onData);
+    r.stream.once('end', () => { clearTimeout(guard); onEnd(); });
+    r.stream.once('error', () => { clearTimeout(guard); onEnd(); });
+    try { r.stream.resume(); } catch {}
+  });
+
+  /** 从 SSE 文本里取 id / cached_tokens / input_tokens（只做最小提取，不重建事件流） */
+  const scanSse = (text) => {
+    const idm = /"id"\s*:\s*"(resp_[^"]+)"/.exec(text);
+    const cm = /"cached_tokens"\s*:\s*(\d+)/.exec(text);
+    const im = /"input_tokens"\s*:\s*(\d+)/.exec(text);
+    return {
+      id: idm ? idm[1] : null,
+      cached: cm ? Number(cm[1]) : null,
+      input: im ? Number(im[1]) : null,
+    };
+  };
+
   const deliver = async (model, r, attemptNo, fpRetriesLeft = FP_RETRIES) => {
     tPhase.upstreamDone = Date.now();   // 拿到上游响应（头已到）——之后都算交付闸 + 回传
+    // ★ 2026-11-06（L3）：流式缓冲。必须在**写响应头之前**完成，否则状态码已经发出去了。
+    // 只在开关打开 + responses + 确实是 SSE 时介入；关闭时本块整体跳过，行为逐字节不变。
+    if (STREAM_BUFFER && proto === 'responses' && String(r.ctype || '').includes('event-stream') && !r.__bufferedAll) {
+      const d = await drainSseToBuffer(r);
+      r.buffered = d.chunks;
+      r.__bufferedAll = true;
+      const text = Buffer.concat(d.chunks).toString('utf8');
+      const s = scanSse(text);
+      const idOk = (() => {
+        if (!s.id) return false;
+        const m = /^resp_([0-9a-f]{32})$/i.exec(s.id);
+        return !!(m && UUID4_BITS(m[1]));
+      })();
+      const cacheOk = s.cached == null ? true : (s.cached === 0 || s.cached % CACHE_BLOCK_SIZE === 0);
+      const skipped = d.over || d.timedOut;
+      metrics.streamBuffered = (metrics.streamBuffered || 0) + 1;
+      if (skipped) {
+        metrics.streamBufferSkipped = (metrics.streamBufferSkipped || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'STREAM_BUFFER_SKIP', model,
+              bytes: d.bytes, over: d.over, timedOut: d.timedOut, max: STREAM_BUFFER_MAX });
+      } else if (!idOk || !cacheOk) {
+        metrics.streamBufferRejected = (metrics.streamBufferRejected || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'STREAM_BUFFER_REJECT', model,
+              idShape: s.id ? (idOk ? 'resp_uuid4' : 'resp_bad') : '(none)',
+              cached: s.cached, input: s.input, block: CACHE_BLOCK_SIZE,
+              reason: !idOk ? 'id_shape' : 'cache_block', bytes: d.bytes });
+        pushAlert('STREAM_BUFFER_REJECT', { reqId, model, reason: !idOk ? 'id_shape' : 'cache_block', cached: s.cached });
+        try { res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
+              'x-gate-result': 'blocked', 'x-gate-reason': !idOk ? 'stream_id_shape' : 'stream_cache_block',
+              'x-gate-req-id': reqId }); } catch {}
+        try { res.end(JSON.stringify({ error: { type: 'gate_no_official_route',
+              message: '该流式响应未通过体级判据；已 fail-closed，未向客户端交付任何内容。',
+              reason: !idOk ? 'id_shape' : 'cache_block', request_id: reqId } })); } catch {}
+        return;
+      } else {
+        metrics.streamBufferPassed = (metrics.streamBufferPassed || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'STREAM_BUFFER_PASS', model,
+              cached: s.cached, input: s.input, block: CACHE_BLOCK_SIZE, bytes: d.bytes });
+      }
+    }
     // ★ 2026-10-27 冻结版：结构闸放在**所有计数之前**。
     // 早期版本把它接在 metrics.pass++ 之后，导致「被判 pass 但实际返回 503」的台账/指标不一致
     // （实测 10 次请求里 1 次被拦，却显示 passByProof=10）。
@@ -3447,6 +3723,21 @@ async function handle(req, res) {
       if (fbody) {
         const fpRes = fingerprint(fbody, body, model);
         const miss = fpRes.hard || [];
+        // ★ 2026-11-06：缓存块对齐单独留痕（它可能是 soft 也可能是 hard，取决于 GATE_CACHE_BLOCK_ALIGN）。
+        // 不并进 FP_SOFT 是因为运维需要一眼看到"这次 cached 到底是多少、差在哪"。
+        {
+          const cin = (fbody.usage && fbody.usage.input_tokens_details || {}).cached_tokens;
+          const bad = (fpRes.hard || []).includes('cacheBlockMisaligned')
+            || (fpRes.soft || []).includes('cacheBlockMisaligned');
+          if (bad) {
+            metrics.cacheBlockMisaligned = (metrics.cacheBlockMisaligned || 0) + 1;
+            log({ ts: new Date().toISOString(), reqId, proto, result: 'CACHE_BLOCK_MISALIGNED', model,
+                  cached: cin, block: CACHE_BLOCK_SIZE, remainder: (typeof cin === 'number') ? cin % CACHE_BLOCK_SIZE : null,
+                  policy: CACHE_BLOCK_ALIGN });
+          } else if (typeof cin === 'number' && cin > 0) {
+            metrics.cacheBlockAligned = (metrics.cacheBlockAligned || 0) + 1;
+          }
+        }
         if (fpRes.soft && fpRes.soft.length) {
           metrics.fpSoft = (metrics.fpSoft || 0) + 1;
           for (const k of fpRes.soft) fpMissing.set('soft:' + k, (fpMissing.get('soft:' + k) || 0) + 1);
@@ -3762,8 +4053,8 @@ async function handle(req, res) {
     }));
   }
 
-  if (!candidates.length) {
-  }
+  // 2026-11-06：这里原有一个空的条件块（历史编辑残留），已删除；
+  // 含义完全由下面这个分支承担。verify AQ14 断言"只剩一个真分支"。
   if (!candidates.length) {
     metrics.blocked++;
     // 三种拒绝原因必须分开归因，否则客户端无法判断「等一会儿再试」还是「路由被拒」。
@@ -3813,8 +4104,19 @@ async function handle(req, res) {
   const topCertain = (verdicts.get(candidates[0]) === 'official') || precheckSaysOfficial;
   // 连接层失败（无 HTTP 响应）按车道记录；不同车道都失败即判上游不可达，快速收敛
   const connFailedLanes = new Set();
-  const noteConnFail = (m, r) => { if (r && r.verdict === 'error' && !r.status) connFailedLanes.add(m); };
-  const upstreamDown = () => connFailedLanes.size >= Math.min(UPSTREAM_FAST_FAIL_LANES, candidates.length);
+  // 2026-11-06：某条车道**曾经拿到过真实 HTTP 响应**（任意状态码）时，就不能再把它算作"连不上"。
+  // 实测误判：同一车道先返回 429、下一次尝试超时 → connFailedLanes 命中 → 终局报
+  // gate_upstream_unreachable「没有返回任何 HTTP 响应」，而上游明明返回了 429。
+  // （复现见 gate/test-429.mjs 用例 ⑤）
+  const sawHttpLanes = new Set();
+  const noteConnFail = (m, r) => {
+    if (r && r.status) sawHttpLanes.add(m);
+    if (r && r.verdict === 'error' && !r.status) connFailedLanes.add(m);
+  };
+  const upstreamDown = () => {
+    const realFails = [...connFailedLanes].filter(m => !sawHttpLanes.has(m));
+    return realFails.length >= Math.min(UPSTREAM_FAST_FAIL_LANES, candidates.length);
+  };
   if (HEDGE && !topCertain && candidates.length >= 2) {
     metrics.hedged++;
     const { winner, all } = await hedgeRace(candidates.slice(0, 2), { pathName, body, incoming: req.headers, signal: clientGone.signal, payloadFactory, timeoutMs: Math.max(3000, Math.min(UPSTREAM_TIMEOUT_MS, remainMs())) }, proto, pgate.allowAllLanes);
@@ -3933,33 +4235,120 @@ async function handle(req, res) {
       }
       try { r.stream && r.stream.destroy(); } catch {}
 
-      // 429 限流：等一小会儿在同车道重试；上游要求的等待超过上限就直接透传，别拖死 dsh
+      // 429 限流：三种情况必须分开，否则客户端与运维都会看错原因。
+      // ★ 2026-11-06 实测（mock 复现，见 gate/test-429.mjs）：
+      //   ① 容量满（prefill_cap_refused / "the cell is at capacity"）：重试无意义 ——
+      //      真实台账 06:42–06:58 连续 16 分钟内、5 秒间隔重试一次都没成功过。
+      //   ② 上游要求的等待 > 上限：本来就不该等。
+      //   ③ 等待 OK 但重试次数用尽。
+      // 旧实现把 ②③ 合并在同一句「要求的等待超过门控上限」里，③ 场景下这句话是假的
+      // （实测 wait=5000、上限 5000，检查是通过的），会把排查引向 GATE_RATE_LIMIT_MAX_WAIT_MS。
       if (r.verdict === 'rate-limit') {
         const wait = r.retryAfterMs ?? 1000;
+        const capacity = capacityRefused(r);
+        const rlCls = rateLimitClass(r);
+        metrics.rlClass[rlCls] = (metrics.rlClass[rlCls] || 0) + 1;
+        if (capacity && CAPACITY_FAILFAST) {
+          // 容量类：最多重试 CAPACITY_RETRY 次。等待上限用**专用**的 CAPACITY_MAX_WAIT_MS
+          // （实测上游给的是 retry-after: 30，通用上限 5 秒会把这次等待直接砍掉、一次都不等），
+          // 同时仍受剩余预算约束：等完之后必须还剩得下一次上游尝试的预算。
+          const roomForWait = remainMs() - MIN_UPSTREAM_BUDGET_MS - 2000;
+          const canWait = wait > 0 && wait <= CAPACITY_MAX_WAIT_MS && wait <= roomForWait;
+          if (t < CAPACITY_RETRY && canWait) {
+            metrics.rateLimited++;
+            metrics.capacityRetried = (metrics.capacityRetried || 0) + 1;
+            log({ ts: new Date().toISOString(), reqId, proto, attempt: attempts.length,
+                  result: 'UPSTREAM_CAPACITY_RETRY', retryAfterMs: wait, model,
+                  laneRetry: t, laneRetryMax: CAPACITY_RETRY, elapsedMs: Date.now() - startedAt });
+            await new Promise(s => setTimeout(s, wait));
+            continue;
+          }
+          metrics.rateLimited++;
+          metrics.capacityRefused = (metrics.capacityRefused || 0) + 1;
+          // 两种放弃原因必须分开：没等（上游要 30s 而我们只肯等 X）≠ 等了但重试用尽
+          const whyCap = !canWait ? 'capacity_wait_exceeded' : 'capacity_retries_exhausted';
+          const ra0 = String(Math.max(1, Math.ceil(wait / 1000)));
+          recordFailure({ kind: 'rate-limit', type: 'gate_upstream_capacity', status: 429,
+                          reqId, proto, model, retryAfterMs: wait, elapsedMs: Date.now() - startedAt,
+                          reason: whyCap, canWait,
+                          cls: rateLimitClass(r), upstream: String(r.passthrough?.body || '').slice(0, 200) });
+          log({ ts: new Date().toISOString(), reqId, proto, attempt: attempts.length,
+                result: 'UPSTREAM_CAPACITY', retryAfterMs: wait, model, reason: whyCap, canWait,
+                capacityMaxWaitMs: CAPACITY_MAX_WAIT_MS, roomForWaitMs: roomForWait,
+                elapsedMs: Date.now() - startedAt });
+          res.writeHead(429, {
+            'content-type': 'application/json',
+            'x-gate-result': 'rate-limited',
+            'x-gate-reason': whyCap,
+            'x-gate-attempts': String(attempts.length),
+            'x-gate-req-id': reqId,
+            'retry-after': ra0,
+          });
+          return res.end(JSON.stringify({
+            error: {
+              type: 'gate_upstream_capacity',
+              message: whyCap === 'capacity_wait_exceeded'
+                ? `上游容量已满（prefill_cap_refused），它要求等待 ${Math.ceil(wait / 1000)}s；`
+                  + `门控的容量等待上限是 ${Math.ceil(CAPACITY_MAX_WAIT_MS / 1000)}s`
+                  + `（当前剩余预算只够 ${Math.max(0, Math.floor(roomForWait / 1000))}s），所以这次没有等。`
+                  + '这是上游没容量，不是你的额度问题，也不是判据拦截。'
+                : `上游容量已满（prefill_cap_refused）；门控已按 retry-after 等待并重试 ${t} 次`
+                  + `（上限 ${CAPACITY_RETRY} 次）仍被拒，已停止重试。`,
+              request_id: reqId,
+              reason: whyCap,
+              retry_after_seconds: Number(ra0),
+              wait_limit_seconds: Math.ceil(CAPACITY_MAX_WAIT_MS / 1000),
+              advice: whyCap === 'capacity_wait_exceeded'
+                ? '想让它真等这么久，调大 GATE_CAPACITY_MAX_WAIT_MS（并确保 GATE_TOTAL_BUDGET_MS 足够）。'
+                : '多试几次可调 GATE_CAPACITY_RETRY（0=立即放弃，2=旧行为）；完全回退设 GATE_CAPACITY_FAILFAST=0。',
+              upstream: r.passthrough?.body ? String(r.passthrough.body).slice(0, 800) : '',
+            },
+          }));
+        }
         if (wait <= RATE_LIMIT_MAX_WAIT_MS && t < LANE_RETRY) {
           metrics.rateLimited++;
           await new Promise(s => setTimeout(s, wait));
           continue;
         }
         metrics.rateLimited++;
-        recordFailure({ kind: 'rate-limit', type: 'gate_upstream_rate_limited', status: 429,
-                        reqId, proto, model, retryAfterMs: wait, elapsedMs: Date.now() - startedAt });
+        // ②③ 分开归因：这两句文案以前是同一句，只有 ② 成立
+        const why = wait > RATE_LIMIT_MAX_WAIT_MS ? 'wait_exceeded' : 'retries_exhausted';
+        const type = why === 'wait_exceeded'
+          ? 'gate_upstream_rate_limited'                  // 保留原 type（verify E5 依赖）
+          : 'gate_upstream_rate_limited_retries';
+        recordFailure({ kind: 'rate-limit', type, status: 429,
+                        reqId, proto, model, retryAfterMs: wait, elapsedMs: Date.now() - startedAt,
+                        // 2026-11-06：普通 429 也记上游原文摘要，否则事后无法区分
+                        // 「容量满」与「真·限流」（前者不该多等，后者值得重试）
+                        cls: rateLimitClass(r), upstream: String(r.passthrough?.body || '').slice(0, 200) });
         log({ ts: new Date().toISOString(), reqId, proto, attempt: attempts.length, result: 'UPSTREAM_429',
-              retryAfterMs: wait, model });
+              retryAfterMs: wait, model, reason: why, laneRetry: t, laneRetryMax: LANE_RETRY,
+              cls: rlCls, upstream: String(r.passthrough?.body || '').slice(0, 200),
+              elapsedMs: Date.now() - startedAt });
         const ra = String(Math.max(1, Math.ceil(wait / 1000)));
         res.writeHead(429, {
           'content-type': 'application/json',
           'x-gate-result': 'rate-limited',
+          'x-gate-reason': why,
           'x-gate-attempts': String(attempts.length),
           'x-gate-req-id': reqId,
           'retry-after': ra,
         });
         return res.end(JSON.stringify({
           error: {
-            type: 'gate_upstream_rate_limited',
-            message: '上游限流，且要求的等待超过门控上限；请稍后重试。',
+            type,
+            message: why === 'wait_exceeded'
+              ? `上游限流，且它要求的等待（${Math.ceil(wait / 1000)}s）超过门控上限`
+                + `（${Math.ceil(RATE_LIMIT_MAX_WAIT_MS / 1000)}s），门控没有等待；`
+                + '请稍后重试。想允许更长等待可调 GATE_RATE_LIMIT_MAX_WAIT_MS。'
+              : `上游持续限流：门控已重试 ${t} 次（上限 ${LANE_RETRY} 次）仍被拒绝，已放弃。`
+                + '这不是"等待超限"——每次等待都在上限内。'
+                + '想多试几次可调 GATE_LANE_RETRY。',
             request_id: reqId,
+            reason: why,
             retry_after_seconds: Number(ra),
+            lane_retry: t,
+            lane_retry_max: LANE_RETRY,
             upstream: r.passthrough?.body ? String(r.passthrough.body).slice(0, 800) : '',
           },
         }));
@@ -4026,38 +4415,51 @@ async function handle(req, res) {
   }
 
   metrics.blocked++;
-  // 三种拒绝原因必须区分开，否则客户端无法判断「等一会儿再试」还是「路由被拒」
+  // 拒绝原因必须区分开，否则客户端无法判断「等一会儿再试」还是「路由被拒」。
+  // 2026-11-06 新增 gate_upstream_slow：**曾收到真实响应**（status>0）但最后一次尝试是超时/硬上限。
+  // 旧实现会把它并入 gate_upstream_unreachable，文案写「没有返回任何 HTTP 响应」——
+  // 而实际上游返回过 429（实测 131 秒那条：attempts=[429, attempt_hard_cap] 却被报成不可达）。
   const unreachable = upstreamDown();
   const exhausted = remainMs() <= 1500;
+  const sawHttp = attempts.some(a => a.status > 0);
+  const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+  const slowTail = !unreachable && sawHttp && lastAttempt && !lastAttempt.status;
   if (unreachable) metrics.upstreamUnreachable++;
+  else if (slowTail) metrics.upstreamSlow = (metrics.upstreamSlow || 0) + 1;
   else if (exhausted) metrics.budgetExhausted++;
   const reasonType = unreachable ? 'gate_upstream_unreachable'
+    : slowTail ? 'gate_upstream_slow'
     : exhausted ? 'gate_budget_exhausted' : 'gate_no_official_route';
   recordFailure({
     kind: 'route',
     type: reasonType,
     status: 503, reqId, proto,
     elapsedMs: Date.now() - startedAt,
-    exhausted,
+    exhausted, sawHttp,
     attempts: attempts.map(a => a.model + ':' + a.status + ':' + a.verdict),
   });
   log({ ts: new Date().toISOString(), reqId, proto, attempt: attempts.length, result: 'BLOCKED',
-        reason: reasonType, unreachable, exhausted,
+        reason: reasonType, unreachable, exhausted, sawHttp,
         elapsedMs: TOTAL_BUDGET_MS - remainMs(), probeNotes: notes, attempts });
   res.writeHead(503, { 'content-type': 'application/json', 'x-gate-result': 'blocked',
                        'x-gate-reason': reasonType,
-                       'retry-after': unreachable ? '10' : '20' });
+                       'retry-after': unreachable ? '10' : slowTail ? '15' : '20' });
   res.end(JSON.stringify({
     error: {
       type: reasonType,
       message: unreachable
         ? '上游整体无响应（所有候选车道都没有返回任何 HTTP 响应）；已 fail-closed，未向客户端交付任何内容。这是可达性问题，不是路由判定问题，稍后重试即可。'
-        : exhausted
-          ? `在 ${TOTAL_BUDGET_MS}ms 总预算内未能确认官方路由；已 fail-closed，未向客户端交付任何内容。`
-          : '所有候选模型此刻都未落在官方上游；已 fail-closed，未向客户端交付任何内容。',
+        : slowTail
+          ? `上游可达但太慢：曾收到 HTTP ${(attempts.find(a => a.status > 0) || {}).status} 等响应，`
+            + `但最后一次尝试在 ${ATTEMPT_HARD_CAP_MS}ms 内没有返回（超时/硬上限）。`
+            + '这不是"连不上"，而是上游过载；已 fail-closed，稍后重试即可。'
+          : exhausted
+            ? `在 ${TOTAL_BUDGET_MS}ms 总预算内未能确认官方路由；已 fail-closed，未向客户端交付任何内容。`
+            : '所有候选模型此刻都未落在官方上游；已 fail-closed，未向客户端交付任何内容。',
       request_id: reqId,
       budget_ms: TOTAL_BUDGET_MS,
       elapsed_ms: TOTAL_BUDGET_MS - remainMs(),
+      saw_http: sawHttp,
       probeNotes: notes,
       attempts,
     },
@@ -4147,6 +4549,14 @@ server.listen(PORT, '127.0.0.1', () => {
   if (IMPL_VECTOR_MS > 0) {
     setInterval(() => { runImplVector().catch(() => {}); }, IMPL_VECTOR_MS).unref();
     setTimeout(() => { runImplVector().catch(() => {}); }, 5000).unref();
+  }
+  // ★ 2026-11-06：缓存语义探针（补「无缓存实现」盲区，只观测 + 告警）。默认 10 分钟。
+  // 成本实测：单次探针 2 发 × ~300 token = 604 token ⇒ 10 分钟频率约 96K token/天。
+  const CACHE_PROBE_MS = num('GATE_CACHE_PROBE_MS', 600000, { min: 0, max: 86400000 });
+  if (CACHE_PROBE_MS > 0) {
+    setInterval(() => { runCacheProbe().catch(() => {}); }, CACHE_PROBE_MS).unref();
+    // 首次延迟跟随配置：默认 12s（等启动自检跑完），配置更短时用配置值（测试用小值验证）
+    setTimeout(() => { runCacheProbe().catch(() => {}); }, Math.min(12000, CACHE_PROBE_MS)).unref();
   }
 
   // ★ 第 17 轮：启动自检（D5-2）

@@ -374,3 +374,60 @@ keyOrderVerdict(顶层键序列):
 ```json
 {"verified":0,"unverified":1,"keyOrder":{"official":0,"relay":1,"unknown":0},"server":{"relay":1},"relayMimicsOfficial":0}
 ```
+
+## B25 体级判据：缓存块对齐 + 流式缓冲 + 缓存语义探针（2026-11-06 标定）
+
+### 起因
+
+B24 的骨架证据回答「信封是谁写的」，回答不了「后端有没有前缀缓存」。
+而 cf-ray 这类头部判据在本车道**恒判 unverified**（8182/8182），没有区分力。
+所以这一层只看**响应体里的缓存账本**。
+
+### 实测（真实上游，2026-11-06）
+
+| 观测点 | 结果 | 意义 |
+|---|---|---|
+| resp_uuid4 内部 32 hex 的 UUID4 位模式 | **70/70**；历史台账 **8182/8182** | 位模式校验误拒风险 **0.00%**，可安全作事前判据 |
+| cached_tokens % 128 | **70/70 = 0** | 取值全集 {0,128,256,384,512,640,6912} |
+| 非整倍数 input 的命中量 | 283→256、455→384、710→640 | **按 128 向下取整**，不是全量命中 |
+| 缓存作用域 | 换 x-opencode-session 分布不变（B1/B2/B3 三组） | **全局前缀缓存**，不是 session 隔离 |
+| 短 prompt（input < 128） | cached 恒 0 | 该区间**无区分力**（0 天然符合 %128） |
+| 流式 vs 非流式 | 两边都恒为 128 倍数 | 判据与协议无关 |
+
+### 判据
+
+    L2（逐响应，非流式 + L3 开启时的流式）：
+      cached_tokens > 0 && cached_tokens % 128 != 0  → cacheBlockMisaligned
+      （默认 label：只记录；GATE_CACHE_BLOCK_ALIGN=require 才升 hard）
+
+    L4（周期探针，补 L2 的「无缓存实现」盲区）：
+      同一长前缀（>200 token）连发 2 次，取 max(cached)
+      max == 0        → no_cache_impl
+      max % 128 != 0  → block_misaligned
+      否则            → ok
+
+### 为什么 128 有意义
+
+DeepSeek infra 的 cache block = 128；**vLLM 默认 block_size=16、SGLang 默认 1**。
+所以「默认配置的同权重自部署」在这一项上必然对不上 —— 这是本判据唯一的真实鉴别力来源。
+刻意把块大小配成 128 的自部署，与官方**不可区分**（诚实边界）。
+
+### 与既有证据的关系
+
+| 层 | 看什么 | 能挡 |
+|---|---|---|
+| L1（Q74-Q79） | id 位模式 | 异模型、非 UUID4 形态（**可被 2 字符伪造绕过**） |
+| **L2/L4（本节）** | **缓存账本** | **默认配置的自部署（vLLM/SGLang）** |
+| B24 | 信封骨架 | 中转 vs 官方格式（本车道恒 unverified） |
+| canary EV10/EV13 | 分词一致性 | 模型族（DS vs 非 DS） |
+
+### 边界（必须承认）
+
+- **cached = 0 不是证据**：不做缓存的实现与「prompt 太短」都会给 0 ⇒ 必须靠 L4 的重复前缀探针
+- **input_tokens 不能作 tokenizer 指纹**：同一 prompt flash 计 53、pro 计 106，usage 是网关按倍率估算的
+- **抢跑不成立**：探针 1873ms > 业务首字节 1657ms（窗口 −216ms），所以 L3 只能「缓冲后判定」
+- **流式判定必然付出延迟**：cached_tokens 在流的最后一个事件里，L3 缓冲把首字节从 1.6s 推到 1.9s
+
+### 当前生产值（2026-11-06 首次采样）
+
+    {"cached":128,"input":220,"runs":2,"ms":410,"block":128,"policy":"label","aligned":1,"misaligned":0}
