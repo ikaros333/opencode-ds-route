@@ -67,7 +67,7 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 ```powershell
 Get-FileHash .\opencode-ds-route-v0.1.9.zip -Algorithm SHA256
 # 期望值（与 SHA256SUMS.txt 一致）：
-# 5D074DBCBDD12C45DD34147797BB3F1A69498943AF53AE68C10C0CF80D8F4FCD
+# F8A9FDA46C3822E79AEF615AD7E053EEB28A628DE1358AC592CEE5FF873E1C4A
 ```
 
 > 若哈希不一致：**不要解压、不要运行 `install.ps1`**。说明包在传输中被改动过，
