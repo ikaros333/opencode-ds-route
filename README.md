@@ -14,15 +14,17 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 
 [![ci](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml/badge.svg)](https://github.com/ikaros333/opencode-ds-route/actions/workflows/ci.yml)
 
-> **如果你也是 opencode go 套餐的订阅者，而且还是 deepseek 模型的深度使用者，同时不想让 opencode 给你路由到第三方的、自部署的掺水 deepseek 模型的话，请看看这个项目！它能极大地保证你在使用 opencode go 套餐时能路由到官方的 deepseek。**
+> **如果你也是 opencode go 套餐的订阅者，而且还是 deepseek 模型的深度使用者，同时不想让 opencode 给你路由到第三方的、自部署的掺水 deepseek 模型的话，请看看这个项目！它不能改变 opencode 的路由，但能识别并挡住"不是 DeepSeek 实现"的响应，并把每次判定依据摊开给你看。**
 
 > **本项目不在 npm 发布。**`package.json` 是 `private: true`，`opencode-ds-route` 这个包名在 npm 上没有对应本项目。
 > 任何 `npm i opencode-ds-route` 装到的都是**别人上传的包**，与这里无关。请只从
 > [Releases](https://github.com/ikaros333/opencode-ds-route/releases) 或 `git clone` 获取。
-`v0.1.8` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.9` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
-在 `127.0.0.1:8787` 起一层本地门控：**只有能证明来自官方 DeepSeek 后端的响应才放行，其余一律 503。**
-它不改变 OpenCode 的路由，只判断"这次响应是不是官方的"。
+在 `127.0.0.1:8787` 起一层本地门控：**对每个响应做身份判定 —— 有强反面证据（异模型 id 形态、伪造 `resp_`、缓存块不匹配）就拒绝；证据不足时放行，但如实标注为 `unverified`。**
+
+它**不改变** OpenCode 的路由（那条车道只有一种实现，无处可切），只回答"这次响应像不像 DeepSeek 实现、以及凭什么这么判"。
+判负分级与默认处置见[它做什么 / 不做什么](#它做什么--不做什么)。
 
 **前提**：你需要一个 **OpenCode Go 套餐的 key**（在 opencode.ai 控制台获取）。没有这个 key，本项目对你没有用处。
 
@@ -55,15 +57,15 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.8](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.8) 下载
-`opencode-ds-route-v0.1.8.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.9](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.9) 下载
+`opencode-ds-route-v0.1.9.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.8.zip -Algorithm SHA256
+Get-FileHash .\opencode-ds-route-v0.1.9.zip -Algorithm SHA256
 # 期望值（与 SHA256SUMS.txt 一致）：
 # 5D074DBCBDD12C45DD34147797BB3F1A69498943AF53AE68C10C0CF80D8F4FCD
 ```
@@ -240,12 +242,24 @@ pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desk
 | 做 | 不做（明写，别指望） |
 |---|---|
 | 挡住"看起来像官方、实际是第三方池"的响应 | 判断官方模型是否降智 |
+| 挡住**默认配置**的同权重自部署（缓存块不是 128 的整数倍） | 挡住**刻意把块大小配成 128** 的自部署（与官方不可区分） |
 | 交付前给出可读的拒绝原因 | 防蓄意的 TLS 中间人（复刻全部可观测特征即可通过） |
-| 出问题能定位到具体判据 | 分辨"第三方转售真官方 API" |
+| 出问题能定位到具体判据（`x-gate-reason` / 台账 / `health`） | 分辨"第三方转售真官方 API" |
 | 拦掉"只有思考、没有正文"的响应（`gate_structure_bad`） | 证明响应来自 DeepSeek 官方服务端（上游已抹掉全部官方指纹，见下） |
 | 把 `trustLevel`（`strong`/`medium`/`weak`/`blocked`）暴露到 health 与响应头 | 把 `medium` 变成 `strong`（只有上游恢复官方直出形态才可能） |
+| **发现后端被换掉**（缓存语义探针，窗口 ≤10 分钟） | **把请求路由到官方**（本车道只有一种实现，没有第二个落点可选） |
 
-一句话：**能拒绝「意外的第三方」，不能拒绝「蓄意的中间人」，也不能证明「这就是官方后端」。**
+**判负分三级，默认处置不同** —— 这是最容易误读的一点：
+
+| 判负强度 | 例子 | 默认处置 |
+|---|---|---|
+| **强反面** | id 不是 `resp_uuid4` 位模式、伪造 `resp_`、`HEX32`/`chatcmpl`/`gw-` | **拒绝**（503） |
+| **中等反面** | `cached_tokens` 不是 128 的整数倍 | 只记录（`GATE_CACHE_BLOCK_ALIGN=label`）；要拦就设 `require` |
+| **弱反面** | 响应头带 `cf-ray` / `server: cloudflare`、无 `x-ds-trace-id` | 只标注 `unverified`（**这条车道上恒为此值**） |
+
+为什么弱反面不拦：这条车道上 `unverified` 是 **8182/8182** —— 拦掉等于停服，而不是"更安全"。
+
+一句话：**能拒绝「明确的第三方」，能发现「后端被换掉」，不能证明「这就是官方后端」，也不能「把请求切成官方」。**
 
 ## 2026-11-04 新增：证据链与 canary 硬闸
 
@@ -258,7 +272,8 @@ pwsh -NoProfile -File scripts\enable-placeholder-key.ps1    # 自动改 web+desk
 | **L0 端点指纹**（5 条，零 token、秒级） | `owned_by`、`x-ds-trace-id`、`cf-ray`/`x-zen-model`、401 的 `governor` 文案、试跑 `glm-5.2` | 这条通道是不是多厂商转售池 | 只标注（`GATE_L0_POLICY=label`） |
 | **MX messages 判据**（6 条） | id 形态、`cost`/`opencode` 块、`service_tier`、错误包装、官方范围文案 + UUID4 `request_id` | 请求是否到达官方校验器 | 只标注（`GATE_ASSURANCE=label`） |
 | **CY 随机 canary**（10 条随机串） | 同一随机串在官方与门控上游的 `input_tokens` 是否一致 | **模型族有没有被换** | ✅ **硬闸**（`GATE_CANARY_POLICY=require`） |
-| **PR 逐响应痕迹** | 每个成功响应的 `x-gate-proof` | 有没有官方 infra 痕迹（`x-ds-trace-id`） | 只标注（当前全为 `unverified`） |
+| **PR 逐响应痕迹**（2026-11-05） | 每个成功响应的 `server` 头 + 顶层键顺序（官方 **35** 键 / 中转 **17–18** 键） | 这层**信封**是谁写的 | 只标注（本车道恒 `unverified` / `keyOrder=relay`） |
+| **BODY 体级证据**（2026-11-06） | `resp_uuid4` 内部 UUID4 位模式 + `cached_tokens % 128` + 周期缓存语义探针 | 后端是**哪种实现**、有没有前缀缓存 | id 强反面**拒绝**；缓存块只记录（可设 `require`） |
 
 ### canary 的判别力（实测）
 
@@ -340,13 +355,65 @@ powershell -ExecutionPolicy Bypass -File scripts\install-refresh-task.ps1
 
 详见 [docs/CONFIG.md](docs/CONFIG.md) 的「证据自动刷新」。
 
+## 2026-11-06 新增：体级判据（看缓存账本，不看响应头）
+
+前面几层都在看「信封」——响应头、键顺序、错误文案。但在这条车道上信封恒为 `unverified`
+（**8182/8182**），所以那一层没有区分力。2026-11-06 加的这一层改看**响应体里的缓存账本**。
+
+### 三条实测基线（真实上游）
+
+| 观测 | 数据 | 为什么有用 |
+|---|---|---|
+| `resp_uuid4` 内部 32 hex 是否符合 UUID4 位模式 | **70/70**；历史台账 **8182/8182** | 严格校验的误拒风险 **0.00%**，可以安全用作事前判据 |
+| `cached_tokens % 128` | **70/70 = 0**；取值全集 `{0,128,256,384,512,640,6912}` | DeepSeek infra 的 cache block 是 **128**；**vLLM 默认 16、SGLang 默认 1** ⇒ 默认配置的自部署必然对不上 |
+| 非整倍数 input 的命中量 | 283→256、455→384、710→640 | 按 128 **向下取整**，不是全量命中 |
+| 缓存作用域 | 换 `x-opencode-session` 分布不变 | 全局前缀缓存，不是 session 隔离 |
+| 最小前缀门槛 | `input < 256` 时 `cached` 恒 0 | 短 prompt 区间这条判据**无区分力** |
+
+### 三个开关（都能关掉）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `GATE_CACHE_BLOCK_ALIGN` | `label` | `cached_tokens` 不是 128 倍数时只记录；设 `require` 才升为拒绝 |
+| `GATE_STREAM_BUFFER` | **`0`（关）** | 开启后先读完整条 SSE 再判定 —— 让缓存判据对**流式**也生效，不合规 503 且**零字节交付** |
+| `GATE_CACHE_PROBE_MS` | 600000 | 每 10 分钟用「同一长前缀连发 2 次」验一次缓存语义，补「该实现根本没有缓存」这个盲区 |
+
+> **`GATE_STREAM_BUFFER` 为什么默认关**：`cached_tokens` 只在流的**最后一个事件**里，等拿到时内容已经发出去了。
+> 缓冲把首字节从 1.6s 推到 **1.9s**（内容传输本身只占 0.3s），代价是**逐字显示消失**。
+> 这是唯一会改变体验的开关，必须自己选。关闭时该代码块整体跳过，行为逐字节不变。
+
+### 能力边界（红队实测）
+
+| 攻击场景 | 判定 | 依据 |
+|---|---|---|
+| 异模型顶包（GLM / GPT / Qwen） | ✅ **拒绝** | id 形态不符 |
+| 同权重自部署 + vLLM（块 16） | ✅ **拒绝** | `cached % 128 != 0` |
+| 同权重自部署 + SGLang（块 1） | ✅ **拒绝** | 同上 |
+| 无缓存实现（`cached` 恒 0） | ⚠️ 逐响应放行 → **探针 ≤10 分钟内发现** | 重复前缀第二次仍为 0 |
+| 刻意把块大小配成 128 | ❌ 不可判 | 与官方不可区分 |
+| 区分「官方托管」vs「第三方托管」 | ❌ 不可判 | 缺 `x-ds-trace-id`，历史上从未出现过 |
+
+### 顺带记录：两条被数据否掉的思路
+
+- **前置探针「抢跑」不成立**：探针 1873 ms，业务首字节 1657 ms → 窗口 **−216 ms**（探针比业务还慢），
+  所以做不到"在内容发出前用探针判断"。
+- **缓存精确公式不成立**：`(input≥256) ? floor(input/128)*128 : 0` 在 30 个样本里只有 **40%** 符合 ——
+  命中量由**历史前缀**决定，不是当前 `input` 的函数。所以只保留「128 的整数倍」这一条弱判据。
+
+完整标定见 [docs/BASELINE.md](docs/BASELINE.md) 的 **B25**；开关细节见 [docs/CONFIG.md](docs/CONFIG.md)。
+
 ## 怎么工作
 
 ```text
 客户端 ──POST──▶ 127.0.0.1:8787 ──▶ ① 车道级形态预检（每条车道一条结论；单车道退化为一次）
                                   ② 转发：CHAIN 内切换/对冲 —— 判负即换下一条车道
                                   ③ 交付闸：按**赢下车道**的结论判 id 位模式 / usage 键集 / 结构完整性
-判定通过 ──▶ 交付（附 x-gate-trust）；判不了 ──▶ 503 + 可读原因（/gate/alerts）
+                                     └ 体级：id 内部 UUID4 位模式 + cached_tokens % 128
+                                  ④ 流式缓冲（GATE_STREAM_BUFFER=1 时）：读完整条 SSE 再判，不合规零字节交付
+判定通过 ──▶ 交付（附 x-gate-trust / x-gate-proof）；判不了 ──▶ 503 + 可读原因（/gate/alerts）
+
+后台常驻 ──▶ 缓存语义探针（每 10 分钟）：同一长前缀连发 2 次，验「第二次命中且是 128 的整数倍」
+         ──▶ 成立 → health.cacheSemantics.ok=true；不成立 → ALERT_CACHE_SEMANTICS_DRIFT
 ```
 
 - 只有 `responses` 一个协议；`messages` 与 `chat` 默认拒绝（见上方重要提示）。
