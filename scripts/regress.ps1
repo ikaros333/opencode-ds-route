@@ -1,4 +1,4 @@
-# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
+﻿# regress.ps1 — 生产回归：起一个「影子门控」打真实上游，跑成套测试
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\regress.ps1
@@ -109,10 +109,10 @@ Write-Host "  影子门控就绪：$base  tokenRequired=$($h.tokenRequired)  env
 
 $fail = 0
 $skip = 0
-function Run([string]$name, [string[]]$args) {
+function Run([string]$name, [string[]]$rest) {
   Write-Host ''
   Write-Host "--- $name ---"
-  & $NodePath (Join-Path $Root "gate\$name") @args
+  & $NodePath (Join-Path $Root "gate\$name") @rest
   # 2026-11-06：退出码 77 = 环境不配合（上游 429 过载）。既不算通过也不算失败，
   # 单独计入 skip 并在汇总里打印 —— 避免"反复重跑到绿"把上游问题藏起来。
   if ($LASTEXITCODE -eq 77) { $script:skip++; Write-Host "  SKIP  $name（上游 429，环境不配合）" -ForegroundColor Yellow }

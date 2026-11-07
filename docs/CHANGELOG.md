@@ -16,6 +16,87 @@
 "判负即切换"的能力保留（多车道配置即生效，G32 覆盖），但在现有约束下它只会退化为"判负即 503"。
 后续改进应转向「判定质量与可用性」，而不是「换上游」。
 
+## 未发布 · 2026-11-07 上游调价重标 + 探针 fail-open + 回归隔离
+
+### 一、上游调价导致计费判据 100% 误报（真 bug）
+
+`billingMul()` 先匹配 `v4.1` 返回 2，而上游单价会在 1× / 2× 之间**整段切换**：
+
+| 时间窗 | 反解倍率 | 证据 |
+|---|---|---|
+| 2026-11-06 UTC 07:42–09:11 | 2× | 连续 186 次非流式，`billingCost` 告警 0 次 |
+| 2026-11-07 UTC 05:20 起 | 1× | 告警全中；现场连发 10 次 `list_cost/1×预测 = 1.000000` |
+
+- 改成**允许集合** `BILLING_MUL_KNOWN = [1, 2]`，集合外才判 `billingCost`
+- 命中时把观测倍率写进 `metrics.billingMul`：**误报变遥测**
+- `GATE_BILLING_POLICY` 默认仍是 `warn`（升 `retry` 会让每个非流式请求白重发）
+- 标定记录见 `docs/BASELINE.md` **B26**
+
+### 二、实现指纹向量恒真告警（把告警环形刷成噪声）
+
+台账 3971 行里 `IMPL_VECTOR_DRIFT` 131 次、匹配基线 **0** 次。实测只有前两位稳定
+（位置 0 恒 400、位置 1 恒 200），位置 2/3/4 随实例池在 400/503/ERR 之间漂移。
+
+- 新增 `IMPL_VECTOR_STABLE = ['400','200']`，只比稳定位；整串仍写进台账/告警 detail
+- 标定记录见 `docs/BASELINE.md` **B27**
+
+### 三、`pushAlert` 连续同条去重
+
+50 格告警环形按 5 分钟一条计算，4 小时就被同一条 `IMPL_VECTOR_DRIFT` 填满，
+`BLOCKED_*` / `ALL_LANES_DEGRADED` 这类真告警会被挤掉。现在紧邻重复的同一条只计数
+（`metrics.alertsDeduped`），不再入环形、不再刷 stderr；中间插入别的告警会重新记录。
+
+### 四、官方性探针 `ocg probe` 坏了 + 本身是 fail-open（两条真 bug）
+
+- **链接失败**：`probe/official-detect.mjs` 引用 `E_SERDE_EXTRAS`，该常量在 `1a78e6b` 已改名
+  → `node bin\ocg.mjs probe` 直接 ESM 报错、整条 CLI 不可用。同时删掉 `e1_msg` / `e1_extra`
+  / `e1_retired` 三个死字段（下游只用 `etype_*`）
+- **fail-open**：`e1` / `p1` 停用后 `items` 只剩 1 个，旧式 `pass >= total - 1` 在 `total=1`
+  时等价于 `0 >= 0` ⇒ **唯一探针返回 unknown（实测：key 错误 → HTTP 401）也会写出
+  `verdict=pass trust=high` 的 proof**，而 `proofGate()` 对 full/high 返回 `allowAllLanes=true`
+  → 未验证即放开全部车道。现要求「至少 1 个真 pass」才给 full/high，且 `total=0` 时 `trust=none`
+
+### 五、预检「无证据」重试（消除一类瞬时 503）
+
+`handle` 的硬前置是 `precheck.verdict === 'pass'`，而旧实现里一次探针 `ABORT_ERR` 就等同
+用户 503（实测 `2026-11-07T06:14:57` id=`1f882cda`：`shape:net(err=ABORT_ERR)`）。
+
+- 新增 `GATE_PRECHECK_NOEVID_RETRY`（默认 1）：只在**所有判据都是 net/rate/timeout**
+  （= 没问到，不是判定）时重试，且重试把探针上限放宽到 `max(当前, 首轮×2)`
+- `fail` / `format` / `drift` **一次都不重试** —— 判据强度不变
+- 台账新增 `PRECHECK_NO_EVIDENCE_RETRY`，`metrics.precheckNoEvidenceRetry` 计数
+
+### 六、回归脚本一直在打生产（测试隔离失效）
+
+`scripts/regress.ps1` 的 `Run([string]$name, [string[]]$args)` 用了 PowerShell 自动变量
+`$args`，`@args` 展开恒为空 ⇒ `@($base)` 从未传进去：
+
+| 套件 | 默认端口 | 实际打到 |
+|---|---|---|
+| `test-suite` / `test-pollution` / `test-security` | 8799 | 影子（碰巧对） |
+| `test-cache` / `test-multimodal` / `test-real` | **8787** | **生产** |
+
+实测证据：生产 `gate.jsonl` 06:15 段 `pid=21768`（生产进程）出现 `test-real` 的 26 条
+`PASS_BY_PROOF`，同窗口影子台账零业务请求。
+
+- 参数改名 `$args` → `$rest`（已复现验证 splat 恢复）
+- 顺手补 UTF-8 BOM：该文件含 1839 字节非 ASCII 却无 BOM，与脚本自身的编码检查规则冲突
+  （PS 5.1 + 中文 Windows 会按 GBK 解码 → `0x5C` 尾字节转义引号 → 解析失败）
+
+### 七、注释与文档校正
+
+- `GATE_PROOF_REFRESH_MS` 段落写的「TTL 90s / 暴露面 0.049%」早已过时（实际 15s）。
+  改成按实际 TTL 计算，并显式提示「TTL(15s) < 刷新周期(25s) ⇒ 有 10s 空窗、
+  调大周期只会让空窗更长，两者必须成对调整」
+- 启动横幅不再硬编码 `暴露面≈0.049%`，改为按 TTL 实算并打印空窗告警
+- `docs/CONFIG.md` + `.env.example` 补 `GATE_BILLING_POLICY`、`GATE_PRECHECK_NOEVID_RETRY`
+
+### 测试
+
+- `verify-patch` 576 → **597 通过 / 0 失败**（新增 AQ1–AQ20，覆盖上述每条不变量）
+- `test-coverage` 201 / 0；`test-bodyproof` 32 / 0；`test-429` 37 / 0
+- 真实上游（影子门控 8799）：`test-suite` 26/0、`test-pollution` 11/0、`test-security` 20/0、
+  `test-cache` 8/0、`test-multimodal` 7/0、`test-real` 18/0
 ## v0.1.9 · 2026-11-06 体级判据三层落地（L2/L3/L4）
 
 **目标锚定**：在使用 opencode go 套餐的 `deepseek-v4.1-flash` 前提下，

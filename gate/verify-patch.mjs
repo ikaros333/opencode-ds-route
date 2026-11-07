@@ -514,7 +514,7 @@ hasIn(baseLines, 'X8 旧枚举判据标记退役', '已退役（2026-10-27 晚�
 // 冻结后 responses 只用形态探针（id 位模式 38/38 + usage 键集 20/20），
 // 参数探针降级为"实现指纹向量"，只告警不放行。
 console.log('\n=== Y. 判据冻结版（形态探针 + 结构闸 + 信任分级）===');
-has('Y1 形态探针存在（支持车道级）', "function runShapeProbe(lane = '')");
+has('Y1 形态探针存在（支持车道级 + 上限可被无证据重试放宽）', "function runShapeProbe(lane = '', deadlineOverrideMs = 0)");
 has('Y2 responses 走形态策略', "responses: 'shape',");
 has('Y3 形态判据校验 usage 键集（按剖面）', 'const need = hasOpc ? USAGE_KEYS_REQUIRED : OFFICIAL_USAGE_KEYS;');
 has('Y4 结构闸拒绝无正文', "result: 'STRUCTURE_BAD'");
@@ -638,7 +638,10 @@ hasIn(evLines, 'AF27 权重永远 unproven', "weights: 'unproven'");
 console.log('\n=== AG. 请求体上限 ===');
 has('AG28 big-body 阈值常量', "const BIG_BODY_BYTES = num('GATE_BIG_BODY_BYTES'");
 has('AG29 413 报错体带 actual_bytes', 'actual_bytes: bodySize');
-has('AG30 413 标记不可重试', "res.setHeader('x-gate-fatal', '1')");
+// 2026-11-07：两处 x-gate-fatal 原用 res.setHeader 设置，而 replyEarly 内部
+// `res.writeHead(status, headers)` 会覆盖它 —— 头顶从未真正发出过。
+// 现在都走 replyEarly 的 extraHeaders 参数（413 一处 + assurance 一处 = 2）。
+has('AG30 413 标记不可重试', "x-gate-fatal': '1'", { count: 2 });
 has('AG31 big-body 响应头', "res.setHeader('x-gate-big-body', '1')");
 has('AG32 大 body 台账', "result: 'BIG_BODY'");
 has('AG33 health 暴露 bodyLimit', 'bodyLimit: { maxBodyBytes: MAX_BODY');
@@ -730,12 +733,20 @@ hasIn(lines, 'AM5 自愈不 spawn 子进程（同进程复用探针）', 'runEvi
 hasIn(lines, 'AM6 刷新每个周期只跑一个', 'if (evRefresh.inflight) return false;');
 hasIn(lines, 'AM7 刷新成功写回快照', 'writeEvidenceSnapshot(EVIDENCE_FILE, scored)');
 hasIn(lines, 'AM8 刷新失败留台账', "result: 'EVIDENCE_REFRESH_FAIL'");
-hasIn(lines, 'AM9 判定 stale 时触发自愈', 'refreshEvidenceInBackground(evA ? \'stale\' : \'missing\')');
+// 2026-11-07：AM9 的字面量随「负结论也重采」一起改了。原式只认 stale，
+// 导致 fresh+canary=false 会死锁满 EVIDENCE_MAX_AGE_MS（实测 04:40 ENOTFOUND 采到 0/10，
+// 37 分钟内全站 503 且不重采）。现在同时认 stale 与 negative。
+hasIn(lines, 'AM9 判定 stale 时触发自愈', "refreshEvidenceInBackground(!fresh ? (evA ? 'stale' : 'missing') : 'negative')");
+hasIn(lines, 'AM9b 负结论（canary 未通过）也触发后台重采', 'canaryNegForRefresh');
+hasIn(lines, 'AM9c 目标即官方时不重采（避免官方直连自打死）', "evA.canary.skippedReason !== 'official_target'");
+// 2026-11-07：canary 采集失败必须与"不一致"分开（本次事故根因：两侧 null≠null 被判 mismatch）
+hasIn(evLines, 'AM9d canary 采集不足记为 collect_error 而非 mismatch', "skippedReason: 'collect_error'");
 hasIn(evLines, 'AM10 skipped 必须带原因', "skippedReason: e13?.skipped ? (e13.skippedReason || 'legacy_unknown') : null");
 hasIn(lines, 'AM11 缺基线不等于通过', "const canarySkippedOfficial = canarySkipReason === 'official_target';");
 hasIn(lines, 'AM12 报文点明拦截者', "proto, blocked_by: blockedBy, reason: why,");
 hasIn(lines, 'AM13 报文声明可重试与补刷', "refresh_started: refreshStarted,");
-hasIn(lines, 'AM14 补刷中回 x-gate-refresh', "res.setHeader('x-gate-refresh', 'started')");
+// 2026-11-07：同上，x-gate-refresh 也改走 extraHeaders（原来被 writeHead 覆盖，客户端看不到"正在补刷"）
+hasIn(lines, 'AM14 补刷中回 x-gate-refresh', "x-gate-refresh': 'started'");
 hasIn(lines, 'AM15 health 暴露刷新状态', 'lastAt: evRefresh.at || null, lastWhy: evRefresh.lastWhy');
 hasIn(lines, 'AM16 health 暴露 maxAgeMs', 'maxAgeMs: EVIDENCE_MAX_AGE_MS');
 hasIn(lines, 'AM17 health 暴露 canary 跳过原因', "skippedReason: ev.canary.skippedReason || (ev.canary.skipped ? 'legacy_unknown' : null)");
@@ -839,6 +850,36 @@ hasIn(lines, 'AP12 伪装升级告警', "pushAlert('RELAY_MIMICS_OFFICIAL'");
 hasIn(lines, 'AP13 伪装计数', 'metrics.relayMimicsOfficial = (metrics.relayMimicsOfficial || 0) + 1;');
 hasIn(lines, 'AP14 health 暴露键序分布', 'keyOrder: metrics.keyOrder, server: metrics.proofServer,');
 hasIn(lines, 'AP15 台账带逐响应证明明细', 'proofEvidence: r.proof || null');
+
+// ===== 2026-11-07：上游调价 + 实现向量漂移 + 无证据重试 + 告警去重 =====
+// 全部由实测事故驱动，断言只钉「行为不变量」，不钉具体数值。
+console.log('\n=== AQ. 2026-11-07 修复回归 ===');
+// 计费倍率：单价会在 1×/2× 之间整段切换，必须用集合而不是常数
+hasIn(baseLines, 'AQ1 计费单价常量仍单源在 baseline', 'export const BILLING =');
+has('AQ2 计费倍率用允许集合', 'const BILLING_MUL_KNOWN = [1, 2];');
+has('AQ3 billingMuls 未知模型返回 null', "if (s.includes('flash') || s.includes('v4.1')) return BILLING_MUL_KNOWN;");
+hasNot('AQ4 旧的单一倍率（v4.1 先命中 return 2）已移除', "if (s.includes('v4.1')) return 2;");
+hasNot('AQ4b 不再有 billingMul 单数调用', 'billingMul(');
+has('AQ5 计费命中允许集合才算通过', 'const hit = muls.find(m => Math.abs(o.list_cost - m * base) <= Math.max(tol, 1e-3 * m * base));');
+has('AQ6 观测倍率进 metrics（误报变遥测）', 'else metrics.billingMul = hit;');
+has('AQ7 集合外仍判失败', "if (hit === undefined) billFail('billingCost');");
+// 实现向量：只比稳定前缀
+hasIn(baseLines, 'AQ8 实现向量稳定前缀基线', 'export const IMPL_VECTOR_STABLE =');
+has('AQ9 只比稳定位（不再整串比较）', "const stableHead = vec.split(',').slice(0, IMPL_VECTOR_STABLE.length).join(',');");
+hasNot('AQ10 整串比较已移除', 'vec !== IMPL_VECTOR_2026_10_27');
+// 无证据重试：只重试 net/rate，不重试 fail/format/drift
+has('AQ11 无证据重试开关', "num('GATE_PRECHECK_NOEVID_RETRY', 1,");
+has('AQ12 只对 net/rate/timeout 重试', "const NO_EVIDENCE = new Set(['net', 'rate', 'timeout']);");
+has('AQ13 重试用放宽后的上限', 'const wider = Math.min(PROBE_DEADLINE_MAX, Math.max(probeDeadlineMs(), deadlineAtStart * 2));');
+has('AQ14 重试仍走同一聚合（判据不变）', 'const retryAgg = evalAgg(retryResults);');
+has('AQ15 形态探针上限可被放宽', 'const deadline = deadlineOverrideMs > 0 ? deadlineOverrideMs : probeDeadlineMs();');
+// 告警去重
+has('AQ16 告警连续同条去重', 'if (sig === lastPushedAlertSig) {');
+has('AQ17 去重计数', 'metrics.alertsDeduped = (metrics.alertsDeduped || 0) + 1;');
+// 官方性探针的 fail-open 修复（探针自身也要 fail-closed）
+hasIn(probeLines, 'AQ18 探针无 pass 时不给 full/high', 'else if (pass >= 1 && pass >= total - 1)');
+hasIn(probeLines, 'AQ19 探针无判据时 trust=none', "if (!total) { verdict = 'unknown'; trust = 'none'; }");
+hasNotIn(probeLines, 'AQ20 探针不再 import 已改名的 E_SERDE_EXTRAS', 'E_SERDE_EXTRAS,');
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

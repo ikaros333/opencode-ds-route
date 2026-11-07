@@ -391,9 +391,31 @@ export async function runEvidence(o) {
         if (hit) ok++;
         rows.push({ i, official: ai, target: bi, hit });
       }
-      // 阈值随采样数缩放（默认 10 条时仍是 ≥9/10 的旧口径）：自愈快路径只取 GATE_EVIDENCE_REFRESH_CANARY_N 条
       const needN = Math.max(1, Math.ceil(canaryN * 0.9));
-      add('EV13', ok >= needN, `一致 ${ok}/${canaryN}` + (ok < canaryN ? ' 差异: ' + rows.filter((x) => !x.hit).map((x) => `${x.official}≠${x.target}`).join(',') : ''), { rows });
+      // ★ 2026-11-07：「没采到」和「采到了但不一致」是两件事，必须分开（本次事故的根因）。
+      //   旧实现 `hit = ai!==null && bi!==null && ai===bi`：两侧网络全挂时 ai=bi=null → hit=false
+      //   → 0/N → 判 canary_mismatch。实测 2026-11-07T04:40:50Z 那轮 rows 全是 `null≠null`
+      //   （当时同时出现 shape:net(err=ENOTFOUND)），后端根本没有变化
+      //   （同一时刻 shapeProbe=pass、cached=256/128 完全对齐）。
+      //   现在：采集成功条数不足 needN 时记为 skipped/collect_error（语义 = "无法证明"），
+      //   只有真的拿两侧数值比出来不一致，才是 mismatch。
+      const got = (x) => typeof x === 'number' && Number.isFinite(x);
+      const collected = rows.filter((r) => got(r.official) && got(r.target));
+      if (collected.length < needN) {
+        add('EV13', false,
+          `采集失败 ${collected.length}/${canaryN}（两侧都没拿到 usage；不是模型不一致）`,
+          { skipped: true, skippedReason: 'collect_error', rows });
+      } else {
+        const hits = collected.filter((r) => r.hit).length;
+        const need = Math.max(1, Math.ceil(collected.length * 0.9));
+        add('EV13', hits >= need,
+          `一致 ${hits}/${collected.length}` +
+          (hits < collected.length
+            ? ' 差异: ' + collected.filter((x) => !x.hit).map((x) => `${x.official}≠${x.target}`).join(',')
+            : '') +
+          (collected.length < canaryN ? `（另有 ${canaryN - collected.length} 条未采到，已排除）` : ''),
+          { rows });
+      }
     }
   }
 

@@ -20,9 +20,6 @@ import path from 'node:path';
 // 判据基线唯一来源（与 gate/oc-gate.mjs 共用）。不要在本地复制这些正文字面量，
 // 否则上游一变化就会出现「预检 pass、交付却 503」的漂移。
 import {
-  E1_MSG,
-  E_SERDE_MSG,
-  E_SERDE_EXTRAS,
   E_SERDE_TYPE_MSG,
   E_SERDE_TYPE_EXTRAS,
   E2_MAX,
@@ -57,12 +54,11 @@ const HDR = IS_OFFICIAL_TARGET
 
 // ---------- 基线常量：全部来自 ../gate/baseline.mjs（唯一来源）----------
 // 这里只是给下游旧代码沿用旧字段名，不重新定义任何判据。
+// 2026-11-07：删掉 e1_msg / e1_extra / e1_retired 三个**死字段** —— 下游只用
+// etype_msg / etype_extra / p1_gateway_block；而 e1_extra 引用的旧名
+// `E_SERDE_EXTRAS` 已在 1a78e6b 改名为 `E_SERDE_TYPE_EXTRAS`，
+// 留着会让 `node bin\ocg.mjs probe` 直接 ESM 链接失败（整条 CLI 不可用）。
 const BASELINE = {
-  // 2026-10-27：e1（缺 input）已被网关拦截（503 Endpoint is unavailable），不再穿透；
-  // 主判据换成 serde 反序列化文案（非法 reasoning.effort），见 gate/baseline.mjs。
-  e1_msg: E_SERDE_MSG,
-  e1_extra: E_SERDE_EXTRAS,
-  e1_retired: E1_MSG,
   // 2026-10-27 晚间第二标定：类型层判据（沿用旧字段名 e1_* 以免改下游逻辑）
   etype_msg: E_SERDE_TYPE_MSG,
   etype_extra: E_SERDE_TYPE_EXTRAS,
@@ -245,9 +241,15 @@ const unknown = items.filter(i => !['pass', 'fail'].includes(i.verdict)).length;
 const total = items.length;
 
 let verdict, trust;
-if (fail >= 2) { verdict = 'fail'; trust = 'none'; }
+// 2026-11-07 修 fail-open（实测复现）：e1/p1 停用后 items 只剩 1 个 e1，
+// 旧式 `pass >= total - 1` 在 total=1 时等价于 `0 >= 0`，于是**唯一探针返回 unknown
+// （实测：key 错误 → HTTP 401 → verdict=format）也会写出 verdict=pass trust=high 的 proof**。
+// 门控的 proofGate() 对 full/high 返回 allowAllLanes=true ⇒ 未验证即放开全部车道。
+// 修法：没有任何真实 pass 时永远不给 full/high。
+if (!total) { verdict = 'unknown'; trust = 'none'; }              // 一个判据都没跑 → 不产出信任
+else if (fail >= 2) { verdict = 'fail'; trust = 'none'; }
 else if (pass === total) { verdict = 'pass'; trust = 'full'; }
-else if (pass >= total - 1) { verdict = 'pass'; trust = 'high'; }
+else if (pass >= 1 && pass >= total - 1) { verdict = 'pass'; trust = 'high'; }   // ← 必须含至少 1 个真 pass
 else if (pass >= Math.ceil(total / 2)) { verdict = 'degraded'; trust = 'low'; }
 else { verdict = 'unknown'; trust = 'medium'; }
 

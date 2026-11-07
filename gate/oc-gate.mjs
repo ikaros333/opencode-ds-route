@@ -56,6 +56,7 @@ import {
   EVENT_FAMILY_REQUIRED,
   EVENT_TERMINAL,
   OBSERVED_AT,
+  IMPL_VECTOR_STABLE,
 } from './baseline.mjs';
 import { readSnapshot as readEvidenceSnapshot, runEvidence, scoreEvidence, writeSnapshot as writeEvidenceSnapshot } from './evidence.mjs';
 
@@ -240,7 +241,11 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   keyOrder: { official: 0, relay: 0, unknown: 0 }, proofServer: {}, relayMimicsOfficial: 0,
   // 2026-11-02：按车道剖面统计 + 缓存观测量（N11 只观察，不做判据）
   profiles: { official: 0, opencode: 0, unknown: 0 },
-  cache: { samples: 0, hits: 0 } };
+  cache: { samples: 0, hits: 0 },
+  // 2026-11-07：最近一次反解出的计费倍率（1 或 2）与告警去重计数
+  billingMul: null, alertsDeduped: 0,
+  // 2026-11-07：「无证据」预检重试次数
+  precheckNoEvidenceRetry: 0 };
 
 // ---------- 2026-11-05：分段计时（阶段一 P0-②） ----------
 // 起因：台账只有 elapsedMs，`elapsed − Σattempts.ms` 的 p90 有 1.7s 无法归因 ——
@@ -1268,6 +1273,12 @@ const precheckWaitMs = () => {
 };
   // 抗抖动：预检判 fail 后必须先重测确认，避免网络抖动/瞬时限流被当成「后端变成非官方」
   const PRECHECK_CONFIRM = num('GATE_PRECHECK_CONFIRM', 1, { min: 0, max: 5 });
+  // ★ 2026-11-07：「无证据」类结论的重试次数（与上面的 fail 确认重测对称）。
+  // net / rate 不是判定 —— 它只说明"我们没问到"。旧实现里一次 ABORT_ERR 就等于用户 503：
+  //   handle 的硬前置 `decision.precheck?.verdict !== 'pass'` 会直接打掉请求
+  //   （实测 2026-11-07T06:14:57 id=1f882cda：shape:net(err=ABORT_ERR) → 503）。
+  // 重试**不放松判据**：重试后仍然必须是真 pass，fail/format/drift 一次都不重试。
+  const PRECHECK_NOEVID_RETRY = num('GATE_PRECHECK_NOEVID_RETRY', 1, { min: 0, max: 2 });
   // 预检「确认失败」时允许被 proof 覆盖的最大 proof 龄期。
   // 探针 10 分钟一轮，所以 90 秒意味着「proof 必须在最近 90 秒内刷新过」；
   // 更旧的 proof 无权否决实时证据（否则实时判据形同虚设）。
@@ -1573,12 +1584,18 @@ async function runMsgFingerprint() {
  * 实测依据：官方 35 字段 + usage 无 opencode 块；opencode 车道 18 字段 + usage 含 opencode。
  * 目的：让判据自适配，而不是用一条车道的形状去卡另一条（那是最典型的误杀来源）。
  */
-/** 2026-11-02 实测：v4.1-flash 的单价恰好是 flash 的 2 倍（Δ=50%），必须按模型定价。
+/** 2026-11-07 重标：单价**不是常数**，必须用「允许集合」而不是单一倍率。
+ *  实测证据（全部来自本机台账 + 真实上游）：
+ *    · 2026-11-02 首次观测到同一 model 在 1×/2× 之间交替（见提交 5201720 的说明）
+ *    · 2026-11-06 UTC 07:42–09:11：连续 186 次非流式响应全部 = 2×，billingCost 告警 0 次
+ *    · 2026-11-07 UTC 05:20 起：连续 10 次全部 = 1×（list_cost / 1×预测 = 1.000000）
+ *  旧实现先匹配 `v4.1` 并返回 2，于是上游切到 1× 后每个非流式响应都误报 billingCost@warn。
  *  未知模型返回 null → 跳过计费校验（宁可漏，不可误杀）。 */
-function billingMul(model) {
+const BILLING_MUL_KNOWN = [1, 2];
+function billingMuls(model) {
   const s = String(model || '').toLowerCase();
-  if (s.includes('v4.1')) return 2;
-  if (s.includes('flash')) return 1;
+  // flash / v4.1 都属于「会整段切换」的那一族；v4-pro 等未知模型直接跳过
+  if (s.includes('flash') || s.includes('v4.1')) return BILLING_MUL_KNOWN;
   return null;
 }
 
@@ -1669,14 +1686,18 @@ function fingerprint(body, reqBody, model) {
   const hasTok = ['input', 'cache_read'].some(k => typeof tk[k] === 'number');
   // 计费按上游**实际服务的模型**（响应里的 model 优先），而不是我们请求的名字
   const billModel = String(b.model || model || '');
+  const muls = billingMuls(billModel);
   if (hasWrite) soft.push('billingSkippedCacheWrite');
-  else if (typeof o.list_cost === 'number' && billingMul(billModel) !== null) {
-    const mul = billingMul(billModel);
-    const pred = mul * ((tk.input || 0) * BILLING.input + (tk.output || 0) * BILLING.output + (tk.cache_read || 0) * BILLING.cacheRead);
+  else if (typeof o.list_cost === 'number' && muls) {
+    // base = 按 1× 单价算出的预测值；实际倍率由允许集合反解
+    const base = (tk.input || 0) * BILLING.input + (tk.output || 0) * BILLING.output
+               + (tk.cache_read || 0) * BILLING.cacheRead;
     // 实测相对偏差最大 8e-5（小额取整），取 1e-3（0.1%）留 12 倍余量
     const tol = Math.max(1e-9, 1e-3 * Math.abs(o.list_cost));
     const billFail = (k) => (BILLING_POLICY === 'retry' ? pushHard(k) : soft.push(k + '@warn'));
-    if (Math.abs(o.list_cost - pred) > tol) billFail('billingCost');
+    const hit = muls.find(m => Math.abs(o.list_cost - m * base) <= Math.max(tol, 1e-3 * m * base));
+    if (hit === undefined) billFail('billingCost');
+    else metrics.billingMul = hit;   // 观测到的倍率：把「误报」变成遥测
     if (typeof o.allowance === 'number'
         && Math.abs(o.allowance - BILLING.allowanceRatio * o.list_cost) > tol) billFail('billingAllowance');
     if (hasTok && typeof u.input_tokens === 'number'
@@ -1875,19 +1896,21 @@ function makeEventTap(reqId, model, seedChunks = []) {
   return tap;
 }
 
-function runShapeProbe(lane = '') {
+function runShapeProbe(lane = '', deadlineOverrideMs = 0) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     // 2026-11-05：车道级探针。lane 为空 = 旧行为（探 ALLOWED[0]）；
     // 多车道时每个车道各探一次，结论写进各自缓存（precheck 的 ckey 带 lane）。
     const probeModel = lane || ALLOWED[0];
+    // 2026-11-07：允许上层为「无证据重试」显式放宽上限（见 precheck 的 NO_EVIDENCE 重试）。
+    const deadline = deadlineOverrideMs > 0 ? deadlineOverrideMs : probeDeadlineMs();
     // 所有出口都记一次 lastShape：health 的 trustLevel 依赖它
     const finish = (o) => { lastShape = { at: Date.now(), verdict: o.verdict, idShape: o.idShape || '', detail: o.detail || '', profile: o.profile || '' };
       resolve(lane ? { ...o, lane } : o); };
     const payload = Buffer.from(JSON.stringify({ model: probeModel, input: 'ping', max_output_tokens: 1 }), 'utf8');
     const req = transport.request({
       host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST',
-      timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      timeout: deadline, signal: AbortSignal.timeout(deadline),
       headers: { 'content-type': 'application/json', 'content-length': payload.length,
                  authorization: `Bearer ${KEY}`,
                  'x-opencode-session': STABLE_SESSION, 'x-opencode-session-id': STABLE_SESSION },
@@ -1988,7 +2011,11 @@ async function runImplVector() {
   try { rows = await Promise.all(IMPL_PROBES.map(implProbeOnce)); } catch { return; }
   const vec = rows.map(r => (r.code < 0 ? 'ERR' : String(r.code))).join(',');
   implVector = vec;
-  const drift = vec !== IMPL_VECTOR_2026_10_27;
+  // ★ 2026-11-07：只比**稳定位**（见 baseline.mjs 的 IMPL_VECTOR_STABLE）。
+  // 整串比较等于恒真告警：位置 2/3/4 随上游实例池在 400/503/ERR 之间漂移，
+  // 实测全台账命中基线 0 次 / 误报 131 次。
+  const stableHead = vec.split(',').slice(0, IMPL_VECTOR_STABLE.length).join(',');
+  const drift = stableHead !== IMPL_VECTOR_STABLE.join(',');
   const goStack = rows.some(r => r.goStack);
   metrics.implVectorChecks = (metrics.implVectorChecks || 0) + 1;
   if (goStack) {
@@ -1998,10 +2025,10 @@ async function runImplVector() {
   }
   if (drift) {
     metrics.implVectorDrift = (metrics.implVectorDrift || 0) + 1;
-    pushAlert('IMPL_VECTOR_DRIFT', { vector: vec, baseline: IMPL_VECTOR_2026_10_27, rows });
-    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_DRIFT', vector: vec, baseline: IMPL_VECTOR_2026_10_27 });
+    pushAlert('IMPL_VECTOR_DRIFT', { vector: vec, stable: IMPL_VECTOR_STABLE.join(','), baseline: IMPL_VECTOR_2026_10_27, rows });
+    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_DRIFT', vector: vec, stable: IMPL_VECTOR_STABLE.join(','), baseline: IMPL_VECTOR_2026_10_27 });
   } else {
-    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR', vector: vec });
+    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR', vector: vec, stable: IMPL_VECTOR_STABLE.join(',') });
   }
 }
 
@@ -2205,14 +2232,14 @@ function precheck(proto = 'responses', opts = {}) {
   const inflight = precheckInflight.get(ckey);
   if (inflight) return inflight;
 
-  function runStrategy() {
+  function runStrategy(opts = {}) {
     if (strategy === 'eclass') {
       const cases = PRECHECK_CASES_BY_PROTO[proto] || [];
       return Promise.all(cases.map(runOnePrecheckCase));
     }
     if (strategy === 'logprob') return runChatPrecisionProbe().then(r => [r]);
     // 2026-10-27 冻结版：responses 用形态探针（稳定特征），不再用错误文案探针。
-    if (strategy === 'shape') return runShapeProbe(lane).then(r => [r]);
+    if (strategy === 'shape') return runShapeProbe(lane, opts.shapeDeadlineMs || 0).then(r => [r]);
     if (strategy === 'msgfp') return runMsgFingerprint().then(r => [r]);
     return Promise.resolve([]);
   }
@@ -2289,6 +2316,26 @@ function precheck(proto = 'responses', opts = {}) {
         agg = { ...retryAgg, verdict: 'unknown' };
         break;
       }
+      results = retryResults;
+      agg = retryAgg;
+    }
+
+    // ★ 2026-11-07：「无证据」重试（与上面的 fail 确认重测对称，方向相反）。
+    // 只有「所有判据都没给出结论」（net / rate / timeout）才重试 —— 那不是判定，是没问到。
+    // 判据强度不变：重试后仍必须是真 pass 才能交付；fail / format / drift 一律不重试。
+    // 重试用**放宽后的上限**（否则同一个偏小的 deadline 会再超时一次）。
+    const NO_EVIDENCE = new Set(['net', 'rate', 'timeout']);
+    let noEvidRetry = 0;
+    while (agg.verdict === 'unknown' && noEvidRetry < PRECHECK_NOEVID_RETRY
+           && results.length > 0 && results.every(r => NO_EVIDENCE.has(r.verdict))) {
+      noEvidRetry++;
+      metrics.precheckNoEvidenceRetry++;
+      const wider = Math.min(PROBE_DEADLINE_MAX, Math.max(probeDeadlineMs(), deadlineAtStart * 2));
+      log({ ts: new Date().toISOString(), result: 'PRECHECK_NO_EVIDENCE_RETRY', proto, strategy,
+            lane: lane || undefined, attempt: noEvidRetry, deadlineMs: wider,
+            first: results.map(r => `${r.id}:${r.verdict}${r.detail ? '(' + r.detail + ')' : ''}`).join(',') });
+      const retryResults = await runStrategy({ shapeDeadlineMs: wider });
+      const retryAgg = evalAgg(retryResults);
       results = retryResults;
       agg = retryAgg;
     }
@@ -2657,7 +2704,19 @@ const PROTO_PATH = {
 
 let refreshing = false;
 const alerts = [];   // 最近告警（内存环形，最多 50 条）
+// ★ 2026-11-07：连续重复的同一条告警不再重复入环形。
+// 动机（实测）：IMPL_VECTOR_DRIFT 每 5 分钟一条，50 格环形 4 小时就被同一条填满，
+// 真告警（BLOCKED/ALL_LANES_DEGRADED）会被挤掉，/gate/alerts 与 stderr 也变成噪声。
+// 只去重「紧邻的同一条」：中间插入别的告警就会重新记录，避免把持续故障静默掉。
+// （注意与下面 ALL_LANES_DEGRADED 用的 lastAlertSig Map 不是一回事，别重名。）
+let lastPushedAlertSig = '';
 function pushAlert(kind, detail) {
+  const sig = kind + '|' + JSON.stringify(detail);
+  if (sig === lastPushedAlertSig) {
+    metrics.alertsDeduped = (metrics.alertsDeduped || 0) + 1;
+    return;
+  }
+  lastPushedAlertSig = sig;
   const rec = { ts: new Date().toISOString(), kind, ...detail };
   alerts.push(rec);
   if (alerts.length > 50) alerts.shift();
@@ -3339,10 +3398,11 @@ async function handle(req, res) {
           actualBytes: bodySize, limitBytes: MAX_BODY, declared: !!declared,
           proto: protoOf('/zen/go/v1' + (url.pathname || '').replace(/^\/v1/, '')) });
     metrics.bodyTooLarge = (metrics.bodyTooLarge || 0) + 1;
-    res.setHeader('x-gate-fatal', '1');
+    // ★ 2026-11-07 修：setHeader 会被 replyEarly 内部的 writeHead 覆盖，
+    //   所以这个"重试无意义"的标记一直没发出去过（dsh 会照样白重试 2 轮）。
     return replyEarly(req, res, 413, { error: { type: 'gate_body_too_large',
       message: '请求体' + (declared ? '（声明长度）' : '') + ' ' + bodySize + ' 字节超过上限 ' + MAX_BODY + ' 字节；已 fail-closed，重试无意义',
-      actual_bytes: bodySize, limit_bytes: MAX_BODY, declared: !!declared } });
+      actual_bytes: bodySize, limit_bytes: MAX_BODY, declared: !!declared } }, { 'x-gate-fatal': '1' });
   };
   const declaredLen = Number(req.headers['content-length']);
   if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY) return tooLarge(declaredLen, true);
@@ -3411,7 +3471,23 @@ async function handle(req, res) {
     const fresh = evA && ageA <= EVIDENCE_MAX_AGE_MS;
     // 2026-11-05：过期/缺失即刻在后台自愈（本次仍 fail-closed，但故障窗口从"小时级"降到"一次刷新"）。
     // 冷却由 EVIDENCE_REFRESH_MIN_MS 控制，刷新失败也会留台账（EVIDENCE_REFRESH_FAIL）。
-    const refreshStarted = !fresh ? refreshEvidenceInBackground(evA ? 'stale' : 'missing') : false;
+    //
+    // ★ 2026-11-07 修死锁（本次全站 503 的根因）：**负结论也要重采**。
+    // 负结论有两种来源：
+    //   (a) 模型真被换了  → 重采仍是负，代价只是 4 条 canary 探针
+    //   (b) 采集那一刻网络/DNS 坏了 → 快照里 rows 全是 `null≠null`，重采立刻恢复
+    // 旧实现只看"年龄"：fresh=true 就永不重采，而 canaryPolicy=require 又要求 canary.ok。
+    // 实测 2026-11-07T04:40:50Z 那轮采到 0/10（同期 `shape:net(err=ENOTFOUND)`），
+    // 之后 37 分钟所有 responses 请求 503，必须等满 EVIDENCE_MAX_AGE_MS(2h) 才会重采 ——
+    // 而同一时刻 shapeProbe=pass、cacheSemantics cached=256/128 完全对齐，后端根本没变。
+    // 现在：只要快照里的 canary 不是"通过"且不是"目标即官方"，就按冷却节奏后台重采。
+    const canaryNegForRefresh = !!evA && !!evA.canary
+      && evA.canary.ok !== true
+      && evA.canary.skippedReason !== 'official_target'
+      && CANARY_POLICY === 'require';
+    const refreshStarted = (!fresh || canaryNegForRefresh)
+      ? refreshEvidenceInBackground(!fresh ? (evA ? 'stale' : 'missing') : 'negative')
+      : false;
     const protoEvidence = proto === 'messages' ? evA?.validator?.messages
       : proto === 'responses' ? evA?.validator?.responses
       : undefined;
@@ -3454,9 +3530,11 @@ async function handle(req, res) {
             canary: evA?.canary ? evA.canary.score + '/' + evA.canary.max : null,
             canarySkipReason, refreshStarted,
             l0: evA?.l0 ? evA.l0.score + '/' + evA.l0.max : null, ageMs: Number.isFinite(ageA) ? ageA : null });
-      res.setHeader('x-gate-fatal', '1');
+      // ★ 2026-11-07 修：replyEarly 内部用的是 res.writeHead(status, headers)，
+      //   它**会覆盖**之前 setHeader 设过的头 —— 所以下面两个 setHeader 从来没能发出去过
+      //   （实测 503 响应里既没有 x-gate-fatal 也没有 x-gate-refresh）。
+      //   改走 replyEarly 的 extraHeaders 参数。
       // x-gate-refresh: started = 已触发后台补刷（客户端稍后重试即可恢复），不是"永久不可用"
-      if (refreshStarted) res.setHeader('x-gate-refresh', 'started');
       return replyEarly(req, res, 503, { error: { type: 'gate_assurance_unmet',
         message: '本协议（' + proto + '）被【' + blockedBy + '】判定不可放行（' + why + '）；已 fail-closed。' +
                  (refreshStarted ? ' 证据已过期，门控正在后台补刷，稍后重试即可恢复。' : ''),
@@ -3469,7 +3547,10 @@ async function handle(req, res) {
         evidence_age_ms: Number.isFinite(ageA) ? ageA : null,
         evidence_max_age_ms: EVIDENCE_MAX_AGE_MS,
         refresh_started: refreshStarted,
-        retryable: true } });
+        retryable: true } }, {
+        'x-gate-fatal': '1',
+        ...(refreshStarted ? { 'x-gate-refresh': 'started' } : {}),
+      });
     }
   }
   if (EVIDENCE_POLICY === 'require' && EVIDENCE_EXPECT === 'official') {
@@ -4595,10 +4676,16 @@ server.listen(PORT, '127.0.0.1', () => {
   // 问题：交付前置闸要求 precheck.verdict === 'pass'，而预检原本只在请求到来时才跑。
   //   上游变慢 10 倍时，用户要等 10–26s 才拿到第一个字节；抖动时直接 503。
   // 做法：后台每 GATE_PROOF_REFRESH_MS（默认 25s）对每个有判据的协议强制跑一轮真探针，
-  //   把 pass 写进 precheckPassByProto；请求到来时命中缓存（TTL 90s），只付生成延迟。
+  //   把 pass 写进 precheckPassByProto；请求到来时命中缓存（TTL 见 GATE_PRECHECK_TTL_MS，
+  //   **默认 15s**，不是注释里旧写法的 90s），只付生成延迟。
   // 为什么不削弱判据：缓存里只有 pass，且「最近一次实测 fail」会立即短路拒绝。
-  //   窗口 90s 的暴露面 = λ×W = 5.4e-6/s × 90s ≈ 0.049%（λ 实测 51h 内 1 次池切换）。
-  // 成本：探针全是 400/422 参数校验失败，**不消耗 token**；msgfp 9 个 + e1 1 个 / 25s ≈ 24 请求/分钟。
+  //   暴露面 = λ×W = 5.4e-6/s × W（λ 实测 51h 内 1 次池切换）：
+  //     W=15s（现行默认）→ 0.0081%    W=90s → 0.049%    W=180s → 0.097%
+  //   注意：TTL(15s) **短于**刷新周期(25s)，中间有 10s 空窗 —— 落在空窗里的请求会同步跑一次
+  //   探针（多付 1.5–4.7s）。调大刷新周期只会把空窗拉得更长，别单独动它：
+  //   TTL 与周期必须成对调整（TTL ≥ 周期），否则延迟分布会变差。
+  // 成本：shape 探针是 max_output_tokens=1 的 200 响应，实测 1.4–3.1s / 次、约 1 token；
+  //   msgfp 9 个 + shape 1 个 / 25s ≈ 24 请求/分钟。
   const PROOF_REFRESH_MS = num('GATE_PROOF_REFRESH_MS', 25000, { min: 5000, max: 300000 });
   if (PRECHECK_ENABLE && PROOF_REFRESH_MS > 0) {
     const protos = ['responses', 'messages']
@@ -4651,8 +4738,17 @@ server.listen(PORT, '127.0.0.1', () => {
       }));
     };
     setInterval(() => { tick().catch(() => {}); }, PROOF_REFRESH_MS).unref();
-    console.log('[oc-gate] 后台保活预检已启用：每 ' + PROOF_REFRESH_MS + 'ms 刷新 ' + protos.join('/') +
-                '（TTL ' + precheckTtlFor('responses') + 'ms，暴露面≈0.049%）');
+    // 2026-11-07：暴露面按**实际 TTL** 算，不再硬编码 0.049%（那对应早已不用的 90s）。
+    {
+      const ttlMs = precheckTtlFor('responses');
+      const lam = 5.4e-6;   // 池切换率（实测 51h 内 1 次）
+      const expo = (lam * (ttlMs / 1000) * 100).toFixed(4);
+      const gap = ttlMs < PROOF_REFRESH_MS
+        ? `；⚠ TTL < 刷新周期，有 ${Math.round((PROOF_REFRESH_MS - ttlMs) / 1000)}s 空窗内的请求会同步跑探针`
+        : '';
+      console.log('[oc-gate] 后台保活预检已启用：每 ' + PROOF_REFRESH_MS + 'ms 刷新 ' + protos.join('/') +
+                  '（TTL ' + ttlMs + 'ms，暴露面≈' + expo + '%' + gap + '）');
+    }
   }
 });
 process.on('SIGINT', () => { writeSnapshot(); process.exit(0); });

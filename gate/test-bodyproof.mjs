@@ -79,9 +79,12 @@ const sseBody = ({ id = 'resp_' + U4_OK, cached = 128, input = 300 } = {}) => {
 
 let mode = 'ok';
 let bizHits = 0, probeHits = 0;
+// 2026-11-07：无证据重试测试用 —— 让下 N 次形态探针返回 5xx（= net，不是判定）
+let shapeFailLeft = 0;
 const mock = http.createServer((req, res) => {
   if (String(req.url).startsWith('/mode/')) {
     mode = String(req.url).slice(6); bizHits = 0; probeHits = 0;
+    shapeFailLeft = mode === 'probe500' ? 1 : 0;
     res.writeHead(200); return res.end(mode);
   }
   let b = ''; req.on('data', c => (b += c)); req.on('end', () => {
@@ -89,6 +92,11 @@ const mock = http.createServer((req, res) => {
     const isShapeProbe = j.input === 'ping' && j.max_output_tokens === 1;
     const isCacheProbe = typeof j.input === 'string' && j.input.length > 500 && j.max_output_tokens === 2;
     if (isShapeProbe) {
+      if (shapeFailLeft > 0) {
+        shapeFailLeft--;
+        res.writeHead(500, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'mock 5xx（模拟探针超时/上游 5xx）' } }));
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify(mkBody({ cached: 0, input: 20 })));
     }
@@ -261,6 +269,34 @@ console.log('\n=== L4 缓存语义探针（GATE_CACHE_PROBE_MS）===');
   // 必须归为 probe_too_short 而不是 no_cache_impl —— 否则会把"prompt 太短"误报成"没有缓存"。
   check('L4 探针 prompt 长度越过门槛（>256 token）',
     (OKP.health?.cacheSemantics?.input || 0) > 256, `input=${OKP.health?.cacheSemantics?.input}`);
+}
+
+// ───────────── L5 ─────────────
+// 2026-11-07：预检「无证据」重试。
+// 事故背景：handle 的硬前置是 precheck.verdict === 'pass'，旧实现里一次探针 ABORT_ERR
+// 就等同用户 503（实测 2026-11-07T06:14:57 id=1f882cda）。net/5xx 不是判定，是"没问到"。
+console.log('\n=== L5 预检「无证据」重试（GATE_PRECHECK_NOEVID_RETRY）===');
+{
+  // TTL=0 → 每个业务请求都同步跑一次真探针；mock 让**第一次**形态探针返回 500
+  const RETRY = await ask('l5retry', { GATE_PRECHECK_TTL_MS: '0', GATE_PRECHECK_NOEVID_RETRY: '1' },
+    'probe500', BIZ);
+  check('L5 首探 5xx 但重试通过 → 200 交付', RETRY.status === 200, `status=${RETRY.status}`);
+  check('L5 台账有 PRECHECK_NO_EVIDENCE_RETRY', RETRY.led.some(x => x.result === 'PRECHECK_NO_EVIDENCE_RETRY'),
+    RETRY.led.filter(x => /NO_EVIDENCE/.test(x.result || '')).map(x => x.result).join(',') || '(none)');
+  check('L5 重试后预检结论为 pass', RETRY.led.some(x => x.result === 'PRECHECK' && x.verdict === 'pass'),
+    RETRY.led.filter(x => x.result === 'PRECHECK').map(x => x.verdict).join(',') || '(none)');
+  check('L5 交了正文（不是空交付）', RETRY.text.length > 0 && !!RETRY.body?.id, `len=${RETRY.text.length}`);
+
+  // 负向对照：关掉重试 → 必须回到旧行为（503 precheck_not_pass）。
+  // 这一条保证「重试」确实是开关在起作用，而不是别的路径顺手救的。
+  const NORT = await ask('l5noret', { GATE_PRECHECK_TTL_MS: '0', GATE_PRECHECK_NOEVID_RETRY: '0' },
+    'probe500', BIZ);
+  check('L5 关闭重试 → 5xx 首探仍 fail-closed（503）', NORT.status === 503, `status=${NORT.status}`);
+  check('L5 关闭重试 → x-gate-reason=precheck_not_pass', NORT.reasonHdr === 'precheck_not_pass',
+    `reason=${NORT.reasonHdr}`);
+  check('L5 关闭重试 → 台账无 PRECHECK_NO_EVIDENCE_RETRY',
+    !NORT.led.some(x => x.result === 'PRECHECK_NO_EVIDENCE_RETRY'),
+    NORT.led.filter(x => /NO_EVIDENCE/.test(x.result || '')).map(x => x.result).join(',') || '(none)');
 }
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`);

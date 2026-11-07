@@ -147,6 +147,8 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_PRECHECK_WAIT_SLACK_MS` | 5000 | 派生时在探针上限上留的余量 |
 | `GATE_PRECHECK_CONFIRM` | 1 | `fail` 后的确认重测次数 |
 | `GATE_PRECHECK_CONFIRM_MS` | 250 | 重测间隔 |
+| `GATE_PRECHECK_NOEVID_RETRY` | 1 | **「无证据」预检的重试次数**（2026-11-07 补）。只有探针给出 `net` / `rate` / `timeout`（= 没问到，不是判定）时才重试，且重试会把探针上限放宽到 `max(当前上限, 首轮上限×2)`。`fail` / `format` / `drift` 一次都不重试——判据强度不变。动机：`handle` 的硬前置要求 `precheck.verdict === 'pass'`，旧实现里一次 `ABORT_ERR` 就等于用户 503（实测 `2026-11-07T06:14:57` id=`1f882cda`）。设 `0` 回退旧行为 |
+| `GATE_BILLING_POLICY` | `warn` | 计费恒等式不成立时的处置（2026-11-07 补文档）：`warn` 只记 `billingCost@warn` 等软告警；`retry` 升为 hard 并进入 `GATE_FP_POLICY` 的 retry 流程。**默认保持 `warn`**：上游单价会在 1×/2× 之间整段切换（见 `docs/BASELINE.md` B26），升 hard 会让每个非流式请求白重发 |
 | `GATE_PROBE_DEADLINE_MS` | 未设（自适应） | 仅用于固定探针上限 |
 | `GATE_PROBE_DEADLINE_K` | 3 | 自适应系数：`deadline = clamp(K×EWMA, MIN, MAX)` |
 | `GATE_PROBE_DEADLINE_MIN` | 8000 | 下限（2026-11-05 文档对齐代码；旧文档写 5000） |
