@@ -19,7 +19,7 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 > **本项目不在 npm 发布。**`package.json` 是 `private: true`，`opencode-ds-route` 这个包名在 npm 上没有对应本项目。
 > 任何 `npm i opencode-ds-route` 装到的都是**别人上传的包**，与这里无关。请只从
 > [Releases](https://github.com/ikaros333/opencode-ds-route/releases) 或 `git clone` 获取。
-`v0.1.9` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
+`v0.1.10` · Windows only（仅在 Windows 11 验证）· Node ≥ 22 · 0 依赖 · MIT
 
 在 `127.0.0.1:8787` 起一层本地门控：**对每个响应做身份判定 —— 有强反面证据（异模型 id 形态、伪造 `resp_`、缓存块不匹配）就拒绝；证据不足时放行，但如实标注为 `unverified`。**
 
@@ -57,17 +57,16 @@ node bin\ocg.mjs stop        # 优雅停止：写 stop.flag，监护进程不再
 
 **第 1 步 · 下载**
 
-去 [Releases · v0.1.9](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.9) 下载
-`opencode-ds-route-v0.1.9.zip`；或用 `git clone` 拉取仓库。
+去 [Releases · v0.1.10](https://github.com/ikaros333/opencode-ds-route/releases/tag/v0.1.10) 下载
+`opencode-ds-route-v0.1.10.zip`；或用 `git clone` 拉取仓库。
 
 > **只从本仓库的 Release 下载。** 这个程序会经手你的 key，fork 或第三方转载的包可能被改过。
 
 下载后先校验，一致再解压：
 
 ```powershell
-Get-FileHash .\opencode-ds-route-v0.1.9.zip -Algorithm SHA256
-# 期望值（与 SHA256SUMS.txt 一致）：
-# F8A9FDA46C3822E79AEF615AD7E053EEB28A628DE1358AC592CEE5FF873E1C4A
+Get-FileHash .\opencode-ds-route-v0.1.10.zip -Algorithm SHA256
+# 期望值（与 Release 页的 SHA256SUMS.txt 一致；README 不再内联哈希，避免打包后失配）
 ```
 
 > 若哈希不一致：**不要解压、不要运行 `install.ps1`**。说明包在传输中被改动过，
