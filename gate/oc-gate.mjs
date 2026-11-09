@@ -3684,7 +3684,11 @@ async function handle(req, res) {
                           lastAt: evRefresh.at || null, lastWhy: evRefresh.lastWhy,
                           lastError: evRefresh.lastError };
         // 2026-11-02：两个闸的策略分开暴露，避免"看 board 显示 label 实际已 require"的误判
-        const base = { modelPolicy: MODEL_EVIDENCE_POLICY, maxAgeMs: EVIDENCE_MAX_AGE_MS, refresh };
+        // 2026-11-09：proof 计数必须在**无快照**时也可见（CI 干净环境暴露：G33 依赖它）。
+        const proof = { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0,
+                        keyOrder: metrics.keyOrder, server: metrics.proofServer,
+                        relayMimicsOfficial: metrics.relayMimicsOfficial || 0 };
+        const base = { modelPolicy: MODEL_EVIDENCE_POLICY, maxAgeMs: EVIDENCE_MAX_AGE_MS, refresh, proof };
         if (!ev) return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: 'missing', snapshot: null };
         const ageMs = Date.now() - Date.parse(ev.at || '');
         return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: ev.endpoint?.verdict || 'unknown',
@@ -3698,10 +3702,6 @@ async function handle(req, res) {
                                        skipped: !!ev.canary.skipped,
                                        skippedReason: ev.canary.skippedReason || (ev.canary.skipped ? 'legacy_unknown' : null) } : null,
                  validate: ev.validate || null,
-                 proof: { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0,
-                          // 2026-11-05：骨架证据分布（键顺序 / server 头 / 伪装升级计数）
-                          keyOrder: metrics.keyOrder, server: metrics.proofServer,
-                          relayMimicsOfficial: metrics.relayMimicsOfficial || 0 },
                  modelFamily: ev.model?.family || 'unknown', familyScore: ev.model?.familyScore,
                  familyMax: ev.model?.familyMax, at: ev.at };
       })(),

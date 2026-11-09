@@ -844,7 +844,15 @@ try {
         body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8, stream: true }) });
       await r.text();
     }
-    const h1 = await (await fetch(`http://127.0.0.1:${P0 + 19}/gate/health`)).json();
+    const h1 = await (async () => {
+      let h = null;
+      for (let i = 0; i < 40; i++) {
+        h = await (await fetch(`http://127.0.0.1:${P0 + 19}/gate/health`)).json().catch(() => null);
+        if ((h?.fingerprint?.breaker?.stream?.samples || 0) >= 6) return h;
+        await sleep(100);
+      }
+      return h;
+    })();
     // 2026-11-02：改为按模式隔离验证——流式坏流必须能被**流式**断路器看到，
     // 但不得污染 json 断路器（否则单份状态会让熔断对真实流量失效或误伤非流式）。
     check('G19 流式坏流只打流式断路器（json 仍 closed）',
@@ -1600,7 +1608,13 @@ try {
         body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }) });
       const proof = r.headers.get('x-gate-proof');
       await r.text();
-      const h = await (await fetch(`http://127.0.0.1:${port}/gate/health`)).json().catch(() => null);
+      // 2026-11-09：健康字段可能在响应结束后才落账；干净 CI 上轮询到 proof 计数出现为止。
+      let h = null;
+      for (let i = 0; i < 30; i++) {
+        h = await (await fetch(`http://127.0.0.1:${port}/gate/health`)).json().catch(() => null);
+        if (h?.evidence?.proof) break;
+        await sleep(100);
+      }
       const led = fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       try { g.child.kill('SIGKILL'); } catch {}
       return { status: r.status, proof, h, led };
