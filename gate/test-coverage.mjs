@@ -248,6 +248,9 @@ const mock = http.createServer((req, res) => {
         res.write(frame('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'ok', sequence_number: seq++ }));
         res.write(frame('response.completed', { response: { id: sid, object: 'response', status: 'completed', created_at: 1, model: 'deepseek-v4.1-flash', output: [{ id: 'msg_' + UUID4HEX, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok', annotations: [], logprobs: null }] }], usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2, cost: 0, opencode: {} } }, sequence_number: seq++ }));
       }
+      // 2026-11-09：CI（更快的机器）上整个流会在 peek 阶段就结束，gate 的 tap 来不及挂，
+      // 导致流式断路器 samples=0。这里延迟 50ms 结束，模拟真实流式时序。
+      if (mode === 'streambad') return setTimeout(() => { try { res.end(); } catch {} }, 50);
       return res.end();
     }
     if (mode === 'noid') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ object: 'response' })); }
