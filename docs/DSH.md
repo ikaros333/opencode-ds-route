@@ -28,6 +28,62 @@ node bin\ocg.mjs setup dsh
       # 原有 provider（例如直连的 opencode-go）保持在同一个 providers 下，不要删
 ```
 
+## 可选：Messages 备选模型（2026-11-08）
+
+`messages` 是唯一在某些时间窗里能证明「请求到达官方参数校验器」的通道（B22 窗口 A）。
+门控新增了一个**手动备选**：只有 `msgfp/M6` 预检通过时才交付，窗口不符一律 503。
+
+```yaml
+      ocg-gated-msg:
+        displayName: "OpenCode Go · Messages（备选·需预检通过）"
+        apiKeyEnv: OCG_PLACEHOLDER_KEY
+        api: anthropic-messages
+        baseURL: http://127.0.0.1:8787        # 注意：不带 /v1，dsh 自己拼 /v1/messages
+        headers:
+          x-gate-token: "<你的 GATE_TOKEN>"
+        models:
+          - id: deepseek-flash
+```
+
+启用条件：
+
+```
+GATE_ALLOW_MESSAGES=1
+GATE_MSG_PROVIDER=1
+```
+
+行为：
+
+- 预检 pass（九条官方文案 + m10 随机 role 精确回声 + UUID4 `request_id` 全对）→ 交付，台账记 `MSG_PROVIDER_DELIVER`；
+- 预检 fail（窗口 B/C）→ 503 `gate_no_official_route`，错误体带 `precheck.detail`（含 `m10:echo` 等）；
+- 非流式成功响应再查 `cache_read_input_tokens % 128 == 0`，不符 → 503 `gate_msg_cache_block`；
+- 流式不做 usage 级缓存检查（实测车道流式 usage 全 0），只做预检 + id 形态；
+- 成功信封评分：有 `service_tier` 记 `MSG_ENVELOPE_OFFICIAL`，只有 `cost/opencode` 记 `MSG_ENVELOPE_RELAY`，不阻断；
+- 不会自动切换：dsh 里是两个模型条目，由你手动选。
+
+> 2026-11-08 实测：当前 messages 窗口为「32hex + 网关自有校验」（C 窗口），
+> `msgfp fingerprint=400,200,200,200,200,400,400,400,400` ≠ 基线，因此现在切过去会 503。
+> 这是预期行为：没有官方校验器证据时不交付。
+
+### 怎么知道此刻能不能用
+
+```powershell
+ocg msg-status            # 读缓存，0 token
+ocg msg-status --refresh  # 现场跑 Tier0（约 30 token；通过后自动跑全量 10 条）
+```
+
+或直接读：
+
+```
+GET http://127.0.0.1:8787/gate/msg-status
+```
+
+- `usable=true` / `state=A` → 现在可切；
+- `usable=false` → 不可用，`detail` 会指出 `m10:echo` / `text` / `net`；
+- `state=unknown` → 探针瞬时故障，稍后重试。
+
+后台每 5 分钟刷新一次，且只在最近 10 分钟有业务时跑。
+
 ## ⚠ 不要新加第二个 `- id: llm-pi-ai` 条目
 
 2026-10-23 实测（`dsh --dump-config`，改前备份、改后哈希还原）：

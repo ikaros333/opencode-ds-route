@@ -255,14 +255,14 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
 const PHASE_KEEP = 300;
 // 键序判形只需前缀顺序；见 baseline.topLevelKeyOrder 的 maxKeys 说明（避免 24 MiB 全量扫描）
 const KEY_ORDER_SCAN_KEYS = 12;
-const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], total: [] };
+const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], ttfb: [], total: [] };
 function notePhase(p) {
   const put = (k, v) => {
     if (!Number.isFinite(v) || v < 0) return;
     const a = phaseStats[k]; a.push(Math.round(v)); if (a.length > PHASE_KEEP) a.shift();
   };
   put('precheck', p.precheckMs); put('upstream', p.upstreamMs);
-  put('gate', p.gateMs); put('stream', p.streamMs); put('total', p.totalMs);
+  put('gate', p.gateMs); put('stream', p.streamMs); put('ttfb', p.ttfbMs); put('total', p.totalMs);
 }
 const pctOf = (a, q) => {
   if (!a || !a.length) return null;
@@ -274,6 +274,9 @@ const phaseView = () => ({
   precheckMs: { p50: pctOf(phaseStats.precheck, 0.5), p90: pctOf(phaseStats.precheck, 0.9) },
   upstreamMs: { p50: pctOf(phaseStats.upstream, 0.5), p90: pctOf(phaseStats.upstream, 0.9) },
   gateMs:     { p50: pctOf(phaseStats.gate, 0.5),     p90: pctOf(phaseStats.gate, 0.9) },
+  // ★ 2026-11-08：ttfbMs = 请求进来到响应头写完（≈ 客户端看到首字节的时间）；
+  // totalMs 含流式回传。两者分列，避免"同名不同义"（台账写头前 / health 含回传）。
+  ttfbMs:     { p50: pctOf(phaseStats.ttfb, 0.5),     p90: pctOf(phaseStats.ttfb, 0.9) },
   streamMs:   { p50: pctOf(phaseStats.stream, 0.5),   p90: pctOf(phaseStats.stream, 0.9) },
   totalMs:    { p50: pctOf(phaseStats.total, 0.5),    p90: pctOf(phaseStats.total, 0.9) },
 });
@@ -422,6 +425,12 @@ if (process.env.GATE_TRACE === '1') {
 }
 // 与 dsh 的重试窗口（约 27s）对齐：等太久只会让 dsh 重发、上游白烧配额
 const UPSTREAM_TIMEOUT_MS = num('GATE_UPSTREAM_TIMEOUT_MS', 60000, { min: 1000, max: 600000 });
+// ★ 2026-11-08：流式请求的「等响应头」watchdog。
+// 动机（11-08 14:28 实测）：上游 108 秒没有返回任何 HTTP 头，请求一直占着 MAX_CONC 槽位到
+// UPSTREAM_TIMEOUT_MS(120s)。流式请求的头本该在 1–2 秒内到达（实测 TTFB 1.6–2.0s），
+// 所以给它一个独立的 30s 上限；超时即释放槽位。
+// **只对流式生效**：非流式响应的头要等整段生成完才到（实测 16K token 需 44s），不能套用该阈值。
+const UPSTREAM_HEADERS_TIMEOUT_MS = num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 30000, { min: 0, max: 600000 });
 // 响应头到达后，body 阶段允许的**无数据**间隔。只要还有字节流入就不断。
 //
 // 为什么需要它：Node 的 req.setTimeout 是 socket 空闲超时，不是总时长。而非流式请求
@@ -1036,10 +1045,12 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
     const started = Date.now();
     let settledFlag = false;
     let hardTimer = null;
+    let headersTimer = null;
     const settle = (v) => {
       if (settledFlag) return;
       settledFlag = true;
       if (hardTimer) { try { clearTimeout(hardTimer); } catch {} hardTimer = null; }
+      if (headersTimer) { try { clearTimeout(headersTimer); } catch {} headersTimer = null; }
       resolve(v);
     };
     // ★ 2026-10-23：硬上限必须**同时**受单请求预算约束。
@@ -1057,6 +1068,8 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
     if (hardTimer && typeof hardTimer.unref === 'function') hardTimer.unref();
     let reqRef = null;
     const req = transport.request({ host: HOST, port: HOST_PORT, path: pathName, method: 'POST', headers, signal }, async (res) => {
+      // ★ 2026-11-08：响应头已到 → 清除「等头」watchdog（仅流式请求会设置）。
+      if (headersTimer) { try { clearTimeout(headersTimer); } catch {} headersTimer = null; }
       // ★ 响应头已到 = 后端已开始响应。此刻必须**清除「等待响应头」的空闲超时**。
       //
       // Node 的 req.setTimeout 是 socket 空闲超时，不是总时长。而非流式请求在上游把
@@ -1224,6 +1237,18 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
     // 与 dsh 的重试窗口（约 27 秒）对齐：等太久只会让 dsh 重发、上游白烧配额
     req.setTimeout(timeoutMs || UPSTREAM_TIMEOUT_MS, () => req.destroy(new Error('upstream timeout')));
     req.end(payload);
+    // ★ 2026-11-08：流式请求等头 watchdog（只对流式生效）。
+    // 头在 1–2 秒内本该到；超过 30s（可配）说明这条连接卡住，释放槽位，避免 6 条僵尸占满 MAX_CONC。
+    if (body && body.stream === true && UPSTREAM_HEADERS_TIMEOUT_MS > 0) {
+      headersTimer = setTimeout(() => {
+        if (settledFlag) return;
+        log({ ts: new Date().toISOString(), result: 'ATTEMPT_HEADERS_TIMEOUT', model,
+              elapsedMs: Date.now() - started, capMs: UPSTREAM_HEADERS_TIMEOUT_MS });
+        settle({ verdict: 'error', status: 0, error: 'headers_timeout', model, ms: Date.now() - started });
+        try { req.destroy(new Error('headers timeout')); } catch {}
+      }, UPSTREAM_HEADERS_TIMEOUT_MS);
+      if (headersTimer && typeof headersTimer.unref === 'function') headersTimer.unref();
+    }
   });
 }
 
@@ -1489,6 +1514,49 @@ const MSG_PROBES = [
   { id: 'm9', body: { max_tokens: 8, messages: [{ role: 'user', content: 12345 }] } },
 ];
 
+// ★ 2026-11-08：messages 备选通道（dsh 侧手动选择的第二个模型）。
+// 默认关闭；开启后 messages 成功响应不再一律按 third 拒绝，而是要求：
+//   · 本协议预检（msgfp / M6）pass —— 证明这条消息路径通到「会做官方参数校验」的实现；
+//   · id 形态属于 messages 家族（msg_hex / 53hex / UUID4），gw-/chatcmpl 仍拒绝；
+// 代价：该窗口小时级轮换（B22 窗口 A/B/C），不通过时一律 503，符合「只在有官方证据时放行」。
+const MSG_PROVIDER = flag('GATE_MSG_PROVIDER', false);
+const MSG_DELIVERABLE_SHAPES = new Set(['msg_hex', 'other', 'HEX32', 'UUID4', 'UUID']);
+// ★ 2026-11-08：messages 可用性指示器。Tier0 = 单条随机 role 回声（~30 token），
+// 失败即可判定「当前窗口不可用」；Tier1 = 全量 10 条，只在 Tier0 通过后跑。
+const MSG_STATUS = {
+  usable: false, state: 'unknown', checkedAt: null, ms: 0, tier: 0,
+  echoOk: false, fingerprint: '', detail: '尚未检查', lastPassAt: null, source: 'none',
+};
+// 2026-11-08：指示器后台刷新。默认 5 分钟一次，且只在最近 10 分钟有业务时跑（空闲不花 token）。
+const MSG_STATUS_MS = num('GATE_MSG_STATUS_MS', 300000, { min: 0, max: 3600000 });
+const MSG_STATUS_ACTIVE_MS = num('GATE_MSG_STATUS_ACTIVE_MS', 600000, { min: 0, max: 86400000 });
+
+// ★ 2026-11-08：messages「官方校验器文案」判据。比九项状态码强得多：
+// 官方 Anthropic 兼容端点的九条错误文案是固定句式 + UUID4 request_id + 无 `Upstream request failed` 包装。
+// 实测（2026-11-08，api.deepseek.com/anthropic/v1/messages）：
+//   m1 Invalid max_tokens value, the valid range of max_tokens is [1, 393216]
+//   m2/m3 Invalid temperature value, the valid range of temperature is [0, 2]
+//   m4/m5 Invalid top_p value, the valid range of top_p is (0, 1.0]
+//   m6 messages: at least one message is required
+//   m7/m8/m9 Failed to deserialize the JSON body into the target type: ...
+// 车道 C 窗口（2026-11-08 实测）是 200/200/… 或网关包装文案，全部对不上。
+const MSG_OFFICIAL_TEXT = flag('GATE_MSG_OFFICIAL_TEXT', true);
+const MSG_TEXT_RULES = {
+  m1: { code: 400, re: /Invalid max_tokens value, the valid range of max_tokens is \[1, 393216\]/ },
+  m2: { code: 400, re: /Invalid temperature value, the valid range of temperature is \[0, 2\]/ },
+  m3: { code: 400, re: /Invalid temperature value, the valid range of temperature is \[0, 2\]/ },
+  m4: { code: 400, re: /Invalid top_p value, the valid range of top_p is \(0, 1\.0\]/ },
+  m5: { code: 400, re: /Invalid top_p value, the valid range of top_p is \(0, 1\.0\]/ },
+  m6: { code: 400, re: /messages: at least one message is required/ },
+  m7: { code: 422, re: /Failed to deserialize the JSON body into the target type: messages\[0\]\.role: unknown variant `wizard`, expected one of `user`, `assistant`, `system`/ },
+  m8: { code: 422, re: /Failed to deserialize the JSON body into the target type: missing field `messages`/ },
+  m9: { code: 422, re: /Failed to deserialize the JSON body into the target type: messages\[0\]\.content: expected a string or a list/ },
+};
+const MSG_REQ_ID_RE = /\(request_id:\s*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\)/i;
+const MSG_GATEWAY_WRAP_RE = /Upstream request failed|\bgw-[0-9a-z]/i;
+
+
+
 // ★ 2026-10-22 修复：探针必须带「总时长」上限（signal），不能只靠 timeout。
 //   Node 的 req.setTimeout 是 socket **空闲**超时；上游慢速滴流（或握手期持续有字节）时永不触发，
 //   整次预检会挂到外层 PRECHECK_WAIT_MS 才被切断 → 判定 timeout → 误拦官方流量。
@@ -1558,6 +1626,225 @@ async function runMsgFingerprint() {
             `${probeErrs.size ? ` 错误[${[...probeErrs].map(([k, v]) => k + ':' + v).join(' ')}]` : ''}`,
     fingerprint: codes.join(','),
   };
+}
+
+/** 2026-11-08：官方 messages 文案探针（带 body，用于文案 + request_id 校验）。 */
+function msgTextProbe(p) {
+  return new Promise((resolve) => {
+    const payload = Buffer.from(JSON.stringify({ model: ALLOWED[0], ...p.body }), 'utf8');
+    const req = transport.request({
+      host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/messages', method: 'POST',
+      timeout: probeDeadlineMs(), signal: AbortSignal.timeout(probeDeadlineMs()),
+      headers: { 'content-type': 'application/json', 'content-length': payload.length,
+                 'x-api-key': KEY, 'anthropic-version': '2023-06-01',
+                 'x-opencode-session': STABLE_SESSION },
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { if (body.length < 8192) body += d; });
+      res.on('end', () => resolve({ id: p.id, code: res.statusCode, body }));
+    });
+    req.on('error', (e) => { probeErrs.set(p.id, e?.code || e?.name || String(e?.message || e)); resolve({ id: p.id, code: -1, body: '' }); });
+    req.on('timeout', () => { try { req.destroy(); } catch {} resolve({ id: p.id, code: -1, body: '' }); });
+    req.end(payload);
+  });
+}
+
+/** 2026-11-08：官方文案判据。九条全对（状态码 + 固定句式 + UUID4 request_id + 无网关包装）才算 pass。 */
+const MSG_ECHO_PREFIX = 'wizard_';
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+function runPool(items, limit, fn) {
+  return new Promise((resolve) => {
+    const out = new Array(items.length);
+    if (!items.length) return resolve(out);
+    let next = 0, done = 0;
+    const pump = () => {
+      if (next >= items.length) return;
+      const i = next++;
+      Promise.resolve().then(() => fn(items[i], i)).then((v) => { out[i] = v; })
+        .catch(() => { out[i] = null; })
+        .finally(() => { done++; if (done === items.length) resolve(out); else pump(); });
+    };
+    for (let k = 0; k < Math.min(limit, items.length); k++) pump();
+  });
+}
+async function msgTextProbeRetry(p) {
+  let r = await msgTextProbe(p);
+  // 503/429/timeout 是「本次不可判定」，不是「文案不符」；重试一次，避免窗口 A 被瞬时故障误杀。
+  if (r.code === -1 || r.code === 429 || (r.code >= 500 && r.code <= 599)) {
+    await sleepMs(350);
+    r = await msgTextProbe(p);
+  }
+  return r;
+}
+async function runMsgOfficialText() {
+  // 动态挑战：每次随机 role，官方会把它原样回显在 unknown variant 文案里。
+  // 静态伪造九段文案容易，回显任意随机串要求真正实现了反序列化枚举校验。
+  const echo = MSG_ECHO_PREFIX + crypto.randomBytes(4).toString('hex');
+  const probes = [...MSG_PROBES, { id: 'm10', body: { max_tokens: 8, messages: [{ role: echo, content: 'hi' }] } }];
+  const rows = await runPool(probes, 3, msgTextProbeRetry);
+  const bad = [];
+  let net = 0;
+  for (const r of rows) {
+    if (!r) { bad.push('probe:null'); net++; continue; }
+    const body = String(r.body || '');
+    const isNet = r.code === -1 || r.code === 429 || (r.code >= 500 && r.code <= 599);
+    if (r.id === 'm10') {
+      const ok = r.code === 422 && body.includes(echo) && MSG_REQ_ID_RE.test(body) && !MSG_GATEWAY_WRAP_RE.test(body);
+      if (!ok) { bad.push('m10:echo'); if (isNet) net++; }
+      continue;
+    }
+    const rule = MSG_TEXT_RULES[r.id];
+    if (!rule) { bad.push(r.id + ':norule'); continue; }
+    const codeOk = r.code === rule.code;
+    const textOk = rule.re.test(body);
+    const idOk = MSG_REQ_ID_RE.test(body);
+    const wrapBad = MSG_GATEWAY_WRAP_RE.test(body);
+    if (!codeOk || !textOk || !idOk || wrapBad) {
+      bad.push(`${r.id}:${r.code}${textOk ? '' : ':text'}${idOk ? '' : ':reqid'}${wrapBad ? ':wrap' : ''}`);
+      if (isNet) net++;
+    }
+  }
+  const fp = rows.map((r) => (r ? r.code : -1)).join(',');
+  const detail = bad.length
+    ? `official-text ✗ ${bad.join(',')}${net ? ` net=${net}` : ''}`
+    : 'official-text ✓ (10/10, echo ok)';
+  if (MSG_PROVIDER) {
+    const ok = !bad.length;
+    Object.assign(MSG_STATUS, {
+      usable: ok, state: ok ? 'A' : 'unusable', checkedAt: new Date().toISOString(),
+      ms: 0, tier: 1, echoOk: !bad.some((x) => x.startsWith('m10')),
+      fingerprint: fp, detail, source: 'precheck',
+    });
+    if (ok) MSG_STATUS.lastPassAt = MSG_STATUS.checkedAt;
+  }
+  return {
+    id: 'msgtext',
+    verdict: bad.length ? 'fail' : 'pass',
+    ms: 0,
+    detail,
+    fingerprint: fp,
+    echo,
+  };
+}
+
+async function runMsgEchoProbe() {
+  const echo = MSG_ECHO_PREFIX + crypto.randomBytes(4).toString('hex');
+  const t0 = Date.now();
+  const r = await msgTextProbeRetry({ id: 'm10', body: { max_tokens: 8, messages: [{ role: echo, content: 'hi' }] } });
+  const body = String(r.body || '');
+  const ok = r.code === 422 && body.includes(echo) && MSG_REQ_ID_RE.test(body) && !MSG_GATEWAY_WRAP_RE.test(body);
+  return { ok, code: r.code, ms: Date.now() - t0, echo, detail: ok ? 'echo ✓' : `echo ✗ code=${r.code}` };
+}
+
+async function refreshMsgStatus() {
+  const t0 = Date.now();
+  const e = await runMsgEchoProbe();
+  const at = new Date().toISOString();
+  if (!e.ok) {
+    const net = e.code === -1 || e.code === 429 || (e.code >= 500 && e.code <= 599);
+    Object.assign(MSG_STATUS, {
+      usable: false, state: net ? 'unknown' : 'unusable', checkedAt: at,
+      ms: Date.now() - t0, tier: 0, echoOk: false, fingerprint: String(e.code),
+      detail: e.detail, source: 'live',
+    });
+    return MSG_STATUS;
+  }
+  const full = await runMsgOfficialText();
+  const ok = full.verdict === 'pass';
+  Object.assign(MSG_STATUS, {
+    usable: ok, state: ok ? 'A' : 'unusable', checkedAt: new Date().toISOString(),
+    ms: Date.now() - t0, tier: 1, echoOk: true, fingerprint: full.fingerprint,
+    detail: full.detail, source: 'live',
+  });
+  if (ok) MSG_STATUS.lastPassAt = MSG_STATUS.checkedAt;
+  return MSG_STATUS;
+}
+
+function msgStatusView() {
+  if (!MSG_STATUS.checkedAt) {
+    const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+    const v = ev?.validate?.messages;
+    if (v) {
+      const at = ev.at || null;
+      return {
+        ...MSG_STATUS,
+        usable: v.status === 'pass',
+        state: v.status === 'pass' ? 'A' : 'unusable',
+        checkedAt: at, ageMs: at ? Date.now() - Date.parse(at) : null,
+        detail: `证据快照 validate.messages=${v.status} score=${v.score}/${v.max}`,
+        source: 'evidence', fingerprint: '', echoOk: false, tier: 0,
+      };
+    }
+  }
+  return {
+    ...MSG_STATUS,
+    ageMs: MSG_STATUS.checkedAt ? Date.now() - Date.parse(MSG_STATUS.checkedAt) : null,
+    intervalMs: MSG_STATUS_MS, activeWindowMs: MSG_STATUS_ACTIVE_MS,
+  };
+}
+
+let msgStatusTimer = null;
+let msgStatusRunning = false;
+async function msgStatusTick() {
+  if (!MSG_PROVIDER || MSG_STATUS_MS <= 0) return;
+  const idle = Date.now() - (PROBE_STATE.lastBusinessAt || 0) > MSG_STATUS_ACTIVE_MS;
+  if (idle) {
+    log({ ts: new Date().toISOString(), result: 'MSG_STATUS_SKIP', reason: 'idle',
+          idleMs: Date.now() - (PROBE_STATE.lastBusinessAt || 0), activeWindowMs: MSG_STATUS_ACTIVE_MS });
+    return;
+  }
+  if (msgStatusRunning) return;
+  msgStatusRunning = true;
+  const t0 = Date.now();
+  try {
+    await refreshMsgStatus();
+    log({ ts: new Date().toISOString(), result: 'MSG_STATUS_CHECK', usable: MSG_STATUS.usable,
+          state: MSG_STATUS.state, tier: MSG_STATUS.tier, ms: Date.now() - t0, detail: MSG_STATUS.detail });
+  } catch (e) {
+    log({ ts: new Date().toISOString(), result: 'MSG_STATUS_CHECK_ERROR', error: String(e?.message || e) });
+  } finally {
+    msgStatusRunning = false;
+  }
+}
+function scheduleMsgStatus(delayMs = MSG_STATUS_MS) {
+  if (!MSG_PROVIDER || MSG_STATUS_MS <= 0) return;
+  clearTimeout(msgStatusTimer);
+  msgStatusTimer = setTimeout(async () => {
+    await msgStatusTick();
+    scheduleMsgStatus(MSG_STATUS_MS);
+  }, Math.max(1000, delayMs));
+  msgStatusTimer.unref?.();
+}
+
+/**
+ * 2026-11-08：messages 体级判据 —— cache_read_input_tokens 必须是 128 的倍数。
+ * 与 responses 的 cached_tokens 同理：vLLM 默认 16 / SGLang 默认 1 对不上。
+ */
+function msgCacheMisaligned(r) {
+  // 2026-11-08 实测：messages 流式 usage 全 0（车道不报真实用量），按流式 body 查块只会假通过。
+  if (r.stream) return null;
+  try {
+    const txt = Buffer.concat(r.buffered || []).toString('utf8');
+    const j = JSON.parse(txt);
+    const c = j?.usage?.cache_read_input_tokens;
+    if (typeof c === 'number' && c > 0 && c % CACHE_BLOCK_SIZE !== 0) return { cached: c };
+  } catch {}
+  return null;
+}
+
+/**
+ * 2026-11-08：messages 成功信封评分（不阻断）。
+ * 官方非流式 usage 带 service_tier；车道只有 cost/opencode。流式只做有无判定。
+ */
+function msgEnvelopeOf(r) {
+  try {
+    const txt = Buffer.concat(r.buffered || []).toString('utf8');
+    if (!txt) return null;
+    if (/"service_tier"\s*:\s*"/.test(txt)) return 'official';
+    if (/"opencode"\s*:/.test(txt) || /"cost"\s*:/.test(txt)) return 'relay';
+  } catch {}
+  return null;
 }
 
 /**
@@ -2016,6 +2303,9 @@ async function runImplVector() {
   // 实测全台账命中基线 0 次 / 误报 131 次。
   const stableHead = vec.split(',').slice(0, IMPL_VECTOR_STABLE.length).join(',');
   const drift = stableHead !== IMPL_VECTOR_STABLE.join(',');
+  // ★ 2026-11-08：稳定位出现 ERR 表示「没问到」（超时/连接失败），不是实现变了。
+  // 实测（11-08 04:24:26）：5 项全 ERR 仍被报成 IMPL_VECTOR_DRIFT，把网络故障记成了漂移。
+  const probeErr = stableHead.split(',').includes('ERR');
   const goStack = rows.some(r => r.goStack);
   metrics.implVectorChecks = (metrics.implVectorChecks || 0) + 1;
   if (goStack) {
@@ -2023,7 +2313,11 @@ async function runImplVector() {
     pushAlert('IMPL_GO_STACK', { vector: vec, rows });
     log({ ts: new Date().toISOString(), result: 'IMPL_GO_STACK', vector: vec, rows });
   }
-  if (drift) {
+  if (probeErr) {
+    metrics.implVectorProbeErr = (metrics.implVectorProbeErr || 0) + 1;
+    log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_PROBE_ERR', vector: vec,
+          stable: IMPL_VECTOR_STABLE.join(','), rows });
+  } else if (drift) {
     metrics.implVectorDrift = (metrics.implVectorDrift || 0) + 1;
     pushAlert('IMPL_VECTOR_DRIFT', { vector: vec, stable: IMPL_VECTOR_STABLE.join(','), baseline: IMPL_VECTOR_2026_10_27, rows });
     log({ ts: new Date().toISOString(), result: 'IMPL_VECTOR_DRIFT', vector: vec, stable: IMPL_VECTOR_STABLE.join(','), baseline: IMPL_VECTOR_2026_10_27 });
@@ -2060,6 +2354,120 @@ async function runImplVector() {
 const CACHE_PROBE_TEXT = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo '.repeat(20);
 const CACHE_PROBE_MIN_INPUT = 256;   // 低于此值 cached 必然为 0，不能据此判 no_cache_impl
 const CACHE_PROBE_STATE = { at: null, ok: null, reason: null, cached: 0, input: null, runs: 0, ms: 0 };
+
+// ★ 2026-11-08：探测驱动的三段状态机（normal / suspect / confirm）+ 活动门控 + sentinel。
+// 依据（11-08 测试 + 模拟）：
+//   · 缩短探测间隔是唯一「零用户体验代价」的检测加速器（3min 比 10min 把 f=0.2 的发现时间从 44min 压到 13.5min）；
+//   · 均匀采样缓冲在同等发现时间下每条多付 1.5s，且探测本身已覆盖同一池（B1/B2/B3 全局缓存），不划算；
+//   · 自适应全缓冲会把 70–87% 请求拖慢 12–15s，只在确认后做 fail-closed 才有意义。
+// 因此这里的策略是：稳态只探不缓；可疑时探得更勤、只缓 3 条业务请求做确认；确认后直接 503。
+const CACHE_PROBE_MS = num('GATE_CACHE_PROBE_MS', 600000, { min: 0, max: 86400000 });
+const PROBE_ADAPTIVE = flag('GATE_PROBE_ADAPTIVE', true);
+const STRICT_REJECT = flag('GATE_STRICT_REJECT', true);
+const PROBE_ACTIVE_WINDOW_MS = num('GATE_PROBE_ACTIVE_WINDOW_MS', 600000, { min: 0, max: 86400000 });
+const PROBE_MS_SUSPECT = num('GATE_PROBE_MS_SUSPECT', 90000, { min: 1000, max: 86400000 });
+const PROBE_MS_CONFIRM = num('GATE_PROBE_MS_CONFIRM', 60000, { min: 1000, max: 86400000 });
+const SENTINEL_N = num('GATE_SENTINEL_N', 3, { min: 0, max: 100 });
+const CONFIRM_ON = num('GATE_CONFIRM_ON', 2, { min: 1, max: 10 });
+const CONFIRM_MIN_MS = num('GATE_CONFIRM_MIN_MS', 900000, { min: 0, max: 86400000 });
+const PROBE_STATE = { state: 'normal', driftStreak: 0, goodStreak: 0, sentinelLeft: 0,
+  confirmUntil: 0, lastProbeAt: 0, lastBusinessAt: Date.now(), skippedIdle: 0, transitions: 0 };
+let probeTimer = null;
+let probeRunning = false;
+
+function probeSetState(next, why) {
+  if (PROBE_STATE.state === next) return;
+  const from = PROBE_STATE.state;
+  PROBE_STATE.state = next;
+  PROBE_STATE.transitions = (PROBE_STATE.transitions || 0) + 1;
+  log({ ts: new Date().toISOString(), result: 'PROBE_STATE', from, to: next, why,
+        driftStreak: PROBE_STATE.driftStreak, goodStreak: PROBE_STATE.goodStreak,
+        sentinelLeft: PROBE_STATE.sentinelLeft });
+  if (next === 'confirm') pushAlert('PROBE_STATE_CONFIRM', { why, driftStreak: PROBE_STATE.driftStreak });
+}
+
+function noteProbeOutcome(reason) {
+  PROBE_STATE.lastProbeAt = Date.now();
+  if (!PROBE_ADAPTIVE) return;
+  if (reason === 'ok') {
+    PROBE_STATE.goodStreak++;
+    PROBE_STATE.driftStreak = 0;
+    const confirmElapsed = PROBE_STATE.state !== 'confirm' || Date.now() >= PROBE_STATE.confirmUntil;
+    if (PROBE_STATE.state !== 'normal' && PROBE_STATE.goodStreak >= 2 && confirmElapsed) {
+      PROBE_STATE.sentinelLeft = 0;
+      probeSetState('normal', 'recovered');
+    }
+  } else if (reason === 'no_cache_impl' || reason === 'block_misaligned') {
+    PROBE_STATE.goodStreak = 0;
+    PROBE_STATE.driftStreak++;
+    if (PROBE_STATE.driftStreak >= CONFIRM_ON) {
+      PROBE_STATE.confirmUntil = Date.now() + CONFIRM_MIN_MS;
+      PROBE_STATE.sentinelLeft = 0;
+      probeSetState('confirm', reason);
+    } else {
+      PROBE_STATE.sentinelLeft = Math.max(PROBE_STATE.sentinelLeft, SENTINEL_N);
+      probeSetState('suspect', reason);
+    }
+  }
+  // probe_too_short / no_usage：只是「没问到」，不改变状态
+}
+
+// sentinel 的逐响应判负（业务格直接命中）→ 立即确认，不必等两次探测。
+function noteSentinelNegative(why) {
+  PROBE_STATE.driftStreak = Math.max(PROBE_STATE.driftStreak, CONFIRM_ON);
+  PROBE_STATE.goodStreak = 0;
+  PROBE_STATE.confirmUntil = Date.now() + CONFIRM_MIN_MS;
+  PROBE_STATE.sentinelLeft = 0;
+  probeSetState('confirm', why);
+}
+
+// 业务请求活跃度：空闲后恢复使用时，尽快补一次探测（否则要等到下一个定时点）。
+function noteBusinessActivity() {
+  const prev = PROBE_STATE.lastBusinessAt;
+  PROBE_STATE.lastBusinessAt = Date.now();
+  if (!PROBE_ADAPTIVE || PROBE_ACTIVE_WINDOW_MS <= 0) return;
+  if (Date.now() - prev > PROBE_ACTIVE_WINDOW_MS && CACHE_PROBE_MS > 0) {
+    scheduleCacheProbe(500);
+  }
+}
+
+function probeIntervalMs() {
+  if (!PROBE_ADAPTIVE) return CACHE_PROBE_MS;
+  if (PROBE_STATE.state === 'confirm') return Math.min(PROBE_MS_CONFIRM, CACHE_PROBE_MS || PROBE_MS_CONFIRM);
+  if (PROBE_STATE.state === 'suspect') return Math.min(PROBE_MS_SUSPECT, CACHE_PROBE_MS || PROBE_MS_SUSPECT);
+  return CACHE_PROBE_MS;
+}
+
+function scheduleCacheProbe(delay) {
+  if (CACHE_PROBE_MS <= 0) return;
+  if (probeTimer) { try { clearTimeout(probeTimer); } catch {} probeTimer = null; }
+  probeTimer = setTimeout(async () => {
+    probeTimer = null;
+    if (probeRunning) { scheduleCacheProbe(500); return; }
+    probeRunning = true;
+    // 活动门控：最近 activeWindow 内没有业务请求 → 本轮跳过（不发上游、不花 token）。
+    // 注意：lastBusinessAt 在启动时初始化为当前时间，所以「刚启动」那一轮一定会跑。
+    const idle = PROBE_ACTIVE_WINDOW_MS > 0
+      && Date.now() - PROBE_STATE.lastBusinessAt > PROBE_ACTIVE_WINDOW_MS;
+    if (idle) {
+      PROBE_STATE.skippedIdle = (PROBE_STATE.skippedIdle || 0) + 1;
+      metrics.probeSkippedIdle = (metrics.probeSkippedIdle || 0) + 1;
+      log({ ts: new Date().toISOString(), result: 'CACHE_PROBE_SKIP', reason: 'idle',
+            idleMs: Date.now() - PROBE_STATE.lastBusinessAt });
+    } else {
+      const tProbe = Date.now();
+      try { await runCacheProbe(); } catch {}
+      probeRunning = false;
+      // 固定节拍：把本轮耗时从下个间隔里扣掉，避免「探测耗时把周期越拖越长」。
+      const spent = Date.now() - tProbe;
+      scheduleCacheProbe(Math.max(200, probeIntervalMs() - spent));
+      return;
+    }
+    probeRunning = false;
+    scheduleCacheProbe(probeIntervalMs());
+  }, Math.max(0, delay | 0));
+  if (probeTimer && typeof probeTimer.unref === 'function') probeTimer.unref();
+}
 
 function cacheProbeOnce(payloadObj) {
   return new Promise((resolve) => {
@@ -2105,6 +2513,7 @@ async function runCacheProbe() {
     CACHE_PROBE_STATE.reason = 'no_usage';
     metrics.cacheProbeNoUsage = (metrics.cacheProbeNoUsage || 0) + 1;
     log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE_SKIP', reason: 'no_usage', ms: CACHE_PROBE_STATE.ms });
+    noteProbeOutcome('no_usage');
     return;
   }
   const caches = runs.map(r => (r.usage.input_tokens_details || {}).cached_tokens ?? 0);
@@ -2131,6 +2540,7 @@ async function runCacheProbe() {
           cached: maxCached, block: CACHE_BLOCK_SIZE, remainder: maxCached % CACHE_BLOCK_SIZE,
           runs: runs.length, ms: CACHE_PROBE_STATE.ms });
   }
+  noteProbeOutcome(reason);
 }
 
 function runOnePrecheckCase(c) {
@@ -2240,7 +2650,10 @@ function precheck(proto = 'responses', opts = {}) {
     if (strategy === 'logprob') return runChatPrecisionProbe().then(r => [r]);
     // 2026-10-27 冻结版：responses 用形态探针（稳定特征），不再用错误文案探针。
     if (strategy === 'shape') return runShapeProbe(lane, opts.shapeDeadlineMs || 0).then(r => [r]);
-    if (strategy === 'msgfp') return runMsgFingerprint().then(r => [r]);
+    if (strategy === 'msgfp') {
+      if (MSG_PROVIDER && MSG_OFFICIAL_TEXT) return runMsgOfficialText().then(r => [r]);
+      return runMsgFingerprint().then(r => [r]);
+    }
     return Promise.resolve([]);
   }
 
@@ -2767,6 +3180,12 @@ async function refreshMatrix() {
   // 50 条环形缓冲会被噪音占满，反而把 responses/messages 的真告警挤掉。
   // chat 的官方性由 proof（logprob 精度）负责，那属于另一条独立告警线。
   for (const p of ['responses', 'messages']) {
+    // ★ 2026-11-08：被封禁的协议不推 ALL_LANES_DEGRADED。
+    // 实测（11-08 04:29:24）：messages 本来就 503 gate_proto_blocked，它的探针 third 只是噪音，
+    // 会挤占 50 格告警环形，把 responses 的真告警挤掉。
+    if (BLOCKED_PROTOS.has(p)) { lastAlertSig.delete(p); continue; }
+    // messages 备选通道开启时，它的窗口本就是「时好时坏」；每轮刷降级告警只会淹没 responses 的真告警。
+    if (p === 'messages' && MSG_PROVIDER) { lastAlertSig.delete(p); continue; }
     const rows = ALLOWED.map(m => ({ model: m, verdict: cacheGet(m, p)?.verdict || 'unknown' }));
     // ★ 告警判据修正（与 P0-1/P1-3 同源）：只有「明确的反面信号」才算降级。
     //
@@ -2980,6 +3399,7 @@ async function handle(req, res) {
 
   // 代理请求统一记录总耗时（/gate/* 自身的管理端点不计入）
   const isProxy = req.method === 'POST' && !req.url.startsWith('/gate/');
+  if (isProxy) noteBusinessActivity();
   const startedAt = Date.now();
   // 分段计时的四个时间戳（0 = 尚未发生）；见 phaseStats / phaseView
   const tPhase = { precheckDone: 0, upstreamDone: 0, headersAt: 0 };
@@ -2990,6 +3410,9 @@ async function handle(req, res) {
       upstreamMs: tPhase.precheckDone ? up - tPhase.precheckDone : up - startedAt,
       gateMs: tPhase.headersAt ? tPhase.headersAt - up : 0,
       streamMs: tPhase.headersAt ? Date.now() - tPhase.headersAt : 0,
+      // ★ 2026-11-08：TTFB = 请求进来到「交付闸写完响应头」。台账在写头前落盘时它等于 totalMs，
+      // health 在 finish 时采样则拿到真实首字节时间；与含回传的 totalMs 分列，消除同名不同义。
+      ttfbMs: tPhase.headersAt ? tPhase.headersAt - startedAt : Date.now() - startedAt,
       totalMs: Date.now() - startedAt,
     };
   };
@@ -3143,6 +3566,19 @@ async function handle(req, res) {
     }
   }
 
+  if (req.method === 'GET' && req.url.startsWith('/gate/msg-status')) {
+    const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    if (u.searchParams.get('refresh') === '1') {
+      // 刷新会真实花 token：必须带 GATE_TOKEN（未配置 token 时仅允许本机直接调用）。
+      if (GATE_TOKEN && !tokenMatches(req.headers['x-gate-token'])) {
+        return replyEarly(req, res, 401, { error: { type: 'gate_unauthorized',
+          message: '刷新 messages 状态需要 x-gate-token。' } });
+      }
+      await refreshMsgStatus();
+    }
+    return res.end(JSON.stringify(msgStatusView()));
+  }
+
   if (req.method === 'GET' && req.url === '/gate/health') {
     // 第 17 轮：health 不再只是「进程活着」，要把「能不能真服务」也暴露出来，
     // 否则 watchdog 只能看到 ok=true，发现不了「端口通但上游全 503」的假活状态。
@@ -3187,6 +3623,8 @@ async function handle(req, res) {
         idShape: lastShape.idShape || '', detail: lastShape.detail } : null,
       // 实现指纹向量（仅观测）：与基线不一致 → IMPL_VECTOR_DRIFT 告警，不影响放行
       implVector: implVector || null, implVectorBaseline: IMPL_VECTOR_2026_10_27,
+      // ★ 2026-11-08：稳定位 ERR = 探针没问到（超时/连不上），不是实现漂移
+      implVectorProbeErr: metrics.implVectorProbeErr || 0,
       // ★ 2026-11-06：缓存语义（infra 指纹）。ok=true 表示最近一次探针拿到
       // 「同一长前缀第二次命中、且命中量是 block 的整数倍」——这是默认配置的自部署做不到的。
       // ok=null 表示探针尚未跑过或上游没给 usage（不是失败）。
@@ -3206,6 +3644,36 @@ async function handle(req, res) {
         rejected: metrics.streamBufferRejected || 0,
         skipped: metrics.streamBufferSkipped || 0,
       },
+      // ★ 2026-11-08：探测驱动的三段状态机（normal / suspect / confirm）。
+      // 运维只需要看 state 与 streak：normal=只探不缓；suspect=探得勤 + 只缓冲 3 条；
+      // confirm=对 responses 直接 503，直到连续 2 次探测 good。
+      probeControl: {
+        adaptive: PROBE_ADAPTIVE, strictReject: STRICT_REJECT,
+        state: PROBE_STATE.state,
+        driftStreak: PROBE_STATE.driftStreak, goodStreak: PROBE_STATE.goodStreak,
+        sentinelLeft: PROBE_STATE.sentinelLeft, sentinelN: SENTINEL_N,
+        confirmUntil: PROBE_STATE.confirmUntil ? new Date(PROBE_STATE.confirmUntil).toISOString() : null,
+        lastProbeAt: PROBE_STATE.lastProbeAt ? new Date(PROBE_STATE.lastProbeAt).toISOString() : null,
+        lastBusinessAt: PROBE_STATE.lastBusinessAt ? new Date(PROBE_STATE.lastBusinessAt).toISOString() : null,
+        activeWindowMs: PROBE_ACTIVE_WINDOW_MS,
+        intervals: { normalMs: CACHE_PROBE_MS, suspectMs: PROBE_MS_SUSPECT, confirmMs: PROBE_MS_CONFIRM },
+        skippedIdle: PROBE_STATE.skippedIdle || 0,
+        sentinelBuffered: metrics.sentinelBuffered || 0,
+        strictRejected: metrics.strictRejected || 0,
+      },
+      // ★ 2026-11-08：messages 备选通道状态（dsh 侧手动选择）。
+      msgProvider: {
+        enabled: MSG_PROVIDER,
+        officialText: MSG_OFFICIAL_TEXT,
+        echoProbe: true,
+        delivered: metrics.msgProviderDelivered || 0,
+        cacheMisaligned: metrics.msgCacheMisaligned || 0,
+        envelopeOfficial: metrics.msgEnvelopeOfficial || 0,
+        envelopeRelay: metrics.msgEnvelopeRelay || 0,
+        deliverableShapes: [...MSG_DELIVERABLE_SHAPES],
+        requirePrecheck: true,
+      },
+      msgStatus: msgStatusView(),
       serdeFamily: lastSerdeFamily, upstreamPrefix: UPSTREAM_PREFIX, precheckProfile: lastUpstreamProfile,
       evidence: (() => {
         const ev = readEvidenceSnapshot(EVIDENCE_FILE);
@@ -3251,6 +3719,7 @@ async function handle(req, res) {
                  'cacheGtInput','reasoningGtOutput','itemId(uuid4)','itemKeys*','messageRoleStatus',
                  'incompleteReason','billingCost','billingAllowance','billingInputSplit','eventFamily'],
         mismatches: metrics.fpMismatch || 0, retried: metrics.fpRetries || 0,
+        retrySkippedCache: metrics.fpRetrySkippedCache || 0,
         soft: metrics.fpSoft || 0, streamSoft: metrics.streamSoft || 0,
         profiles: metrics.profiles,
         // N11：纯观测量（官方实测：128 token 块，最小前缀≈256，TTL≥180s）
@@ -3363,6 +3832,29 @@ async function handle(req, res) {
   // 也没有 logprobs，因此没有任何可用的前置判据 —— 只能靠 id 形态，可靠性不足。
   // 默认封禁；如需恢复，把 GATE_BLOCK_PROTOS 设为空字符串。
   // （P2-4：此处原有一个未被使用的 `const pid`，与 if 内的同名变量重复，已删除）
+  // ★ 2026-11-08：探测驱动的严格档 —— CONFIRM 状态下对 responses 直接 fail-closed。
+  // 为什么是拒绝而不是缓冲：确认后端可疑后，缓冲只会「更慢地交付可疑内容」；
+  // fail-closed 才与项目初衷一致。恢复条件由探针状态机决定（2 次连续 good）。
+  if (PROBE_ADAPTIVE && STRICT_REJECT && PROBE_STATE.state === 'confirm'
+      && protoOf(url.pathname) === 'responses') {
+    const kid = Math.random().toString(16).slice(2, 10);
+    metrics.strictRejected = (metrics.strictRejected || 0) + 1;
+    recordFailure({ kind: 'policy', type: 'gate_cache_semantics', status: 503,
+                    path: url.pathname, elapsedMs: Date.now() - startedAt });
+    log({ ts: new Date().toISOString(), reqId: kid, proto: 'responses', result: 'BLOCKED_STRICT_CACHE',
+          reason: CACHE_PROBE_STATE.reason, state: PROBE_STATE.state, driftStreak: PROBE_STATE.driftStreak });
+    res.writeHead(503, { 'content-type': 'application/json', 'x-gate-result': 'blocked',
+                         'x-gate-reason': 'cache_semantics', 'retry-after': '30' });
+    return res.end(JSON.stringify({
+      error: {
+        type: 'gate_cache_semantics',
+        message: '缓存语义探针连续判负：当前上游实现与 DeepSeek infra 的 128 块缓存不一致，已 fail-closed。'
+               + '稍后重试，或查看 /gate/health.cacheSemantics。',
+        reason: CACHE_PROBE_STATE.reason,
+        request_id: kid,
+      },
+    }));
+  }
   if (BLOCKED_PROTOS.has(protoOf(url.pathname))) {
     const pid = Math.random().toString(16).slice(2, 10);
     metrics.blockedByPolicy = (metrics.blockedByPolicy || 0) + 1;
@@ -3716,10 +4208,19 @@ async function handle(req, res) {
     tPhase.upstreamDone = Date.now();   // 拿到上游响应（头已到）——之后都算交付闸 + 回传
     // ★ 2026-11-06（L3）：流式缓冲。必须在**写响应头之前**完成，否则状态码已经发出去了。
     // 只在开关打开 + responses + 确实是 SSE 时介入；关闭时本块整体跳过，行为逐字节不变。
-    if (STREAM_BUFFER && proto === 'responses' && String(r.ctype || '').includes('event-stream') && !r.__bufferedAll) {
+    // ★ 2026-11-08：SUSPECT 状态下额外缓冲最多 SENTINEL_N 条业务请求（sentinel），
+    // 用业务格自己的响应做确认；稳态不缓冲，代价只在可疑窗口出现。
+    const sentinelBuffer = PROBE_ADAPTIVE && PROBE_STATE.state === 'suspect' && PROBE_STATE.sentinelLeft > 0;
+    if ((STREAM_BUFFER || sentinelBuffer) && proto === 'responses' && String(r.ctype || '').includes('event-stream') && !r.__bufferedAll) {
       const d = await drainSseToBuffer(r);
       r.buffered = d.chunks;
       r.__bufferedAll = true;
+      if (sentinelBuffer) {
+        PROBE_STATE.sentinelLeft = Math.max(0, PROBE_STATE.sentinelLeft - 1);
+        metrics.sentinelBuffered = (metrics.sentinelBuffered || 0) + 1;
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'SENTINEL_BUFFER', model,
+              left: PROBE_STATE.sentinelLeft, bytes: d.bytes });
+      }
       const text = Buffer.concat(d.chunks).toString('utf8');
       const s = scanSse(text);
       const idOk = (() => {
@@ -3741,6 +4242,8 @@ async function handle(req, res) {
               cached: s.cached, input: s.input, block: CACHE_BLOCK_SIZE,
               reason: !idOk ? 'id_shape' : 'cache_block', bytes: d.bytes });
         pushAlert('STREAM_BUFFER_REJECT', { reqId, model, reason: !idOk ? 'id_shape' : 'cache_block', cached: s.cached });
+        // 业务格自己给出非 128 倍数 → 立即升 CONFIRM（不必再等两次探测）。
+        if (PROBE_ADAPTIVE && idOk && !cacheOk) noteSentinelNegative('sentinel_cache_block');
         try { res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '3',
               'x-gate-result': 'blocked', 'x-gate-reason': !idOk ? 'stream_id_shape' : 'stream_cache_block',
               'x-gate-req-id': reqId }); } catch {}
@@ -3845,7 +4348,17 @@ async function handle(req, res) {
                 missing: miss, request_id: reqId } }));
             }
             const tooBig = FP_RETRY_MAX_BYTES > 0 && Number(bodyBuf ? bodyBuf.length : 0) > FP_RETRY_MAX_BYTES;
-            if (fpRetriesLeft > 0 && remainMs() > 3000 && !tooBig) {
+            // ★ 2026-11-08：cacheBlockMisaligned 不走重发。
+            // 实测（B25，32 次对照）：同 model 重发不改变落点，重发只会白烧 3× 配额、最后仍按 warn 交付。
+            // 其余 hard 项（id 形态 / item id 等）保留重发，它们在换实例时可能真的变好。
+            const retryable = !miss.includes('cacheBlockMisaligned');
+            if (!retryable) {
+              metrics.fpRetrySkippedCache = (metrics.fpRetrySkippedCache || 0) + 1;
+              log({ ts: new Date().toISOString(), reqId, proto, result: 'FP_RETRY_SKIP', model,
+                    reason: 'cache_block',
+                    cached: (fbody.usage && fbody.usage.input_tokens_details || {}).cached_tokens });
+            }
+            if (fpRetriesLeft > 0 && remainMs() > 3000 && !tooBig && retryable) {
               try { r.stream && r.stream.destroy(); } catch {}
               metrics.fpRetries = (metrics.fpRetries || 0) + 1;
               let rr = null, rrErr = null;
@@ -4137,6 +4650,12 @@ async function handle(req, res) {
   // 2026-11-06：这里原有一个空的条件块（历史编辑残留），已删除；
   // 含义完全由下面这个分支承担。verify AQ14 断言"只剩一个真分支"。
   if (!candidates.length) {
+    // ★ 2026-11-08：客户端已断开时，探针阶段收敛同样不能记成上游不可达。
+    if (clientGone.signal.aborted || res.destroyed) {
+      log({ ts: new Date().toISOString(), reqId, proto, result: 'CLIENT_ABORTED', stage: 'probe',
+            elapsedMs: Date.now() - startedAt });
+      return;
+    }
     metrics.blocked++;
     // 三种拒绝原因必须分开归因，否则客户端无法判断「等一会儿再试」还是「路由被拒」。
     // 探针在所有车道都拿不到任何 HTTP 响应 → 可达性问题；
@@ -4205,6 +4724,11 @@ async function handle(req, res) {
     if (winner) return deliver(winner.model, winner.r, attempts.length);
     // 两条车道都没拿到任何 HTTP 响应 → 上游不可达，不必再进主循环烧预算
     if (upstreamDown()) {
+      if (clientGone.signal.aborted || res.destroyed) {
+        log({ ts: new Date().toISOString(), reqId, proto, result: 'CLIENT_ABORTED', stage: 'hedge',
+              elapsedMs: Date.now() - startedAt });
+        return;
+      }
       log({ ts: new Date().toISOString(), reqId, proto, result: 'UPSTREAM_UNREACHABLE',
             phase: 'hedge', lanes: [...connFailedLanes], elapsedMs: Date.now() - startedAt });
     }
@@ -4232,6 +4756,30 @@ async function handle(req, res) {
       attempts.push({ ...brief(model, r), laneRetry: t });
       noteConnFail(model, r);
       cacheSet(model, proto, r);
+      // ★ 2026-11-08：messages 体级判据（cache_read_input_tokens 必须是 128 的倍数）。
+      // 只对 MSG_PROVIDER 开启的备选通道生效；命中即 fail-closed，不交付。
+      if (MSG_PROVIDER && proto === 'messages' && r.status >= 200 && r.status < 300) {
+        const env = msgEnvelopeOf(r);
+        if (env === 'official') {
+          metrics.msgEnvelopeOfficial = (metrics.msgEnvelopeOfficial || 0) + 1;
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'MSG_ENVELOPE_OFFICIAL', model });
+        } else if (env === 'relay') {
+          metrics.msgEnvelopeRelay = (metrics.msgEnvelopeRelay || 0) + 1;
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'MSG_ENVELOPE_RELAY', model });
+        }
+        const bad = msgCacheMisaligned(r);
+        if (bad) {
+          metrics.msgCacheMisaligned = (metrics.msgCacheMisaligned || 0) + 1;
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'MSG_CACHE_MISALIGNED',
+                model, cached: bad.cached, block: CACHE_BLOCK_SIZE });
+          try { r.stream && r.stream.destroy(); } catch {}
+          res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '30',
+                               'x-gate-result': 'blocked', 'x-gate-reason': 'msg_cache_block' });
+          return res.end(JSON.stringify({ error: { type: 'gate_msg_cache_block',
+            message: 'messages 响应的缓存块不是 128 的整数倍；与 DeepSeek infra 不符，已 fail-closed。',
+            cached: bad.cached, block: CACHE_BLOCK_SIZE, request_id: reqId } }));
+        }
+      }
       if (r.verdict === 'official') return deliver(model, r, attempts.length);
       // proof/预检已证明该协议落在官方后端时，id 形态非 UUID4 也照常交付：
       // - chat/messages 车道：id 是 chatcmpl 等网关产物
@@ -4269,6 +4817,19 @@ async function handle(req, res) {
         // 这类响应必须原样透传（下面的 passthrough 分支），否则客户端只会拿到
         // 一个语义错误的 503 gate_no_official_route —— 实测把「损坏图片应回 400」
         // 变成了 503（test-multimodal 抓到）。身份白名单只约束 **2xx 的成功响应**。
+        // ★ 2026-11-08：messages 备选通道 —— 仅当本协议预检 pass 且 id 属于 messages 家族时交付。
+        // 预检（msgfp）pass = 这条消息路径确实通到「会做官方参数校验」的实现；
+        // 此时 id 的 msg_hex/53hex 只是适配层形态，不再单独否决（与 responses 的 resp_ 同理）。
+        if (MSG_PROVIDER && proto === 'messages') {
+          const lanePcM = pgate.byLane && typeof pgate.byLane.get === 'function' ? pgate.byLane.get(model) : null;
+          const lanePassM = lanePcM ? lanePcM.verdict === 'pass' : pgate.allowAllLanes;
+          if (lanePassM && MSG_DELIVERABLE_SHAPES.has(r.idShape)) {
+            metrics.msgProviderDelivered = (metrics.msgProviderDelivered || 0) + 1;
+            log({ ts: new Date().toISOString(), reqId, proto, result: 'MSG_PROVIDER_DELIVER',
+                  model, idShape: r.idShape, lanePass: true });
+            return deliver(model, r, attempts.length);
+          }
+        }
         metrics.rejectedThirdShape = (metrics.rejectedThirdShape || 0) + 1;
         log({ ts: new Date().toISOString(), reqId, proto, result: 'REJECT_SHAPE_THIRD',
               model, idShape: r.idShape, policy: 'identity_whitelist', allowAllLanes: pgate.allowAllLanes });
@@ -4283,6 +4844,17 @@ async function handle(req, res) {
         if (DELIVERABLE_SHAPES.has(r.idShape) && pgate.allowAllLanes) {
           return deliver(model, r, attempts.length);
         }
+        // ★ 2026-11-08：messages 备选通道的中性 id（UUID4）同样需要预检 pass 背书。
+        if (MSG_PROVIDER && proto === 'messages') {
+          const lanePcM = pgate.byLane && typeof pgate.byLane.get === 'function' ? pgate.byLane.get(model) : null;
+          const lanePassM = lanePcM ? lanePcM.verdict === 'pass' : pgate.allowAllLanes;
+          if (lanePassM && MSG_DELIVERABLE_SHAPES.has(r.idShape)) {
+            metrics.msgProviderDelivered = (metrics.msgProviderDelivered || 0) + 1;
+            log({ ts: new Date().toISOString(), reqId, proto, result: 'MSG_PROVIDER_DELIVER',
+                  model, idShape: r.idShape, lanePass: true });
+            return deliver(model, r, attempts.length);
+          }
+        }
         metrics.rejectedUnknownShape = (metrics.rejectedUnknownShape || 0) + 1;
         log({ ts: new Date().toISOString(), reqId, proto, result: 'REJECT_SHAPE_UNKNOWN',
               model, idShape: r.idShape || '(none)', allowAllLanes: pgate.allowAllLanes });
@@ -4293,6 +4865,11 @@ async function handle(req, res) {
       // 否则 hedge 阶段两条车道都连接失败过之后，再来一条成功的 official 会被这里误判丢弃。
       if (upstreamDown()) {
         try { r.stream && r.stream.destroy(); } catch {}
+        if (clientGone.signal.aborted || res.destroyed) {
+          log({ ts: new Date().toISOString(), reqId, proto, result: 'CLIENT_ABORTED', stage: 'main-loop',
+                elapsedMs: Date.now() - startedAt, attempts: attempts.length });
+          return;
+        }
         log({ ts: new Date().toISOString(), reqId, proto, result: 'UPSTREAM_UNREACHABLE',
               phase: 'main', lanes: [...connFailedLanes], attempts: attempts.length,
               elapsedMs: Date.now() - startedAt });
@@ -4495,6 +5072,16 @@ async function handle(req, res) {
     return res.end(last4xx.body);
   }
 
+  // ★ 2026-11-08：客户端已断开时，这次收敛不能记成「上游不可达 / 平台判负」。
+  // 实测（11-08 14:28:45、15:00:53）：用户取消后 attempt 变成 status:0 +
+  // "The operation was aborted"，旧实现仍 blocked++、recordFailure(route/unreachable) 并写 503，
+  // 把 /gate/alerts.recentFailures 与 metrics.upstreamUnreachable 污染成「上游挂了」。
+  if (clientGone.signal.aborted || res.destroyed) {
+    log({ ts: new Date().toISOString(), reqId, proto, result: 'CLIENT_ABORTED', stage: 'terminal',
+          elapsedMs: Date.now() - startedAt, attempts: attempts.length });
+    return;
+  }
+
   metrics.blocked++;
   // 拒绝原因必须区分开，否则客户端无法判断「等一会儿再试」还是「路由被拒」。
   // 2026-11-06 新增 gate_upstream_slow：**曾收到真实响应**（status>0）但最后一次尝试是超时/硬上限。
@@ -4631,13 +5218,15 @@ server.listen(PORT, '127.0.0.1', () => {
     setInterval(() => { runImplVector().catch(() => {}); }, IMPL_VECTOR_MS).unref();
     setTimeout(() => { runImplVector().catch(() => {}); }, 5000).unref();
   }
-  // ★ 2026-11-06：缓存语义探针（补「无缓存实现」盲区，只观测 + 告警）。默认 10 分钟。
-  // 成本实测：单次探针 2 发 × ~300 token = 604 token ⇒ 10 分钟频率约 96K token/天。
-  const CACHE_PROBE_MS = num('GATE_CACHE_PROBE_MS', 600000, { min: 0, max: 86400000 });
+  // ★ 2026-11-06：缓存语义探针（补「无缓存实现」盲区）。
+  // ★ 2026-11-08：改由状态机调度 —— normal 用 GATE_CACHE_PROBE_MS，suspect/confirm 自动缩短，
+  // 空闲（最近 GATE_PROBE_ACTIVE_WINDOW_MS 无业务）跳过，避免 24/7 白烧 token。
   if (CACHE_PROBE_MS > 0) {
-    setInterval(() => { runCacheProbe().catch(() => {}); }, CACHE_PROBE_MS).unref();
-    // 首次延迟跟随配置：默认 12s（等启动自检跑完），配置更短时用配置值（测试用小值验证）
-    setTimeout(() => { runCacheProbe().catch(() => {}); }, Math.min(12000, CACHE_PROBE_MS)).unref();
+    scheduleCacheProbe(Math.min(12000, probeIntervalMs()));
+  }
+  // ★ 2026-11-08：messages 可用性指示器后台刷新（Tier0 ~30 token；空闲跳过）。
+  if (MSG_PROVIDER && MSG_STATUS_MS > 0) {
+    scheduleMsgStatus(Math.min(20000, MSG_STATUS_MS));
   }
 
   // ★ 第 17 轮：启动自检（D5-2）

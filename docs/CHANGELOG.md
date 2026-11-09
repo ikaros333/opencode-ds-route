@@ -16,6 +16,191 @@
 "判负即切换"的能力保留（多车道配置即生效，G32 覆盖），但在现有约束下它只会退化为"判负即 503"。
 后续改进应转向「判定质量与可用性」，而不是「换上游」。
 
+## 未发布 · 2026-11-08 取消归类 + 探针错误分类 + 封禁协议静音 + 缓存块不重发
+
+四条都由 2026-11-08 当日台账驱动（时间为 Asia/Shanghai）。
+
+### 一、客户端取消被记成「上游不可达」（真 bug）
+
+| 时间 | 台账 | 实际含义 |
+|---|---|---|
+| 14:28:45 | `CLIENT_ABORTED` + `UPSTREAM_UNREACHABLE` + `BLOCKED`，attempt `status:0`、`"The operation was aborted"` | 用户取消 |
+| 15:00:53 | 同上（3.0s） | 用户取消 |
+
+旧实现：客户端断开后 attempt 变成 `status:0`，终局仍走 `metrics.blocked++`、
+`recordFailure(kind:'route', type:'gate_upstream_unreachable')` 并写 503。
+结果 `/gate/alerts.recentFailures` 与 `metrics.upstreamUnreachable` 被「用户取消」污染，
+排障会把取消读成「上游挂了」。
+
+修复：在四个收敛点（probe / hedge / main-loop / terminal）先判
+`clientGone.signal.aborted || res.destroyed`，只记 `CLIENT_ABORTED`（带 `stage`），
+不计数、不 recordFailure、不写 503。
+
+### 二、全 ERR 实现向量被报成 `IMPL_VECTOR_DRIFT`
+
+04:24:26 `vector=ERR,ERR,ERR,ERR,ERR`：五项探针全部超时/连不上。
+旧实现只看稳定前缀是否等于 `400,200`，于是把「没问到」记成了「实现变了」。
+
+修复：稳定位出现 `ERR` → 记 `IMPL_VECTOR_PROBE_ERR` + `metrics.implVectorProbeErr`，
+不推 DRIFT 告警；只有「有 HTTP 状态且稳定位变化」才继续算 drift。
+
+### 三、被封禁协议的 `ALL_LANES_DEGRADED` 噪声
+
+04:29:24 `proto=messages, verdict=third`。messages 本来就 503 `gate_proto_blocked`，
+它的探针结论只是噪音，会挤占 50 格告警环形。
+
+修复：`BLOCKED_PROTOS` 内的协议跳过降级告警（并清掉历史签名），responses 的告警不变。
+
+### 四、`cacheBlockMisaligned` 白重发
+
+B25 实测「同 model 重发不改变落点（32 次对照零差异）」，而 `require` + 默认
+`GATE_FP_POLICY=retry` 会把每条不符请求重发 2 次（3× 配额），最后仍按 warn 交付。
+
+修复：`cacheBlockMisaligned` 不参与重发，直接进入 `block`/`warn` 分支；
+其余 hard 项（id 形态 / item id）保留重发。新增 `FP_RETRY_SKIP` 台账与
+`metrics.fpRetrySkippedCache`。
+
+### 五、流式「等头」watchdog + phase 双口径
+
+**watchdog**：14:28 实测上游 108 秒没有任何响应头，请求一直占着 `MAX_CONC=6` 的一个槽位到
+`GATE_UPSTREAM_TIMEOUT_MS`（120s）。六条这样的连接就能把并发占满。
+
+- 新增 `GATE_UPSTREAM_HEADERS_TIMEOUT_MS`（默认 **30000**，`0` 关闭）；
+- **只对流式生效**：流式头实测 1.6–2.0s 到达；非流式响应的头要等整段生成完（16K token ≈ 44s），
+  套用同一阈值会误杀长输出；
+- 超时记 `ATTEMPT_HEADERS_TIMEOUT`，按 `verdict=error/status=0` 收敛，槽位立即释放。
+
+**phase 双口径**：台账 `phase.totalMs` 是「写头前」，health `phase.totalMs` 含流式回传，
+同名字段两个含义。现在：
+
+- `phaseSnap()` 增加 `ttfbMs`（请求进来 → 写完响应头）；
+- `phaseStats` / `phaseView` 增加 `ttfbMs` 分位；
+- 台账与 health 都能同时看到 `ttfbMs` 与 `totalMs`，不再靠猜。
+
+### 六、探测驱动的三段状态机（结构性升级）
+
+**测试结论（11-08，真实上游 + 蒙特卡洛）**：
+
+| 策略 | f=0.2 发现延迟 | 缓冲占比 | 每条附加延迟 |
+|---|---|---|---|
+| probe 10min（旧） | 43.8 min | 0% | 0 |
+| **probe 3min** | **13.5 min** | 0% | **0** |
+| probe10 + 均匀采样 10% | 24.7 min | 8.9% | +1.5s |
+| probe10 + 自适应全缓冲 | 42.5 min | 72% | +12.3s |
+
+结论：**探测间隔是唯一「零体验代价」的加速器；均匀采样与全缓冲都不划算。**
+长输出实测（max_output_tokens=500）：开缓冲后 TTFT 从 1.2–1.4s 变成 8.5–8.7s，代价约 **+7s/条**。
+
+**实现**（`oc-gate.mjs`）：
+
+- **NORMAL**：按 `GATE_CACHE_PROBE_MS` 探测，不缓冲、不拒绝；
+- **SUSPECT**（1 次判负）：探测间隔降到 `GATE_PROBE_MS_SUSPECT`，只缓冲 `GATE_SENTINEL_N` 条业务流式请求，
+  用业务格自己的响应确认；业务格判负立即升 CONFIRM；
+- **CONFIRM**（连续 `GATE_CONFIRM_ON` 次判负，或 sentinel 判负）：`responses` 直接 503
+  `gate_cache_semantics`，探测间隔 `GATE_PROBE_MS_CONFIRM`；连续 2 次 good 且过了
+  `GATE_CONFIRM_MIN_MS` 才回 NORMAL；
+- **活动门控**：最近 `GATE_PROBE_ACTIVE_WINDOW_MS` 没有业务请求就跳过本轮探测（不花 token）；
+  空闲后首个业务请求会触发一次补探；
+- 探测节拍固定：本轮耗时从下个间隔里扣除，不会越拖越长；
+- 全部可关：`GATE_PROBE_ADAPTIVE=0` 回到旧行为。
+
+成本：3 分钟 + 活动门控约 **10 万 token/天（≈$0.3–0.7/月，占 flash 月额度 0.3–0.7%）**；
+不活动门控的 3 分钟全时约 29 万/天（≈$1/月，占额度 1%）。
+
+### 七、messages 备选通道（dsh 第二个模型）
+
+**动机**：`messages` 是唯一在某些窗口能证明「请求到达官方参数校验器」的通道（B22 窗口 A）。
+把它做成 dsh 侧**手动可选的第二个模型**，只在有官方校验器证据时交付。
+
+**门控实现**（`oc-gate.mjs`）：
+
+- 新增 `GATE_MSG_PROVIDER`（默认 `false`），需同时 `GATE_ALLOW_MESSAGES=1`；
+- `messages` 的 third/unknown 响应，只要本协议预检（msgfp/M6）`pass` 且 id 属于
+  `msg_hex / 53hex / UUID4`，就交付并记 `MSG_PROVIDER_DELIVER`；`gw-`/`chatcmpl` 仍拒绝；
+- 预检不通过 → 503 `gate_no_official_route`，错误体带 `precheck.fingerprint`；
+- 备选通道开启时，`messages` 不再反复推 `ALL_LANES_DEGRADED`（窗口本就时好时坏）；
+- health 新增 `msgProvider.{enabled,officialText,delivered,cacheMisaligned,deliverableShapes}`。
+
+**2026-11-08 官方文案判据（收紧「能用」的含义）**
+
+对官方 Anthropic 兼容端点（`api.deepseek.com/anthropic/v1/messages`）实测九条错误：
+
+| 探针 | 官方 | 车道 C 窗口（同日实测） |
+|---|---|---|
+| m1 `max_tokens=0` | 400 `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]` | 200 / 网关包装 400 |
+| m2/m3 `temperature` | 400 `Invalid temperature value, the valid range of temperature is [0, 2]` | **200（不校验）** |
+| m4/m5 `top_p` | 400 `Invalid top_p value, the valid range of top_p is (0, 1.0]` | **200（不校验）** |
+| m6 空 messages | 400 `messages: at least one message is required` | 400，但无 `request_id` |
+| m7 非法 role | **422** `Failed to deserialize … unknown variant \`wizard\` …` | **400** `messages[0].role: expected …` |
+| m8/m9 缺字段/错类型 | **422** 反序列化文案 | **400** 简短文案 |
+| request_id | UUID4 | 无 / `gw-…` |
+| 成功 usage | `service_tier: "standard"`，无 `cost/opencode` | `cost`+`opencode`，无 `service_tier` |
+
+新增 `GATE_MSG_OFFICIAL_TEXT`（默认 `1`）：九条必须**状态码 + 官方固定句式 + UUID4 `request_id`**同时成立，
+且不含 `Upstream request failed` / `gw-` 包装；任一不符 → 预检 fail → 503。
+
+**2026-11-08 动态回声 + 信封评分（最终版）**
+
+- **m10 随机 role 回声**：每次预检生成 `wizard_<随机>`，要求官方 422 + 文案**原样回显该随机串** + UUID4
+  `request_id` + 无网关包装。实测官方 5/5 回显，车道 4/5 返回 400 不回显、1/5 503；
+  静态复刻九段文案不再够用，必须实现未知 variant 的反序列化回显。
+- **探针限并发 3 + 503/429 重试一次**：9 并发实测会撞出 503（`…,503,…`），串行/限并发可避免把瞬时故障误判成文案不符。
+- **service_tier 信封评分（不阻断）**：官方非流式 usage 带 `service_tier`，车道只有 `cost/opencode`；
+  health 记 `msgProvider.envelopeOfficial/envelopeRelay`，台账记 `MSG_ENVELOPE_OFFICIAL/RELAY`。
+- **流式缓存检查取消**：实测车道流式 usage 全 0（`input/output/cache` 都是 0），按流式 body 查 128 块只会假通过；
+  缓存块判据只保留非流式，流式不做 usage 级检查。
+- 预检 pass TTL 仍保持 **90s**（不采用 300s）：实测窗口在分钟级漂移，300s 会让旧 pass 掩盖切换。
+另外对成功响应加了体级判据：`cache_read_input_tokens` 必须是 128 的倍数，否则 503 `gate_msg_cache_block`。
+
+这意味着「messages 能用」从「九个状态码像官方」收紧为「九条官方文案 + UUID4 request_id 像官方」；
+仍然不是托管方证明，但自部署要同时复刻文案、格式与 id 形态，门槛显著更高。
+
+**2026-11-08 实测当前窗口**：
+
+```
+msgfp fingerprint = 400,200,200,200,200,400,400,400,400
+官方基线          = 400,400,400,400,400,400,422,422,422
+```
+
+即当前是「32hex + 网关自有校验」的 C 窗口，不是官方校验器窗口 → 现在切 messages 会 503。
+这是预期行为：没有官方证据时不交付；窗口 A 回来时自动可用。
+
+**dsh 侧**：新增 `ocg-gated-msg` provider（见 `docs/DSH.md`），与 `ocg-gated` 并列，手动选择。
+
+### 八、messages 可用性指示器（2026-11-08）
+
+**目标**：不靠猜时间，随时知道「此刻 messages 能不能用」，且成本可忽略。
+
+**分层探针**：
+
+- **Tier0**：1 条随机 role 回声（`wizard_<random>`）。官方 5/5 返回 422 + 精确回显 + UUID4；
+  车道 5/5 返回 400 不回显（1/5 503）。失败即 `unusable`，成本 ~30 token、~0.3–0.8s。
+- **Tier1**：仅当 Tier0 通过才跑全量 10 条（~350 token、~0.6s）；通过才标 `usable`。
+- 503/429/超时重试一次；仍失败标 `unknown`，不覆盖 `lastPassAt`。
+
+**入口**：
+
+- `GET /gate/msg-status`（缓存读取，0 token）；
+- `ocg msg-status` / `--refresh` / `--json`，退出码 0=可用、1=不可用、2=unknown；
+- `GET /gate/health` 新增 `msgStatus`。
+
+**调度**：`GATE_MSG_STATUS_MS=300000`（5 分钟），`GATE_MSG_STATUS_ACTIVE_MS=600000`
+（最近 10 分钟无业务则跳过）。Tier0 常态下每天约 8.6K token ≈ **$0.04/月**；
+Tier1 只在候选窗口跑。
+
+**当前实测（2026-11-08 20:18 本地）**：
+
+```
+MSG_STATUS_CHECK  usable=false  tier=0  ms=284  detail="echo ✗ code=400"
+ocg msg-status → ❌ messages 不可用  5s 前  tier=1  official-text ✗ … m10:echo
+```
+
+### 测试
+
+- `verify-patch` 597 → **677 通过 / 0 失败**（新增 AR/AS/AT/AU/AV/AW/AX 共 78 条）
+- `test-coverage` 201 → **232 通过 / 0 失败**（新增 G35–G38；G31 增补 `ttfbMs` 断言）
+- `test-bodyproof` 39 / 0、`test-429` 37 / 0 不变
+
 ## 未发布 · 2026-11-07 上游调价重标 + 探针 fail-open + 回归隔离
 
 ### 一、上游调价导致计费判据 100% 误报（真 bug）

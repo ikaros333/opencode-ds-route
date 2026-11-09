@@ -114,6 +114,72 @@ const mock = http.createServer((req, res) => {
     // 所以只对**预检请求**（有 max_output_tokens、无 input/messages）扮演官方 Rust 服务端；
     // 429/500/third/noid/hang 等被测行为完全不受影响。
     let jb = {}; try { jb = JSON.parse(b); } catch {}
+    // 2026-11-08：缓存语义探针的专用响应（G37 用）。探针 input 以 'alpha bravo' 开头。
+    if (String(jb.input || '').startsWith('alpha bravo')) {
+      const f = fullBody('resp_' + UUID4HEX);
+      f.usage.input_tokens = 351;
+      f.usage.input_tokens_details = { cached_tokens: mode === 'probe_bad' ? 100 : 256 };
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify(f));
+    }
+    // 2026-11-08：messages 备选通道（G38）。按 msg 探针语义返回指纹码。
+    if (String(req.url || '').includes('/v1/messages')) {
+      const m = Array.isArray(jb.messages) ? jb.messages : null;
+      const role = m && m[0] ? m[0].role : null;
+      const badRole = typeof role === 'string' && role.startsWith('wizard');
+      const badContent = m && m[0] && typeof m[0].content !== 'string';
+      if (mode === 'msgok' || mode === 'msgbad') {
+        const RID = UUID4; // '01234567-89ab-4cde-8f01-23456789abcd'
+        const err = (code, msg) => {
+          res.writeHead(code, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } }));
+        };
+        const official = mode === 'msgok';
+        if (jb.max_tokens === 0) {
+          return official
+            ? err(400, `Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: ${RID})`)
+            : err(400, 'Upstream request failed: [invalid_request_error] max_tokens must be between 1 and 393216 (request_id: gw-abc123)');
+        }
+        if (typeof jb.temperature === 'number' && (jb.temperature < 0 || jb.temperature > 2)) {
+          return official
+            ? err(400, `Invalid temperature value, the valid range of temperature is [0, 2] (request_id: ${RID})`)
+            : err(400, 'Upstream request failed: [invalid_request_error] temperature out of range');
+        }
+        if (typeof jb.top_p === 'number' && (jb.top_p <= 0 || jb.top_p > 1)) {
+          return official
+            ? err(400, `Invalid top_p value, the valid range of top_p is (0, 1.0] (request_id: ${RID})`)
+            : err(400, 'Upstream request failed: [invalid_request_error] top_p out of range');
+        }
+        if (m && m.length === 0) {
+          return official
+            ? err(400, `messages: at least one message is required (request_id: ${RID})`)
+            : err(400, 'messages: at least one message is required');
+        }
+        if (!m) {
+          return official
+            ? err(422, `Failed to deserialize the JSON body into the target type: missing field \`messages\` (request_id: ${RID})`)
+            : err(422, 'messages: expected an array');
+        }
+        if (badRole) {
+          return official
+            ? err(422, `Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant \`${role}\`, expected one of \`user\`, \`assistant\`, \`system\` (request_id: ${RID})`)
+            : err(400, 'messages[0].role: expected user, assistant or system');
+        }
+        if (badContent) {
+          return official
+            ? err(422, `Failed to deserialize the JSON body into the target type: messages[0].content: expected a string or a list (request_id: ${RID})`)
+            : err(422, 'messages[0].content: expected an array');
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'msg_' + UUID4HEX, type: 'message', role: 'assistant',
+          content: [{ type: 'text', text: 'OK' }], model: 'deepseek-v4.1-flash', stop_reason: 'end_turn',
+          usage: { input_tokens: 32, output_tokens: 8, cache_read_input_tokens: 0,
+                   cache_creation_input_tokens: 0, cost: 0,
+                   opencode: { billing_source: 'go', list_cost: 0.0000096, allowance: 0.00000576 } },
+        }));
+      }
+    }
     // mode=noid 时故意连预检都拿不到官方证据（用于验证新加的交付前置闸）
     if (mode !== 'noid' && jb) {
       // shape（2026-10-27 冻结版主判据）：形态探针 —— 成功响应必须是 resp_uuid4 + usage 七键
@@ -166,6 +232,7 @@ const mock = http.createServer((req, res) => {
     if (probeFail && isProbe) { res.writeHead(500, { 'content-type': 'application/json' }); return res.end('{"probe":"fail"}'); }
 
     if (mode === 'hang') { res.writeHead(200, { 'content-type': 'application/json' }); return; }   // 永不响应
+    if (mode === 'stall') { return; }   // 连响应头都不发（用于「等头」watchdog）
     // 2026-10-30：慢响应，用于验证 drain 不会切断在途请求
     if (mode === 'slow') { return setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(fullBody(UUID4))); }, 1200); }
     if (mode === 'third') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ id: HEX32 })); }
@@ -230,6 +297,11 @@ async function startGate(port, env = {}) {
            // 把 G21/G22/G26/G27 那些「用过期快照验拦截」的用例变成 flaky。G30 单独开启验证。
            GATE_EVIDENCE_AUTO_REFRESH: '0',
            GATE_SNAPSHOT: path.join(TEST_LOGS, `cov-${port}.json`),
+           // 2026-11-08：既有用例不参与探测状态机（默认开启），G37 显式打开。
+           GATE_PROBE_ADAPTIVE: '0',
+           // 2026-11-08：生产 User 级可能已设 GATE_ALLOW_MESSAGES=1 / GATE_MSG_PROVIDER=1；
+           // 测试必须显式归零，否则 G8 的「默认封禁 messages」会被宿主环境污染。
+           GATE_ALLOW_MESSAGES: '0', GATE_MSG_PROVIDER: '0', GATE_MSG_OFFICIAL_TEXT: '1',
            // 2026-10-30：测试门控必须写自己的台账，否则会把 STARTUP_SELFTEST/FP_MISMATCH
            // 之类记录混进生产 gate/logs/gate.jsonl，污染日常统计与告警复盘。
            GATE_LOG_FILE: path.join(TEST_LOGS, `cov-${port}.jsonl`), ...env },
@@ -1351,6 +1423,7 @@ try {
     const ph = h1?.phase || {};
     check('G31 health 暴露 phase 四段', !!(ph.precheckMs && ph.upstreamMs && ph.gateMs && ph.streamMs),
       `phase=${JSON.stringify(ph).slice(0, 150)}`);
+    check('G31 health 暴露 ttfbMs（与含回传的 totalMs 分列）', !!ph.ttfbMs, `ttfb=${JSON.stringify(ph.ttfbMs)}`);
     check('G31 分段样本已累计', (ph.n || 0) >= 1, `n=${ph.n}`);
 
     // 客户端中途取消：服务端应记 CLIENT_ABORTED，且不再记 HANDLER_ERROR
@@ -1375,6 +1448,8 @@ try {
     const passRec = led.find(x => x.result === 'PASS_BY_PROOF' || x.result === 'PASS');
     check('G31 PASS 台账带 phase 分段', !!(passRec && passRec.phase && typeof passRec.phase.totalMs === 'number'),
       passRec ? JSON.stringify(passRec.phase) : 'no PASS rec');
+    check('G31 台账 phase 带 ttfbMs', !!(passRec && passRec.phase && typeof passRec.phase.ttfbMs === 'number'),
+      passRec ? `ttfbMs=${passRec.phase.ttfbMs}` : '-');
     check('G31 分段之和 ≈ 总耗时（不重不漏）',
       !!passRec && Math.abs((passRec.phase.precheckMs + passRec.phase.upstreamMs + passRec.phase.gateMs + passRec.phase.streamMs) - passRec.phase.totalMs) <= 5,
       passRec ? `sum=${passRec.phase.precheckMs + passRec.phase.upstreamMs + passRec.phase.gateMs + passRec.phase.streamMs} total=${passRec.phase.totalMs}` : '-');
@@ -1610,6 +1685,186 @@ try {
     try { g4.child.kill('SIGKILL'); } catch {}
     try { mock4.close(); } catch {}
   }
+
+console.log('\n=== G35 客户端取消：只记 CLIENT_ABORTED，不记不可达/判负 ===');
+{
+  const port5 = P0 + 57;
+  const log5 = path.join(TEST_LOGS, 'cov-g35.jsonl');
+  try { fs.rmSync(log5, { force: true }); } catch {}
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+  const g5 = await startGate(port5, {
+    GATE_PRECHECK_TTL_MS: '60000', GATE_LANE_RETRY: '0',
+    GATE_UPSTREAM_TIMEOUT_MS: '20000', GATE_TOTAL_BUDGET_MS: '30000',
+    GATE_LOG_FILE: log5, GATE_SNAPSHOT: path.join(TEST_LOGS, 'cov-g35-m.json'),
+    GATE_ASSURANCE: 'label', GATE_CANARY_POLICY: 'label', GATE_L0_POLICY: 'label',
+  });
+  let up5 = false;
+  for (let i = 0; i < 60 && !up5; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port5}/gate/health`); if (r.ok) up5 = true; } catch {} }
+  check('G35 实例启动', !g5.failed && up5, g5.failed ? g5.stderr().slice(0, 120) : 'ok');
+  const first = await gate(port5, { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+  check('G35 预检缓存建立（首请求 200）', first.status === 200, `status=${first.status} ${first.j?.error?.type || ''}`);
+
+  // 切成 hang：上游永不响应，客户端 800ms 后主动断开
+  await fetch(`http://127.0.0.1:${MP}/mode/hang`);
+  await new Promise((resolve) => {
+    const r = http.request({ host: '127.0.0.1', port: port5, path: '/v1/responses', method: 'POST',
+      headers: { 'content-type': 'application/json' } }, () => {});
+    r.on('error', () => resolve());
+    r.end(JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }));
+    setTimeout(() => { try { r.destroy(); } catch {} resolve(); }, 800);
+  });
+  await sleep(1500);
+
+  const led5 = fs.readFileSync(log5, 'utf8').split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  check('G35 记录 CLIENT_ABORTED', led5.some(x => x.result === 'CLIENT_ABORTED'),
+    `aborted=${led5.filter(x => x.result === 'CLIENT_ABORTED').length}`);
+  check('G35 不记 BLOCKED', !led5.some(x => x.result === 'BLOCKED'),
+    `blocked=${led5.filter(x => x.result === 'BLOCKED').length}`);
+  check('G35 不记 UPSTREAM_UNREACHABLE', !led5.some(x => x.result === 'UPSTREAM_UNREACHABLE'),
+    `unreachable=${led5.filter(x => x.result === 'UPSTREAM_UNREACHABLE').length}`);
+  const m5 = await met(port5);
+  check('G35 metrics.blocked 仍为 0', m5.blocked === 0, `blocked=${m5.blocked}`);
+  check('G35 metrics.abortedByClient ≥ 1', (m5.abortedByClient || 0) >= 1, `abortedByClient=${m5.abortedByClient}`);
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+  try { g5.child.kill('SIGKILL'); } catch {}
+}
+
+console.log('\n=== G36 流式「等头」watchdog：卡住的连接提前释放槽位 ===');
+{
+  const port6 = P0 + 58;
+  const log6 = path.join(TEST_LOGS, 'cov-g36.jsonl');
+  try { fs.rmSync(log6, { force: true }); } catch {}
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+  const g6 = await startGate(port6, {
+    GATE_PRECHECK_TTL_MS: '60000', GATE_LANE_RETRY: '0',
+    GATE_UPSTREAM_TIMEOUT_MS: '20000', GATE_TOTAL_BUDGET_MS: '30000',
+    GATE_UPSTREAM_HEADERS_TIMEOUT_MS: '1200',
+    GATE_LOG_FILE: log6, GATE_SNAPSHOT: path.join(TEST_LOGS, 'cov-g36-m.json'),
+    GATE_ASSURANCE: 'label', GATE_CANARY_POLICY: 'label', GATE_L0_POLICY: 'label',
+  });
+  let up6 = false;
+  for (let i = 0; i < 60 && !up6; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port6}/gate/health`); if (r.ok) up6 = true; } catch {} }
+  check('G36 实例启动', !g6.failed && up6, g6.failed ? g6.stderr().slice(0, 120) : 'ok');
+  const first = await gate(port6, { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+  check('G36 预检缓存建立（首请求 200）', first.status === 200, `status=${first.status}`);
+
+  await fetch(`http://127.0.0.1:${MP}/mode/stall`);
+  const t0 = Date.now();
+  const r6 = await gate(port6, { model: 'deepseek-flash', input: 'hi', stream: true, max_output_tokens: 8 });
+  const ms6 = Date.now() - t0;
+  check('G36 流式卡头 → 503', r6.status === 503, `status=${r6.status} ${ms6}ms`);
+  check('G36 提前收敛（≤8s，而不是等 20s 上游超时）', ms6 <= 8000, `${ms6}ms`);
+  await sleep(300);
+  const led6 = fs.readFileSync(log6, 'utf8').split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  check('G36 台账记录 ATTEMPT_HEADERS_TIMEOUT', led6.some(x => x.result === 'ATTEMPT_HEADERS_TIMEOUT'),
+    `n=${led6.filter(x => x.result === 'ATTEMPT_HEADERS_TIMEOUT').length}`);
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+  try { g6.child.kill('SIGKILL'); } catch {}
+}
+
+console.log('\n=== G37 探测状态机：两次判负 → CONFIRM → 503；两次 good → 恢复 ===');
+{
+  const port7 = P0 + 59;
+  const log7 = path.join(TEST_LOGS, 'cov-g37.jsonl');
+  try { fs.rmSync(log7, { force: true }); } catch {}
+  await fetch(`http://127.0.0.1:${MP}/mode/probe_ok`);
+  const g7 = await startGate(port7, {
+    GATE_PROBE_ADAPTIVE: '1', GATE_CACHE_PROBE_MS: '500',
+    GATE_PROBE_MS_SUSPECT: '300', GATE_PROBE_MS_CONFIRM: '250',
+    GATE_CONFIRM_ON: '2', GATE_CONFIRM_MIN_MS: '1200', GATE_SENTINEL_N: '3',
+    GATE_STRICT_REJECT: '1', GATE_PROBE_ACTIVE_WINDOW_MS: '0',
+    GATE_PRECHECK_TTL_MS: '60000',
+    GATE_LOG_FILE: log7, GATE_SNAPSHOT: path.join(TEST_LOGS, 'cov-g37-m.json'),
+    GATE_ASSURANCE: 'label', GATE_CANARY_POLICY: 'label', GATE_L0_POLICY: 'label',
+  });
+  let up7 = false;
+  for (let i = 0; i < 60 && !up7; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port7}/gate/health`); if (r.ok) up7 = true; } catch {} }
+  check('G37 实例启动', !g7.failed && up7, g7.failed ? g7.stderr().slice(0, 120) : 'ok');
+  const okA = await gate(port7, { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+  check('G37 初始业务 200', okA.status === 200, `status=${okA.status}`);
+
+  await fetch(`http://127.0.0.1:${MP}/mode/probe_bad`);
+  await sleep(3500);
+  const h7a = await (await fetch(`http://127.0.0.1:${port7}/gate/health`)).json();
+  check('G37 两次判负 → state=confirm', h7a.probeControl?.state === 'confirm',
+    JSON.stringify(h7a.probeControl || null));
+  const blocked = await gate(port7, { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+  check('G37 CONFIRM → responses 503 gate_cache_semantics',
+    blocked.status === 503 && blocked.j?.error?.type === 'gate_cache_semantics',
+    `status=${blocked.status} type=${blocked.j?.error?.type}`);
+
+  await fetch(`http://127.0.0.1:${MP}/mode/probe_ok`);
+  await sleep(3500);
+  const h7b = await (await fetch(`http://127.0.0.1:${port7}/gate/health`)).json();
+  check('G37 两次 good → state=normal', h7b.probeControl?.state === 'normal',
+    JSON.stringify(h7b.probeControl || null));
+  const okB = await gate(port7, { model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 });
+  check('G37 恢复后业务 200', okB.status === 200, `status=${okB.status}`);
+  const led7 = fs.readFileSync(log7, 'utf8').split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  check('G37 台账有 PROBE_STATE 迁移', led7.some(x => x.result === 'PROBE_STATE'),
+    led7.filter(x => x.result === 'PROBE_STATE').map(x => x.from + '->' + x.to).join(','));
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+  try { g7.child.kill('SIGKILL'); } catch {}
+}
+
+console.log('\n=== G38 messages 备选通道：预检 pass → 交付；窗口不符 → 503 ===');
+{
+  const askMsg = async (port) => {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-flash', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const text = await r.text(); let j = null; try { j = JSON.parse(text); } catch {}
+    return { status: r.status, j, text: text.slice(0, 120) };
+  };
+  const mk = async (tag, port, modeName) => {
+    await fetch(`http://127.0.0.1:${MP}/mode/${modeName}`);
+    const log = path.join(TEST_LOGS, `cov-g38-${tag}.jsonl`);
+    try { fs.rmSync(log, { force: true }); } catch {}
+    const g = await startGate(port, {
+      GATE_ALLOW_MESSAGES: '1', GATE_MSG_PROVIDER: '1',
+      GATE_PRECHECK_TTL_MS: '60000',
+      GATE_LOG_FILE: log, GATE_SNAPSHOT: path.join(TEST_LOGS, `cov-g38-${tag}-m.json`),
+      GATE_ASSURANCE: 'label', GATE_CANARY_POLICY: 'label', GATE_L0_POLICY: 'label',
+    });
+    let up = false;
+    for (let i = 0; i < 60 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+    return { g, up, log };
+  };
+  const a = await mk('ok', P0 + 60, 'msgok');
+  check('G38 实例启动（msgok）', !a.g.failed && a.up, a.g.failed ? a.g.stderr().slice(0, 120) : 'ok');
+  const r1 = await askMsg(P0 + 60);
+  check('G38 预检 pass + msg_hex → 200 交付', r1.status === 200, `status=${r1.status} ${r1.text}`);
+  const led1 = fs.readFileSync(a.log, 'utf8').split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  check('G38 台账有 MSG_PROVIDER_DELIVER', led1.some(x => x.result === 'MSG_PROVIDER_DELIVER'),
+    led1.filter(x => /MSG_/.test(x.result || '')).map(x => x.result).join(',') || '(none)');
+  const h1 = await (await fetch(`http://127.0.0.1:${P0 + 60}/gate/health`)).json();
+  check('G38 health 暴露 msgProvider.enabled', h1.msgProvider?.enabled === true,
+    JSON.stringify(h1.msgProvider || null));
+  check('G38 信封评分记录 relay（mock 无 service_tier）', (h1.msgProvider?.envelopeRelay || 0) >= 1,
+    `official=${h1.msgProvider?.envelopeOfficial} relay=${h1.msgProvider?.envelopeRelay}`);
+  const ms1 = await (await fetch(`http://127.0.0.1:${P0 + 60}/gate/msg-status`)).json();
+  check('G38 /gate/msg-status 显示可用', ms1.usable === true,
+    `usable=${ms1.usable} state=${ms1.state} tier=${ms1.tier} detail=${(ms1.detail || '').slice(0, 80)}`);
+  try { a.g.child.kill('SIGKILL'); } catch {}
+
+  const b = await mk('bad', P0 + 61, 'msgbad');
+  check('G38 实例启动（msgbad）', !b.g.failed && b.up, b.g.failed ? b.g.stderr().slice(0, 120) : 'ok');
+  const r2 = await askMsg(P0 + 61);
+  check('G38 窗口不符（m7 400）→ fail-closed 503', r2.status === 503,
+    `status=${r2.status} type=${r2.j?.error?.type} ${r2.text}`);
+  check('G38 失败明细包含 m10 回声', String(r2.j?.error?.precheck?.[0]?.detail || '').includes('m10'),
+    String(r2.j?.error?.precheck?.[0]?.detail || '').slice(0, 160));
+  const ms2 = await (await fetch(`http://127.0.0.1:${P0 + 61}/gate/msg-status`)).json();
+  check('G38 /gate/msg-status 显示不可用', ms2.usable === false,
+    `usable=${ms2.usable} state=${ms2.state} detail=${(ms2.detail || '').slice(0, 80)}`);
+  try { b.g.child.kill('SIGKILL'); } catch {}
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+}
 
 try { mock.close(); } catch {}
 console.log(`\n===== 覆盖缺口：${pass} 通过 / ${fail} 失败 =====`);

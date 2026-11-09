@@ -111,12 +111,24 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_HEDGE` | 1 | 对冲开关（预检通过后不再触发） |
 | `GATE_BLOCK_PROTOS` | `chat` | 追加封禁的协议列表（逗号分隔） |
 | `GATE_IMPL_VECTOR_MS` | 300000 | 实现指纹向量观测间隔（仅告警，不参与放行）；`0` = 关闭 |
-| `GATE_CACHE_PROBE_MS` | 600000 | **缓存语义探针间隔**（2026-11-06 新增，仅告警）。同一长前缀连发 2 次，断言第二次 `cached_tokens > 0` 且是 128 的倍数 —— 这是唯一能识破「该实现根本没有前缀缓存」的手段。单轮约 604 token（10 分钟频率 ≈ 96K token/天）；`0` = 关闭 |
+| `GATE_CACHE_PROBE_MS` | 600000 | **缓存语义探针间隔**（2026-11-06 新增）。同一长前缀连发 2 次，断言第二次 `cached_tokens > 0` 且是 128 的倍数 —— 这是唯一能识破「该实现根本没有前缀缓存」的手段。单轮约 604 token；`0` = 关闭。**2026-11-08 建议配合状态机设为 `180000`（3 分钟）**，再加 `GATE_PROBE_ACTIVE_WINDOW_MS` 活动门控，成本约 10 万 token/天 |
 | `GATE_CACHE_BLOCK_ALIGN` | `label` | **缓存块对齐判据强度**（2026-11-06 新增）。`label` = 只记 `CACHE_BLOCK_MISALIGNED` + 计数，不改变交付；`require` = 升为 hard，进入 `GATE_FP_POLICY` 的 retry/block 流程。默认 label 的原因：同 model 重发不改变落点（实测 32 次对照零差异），升 hard 只会白烧配额 |
 | `GATE_CACHE_BLOCK_SIZE` | 128 | 缓存块大小（token）。实测官方 `cached_tokens` 恒为该值的整数倍（283→256、455→384、710→640 都向下取整）。vLLM 默认 16、SGLang 默认 1，改这个值只在换上游基线时才需要 |
 | `GATE_STREAM_BUFFER` | `0` | **流式缓冲**（2026-11-06 新增，**默认关**）。`1` = 先把整条 SSE 流读进内存、判定后再一次性写出；不合规 → 503（`stream_id_shape` / `stream_cache_block`）。代价实测：首字节 1.6s → 1.9s（+0.22~0.31s），且**UI 渐进显示消失**（dsh 是 `AsyncIterable<StreamChunk>` 逐 chunk 消费）。这是唯一会改变延迟特性的开关 |
 | `GATE_STREAM_BUFFER_MAX` | 4194304 | 流式缓冲上限（字节）。超过即放弃判定、原样透传并记 `STREAM_BUFFER_SKIP`（fail-open）—— 超大响应缓冲既费内存也无判定收益 |
+| `GATE_PROBE_ADAPTIVE` | `1` | **探测状态机总开关**（2026-11-08）。`1` = normal/suspect/confirm 三段自动切换；`0` = 完全退回旧行为（固定间隔、只告警） |
+| `GATE_PROBE_MS_SUSPECT` | `90000` | SUSPECT 状态探测间隔（一次判负后进入；只缓冲 3 条业务请求做确认） |
+| `GATE_PROBE_MS_CONFIRM` | `60000` | CONFIRM 状态探测间隔（连续 2 次判负后进入；responses 直接 503） |
+| `GATE_PROBE_ACTIVE_WINDOW_MS` | `600000` | **活动门控**：最近 N 毫秒没有业务请求就跳过这一轮探测（不花 token）。`0` = 全天探测 |
+| `GATE_SENTINEL_N` | `3` | SUSPECT 时最多缓冲几条业务流式请求（用业务自己的响应做确认） |
+| `GATE_CONFIRM_ON` | `2` | 连续几次探测判负进入 CONFIRM |
+| `GATE_CONFIRM_MIN_MS` | `900000` | CONFIRM 最短持续（毫秒）；期间即使探针恢复也要等它过期且连续 2 次 good |
+| `GATE_STRICT_REJECT` | `1` | CONFIRM 时是否对 `responses` 直接 503 `gate_cache_semantics`；`0` = 只告警不拒绝 |
 | `GATE_ALLOW_MESSAGES` | 未设置 | **`1` 才解封 `messages`**。上游 messages 侧已混入非 UUID4 id 池，解封前必须先重新标定 `MSG_FINGERPRINT` |
+| `GATE_MSG_PROVIDER` | `0` | **messages 备选通道**（2026-11-08）：`1` 时，messages 成功响应只要本协议预检（msgfp/M6）pass 且 id 属于 `msg_hex/53hex/UUID4` 就交付；预检不通过一律 503 `gate_no_official_route`。默认关闭；开启还需 `GATE_ALLOW_MESSAGES=1` |
+| `GATE_MSG_OFFICIAL_TEXT` | `1` | **messages 官方文案判据**（2026-11-08）：九条固定文案 + 第十条**随机 role 回声**（每次预检换随机串，要求官方 422 + 原样回显 + UUID4 `request_id`），且不含 `Upstream request failed` / `gw-` 包装；探针限并发 3、503/429 重试一次。设为 `0` 退回旧 msgfp 指纹 |
+| `GATE_MSG_STATUS_MS` | `300000` | messages 可用性指示器后台刷新间隔；Tier0 单条回声约 30 token，通过后才跑全量 10 条。`0` = 关闭后台刷新（仍可 `ocg msg-status --refresh` 手动） |
+| `GATE_MSG_STATUS_ACTIVE_MS` | `600000` | 指示器活动窗口：最近这段时间无业务则跳过刷新（不花 token） |
 
 ### 预检（决定能否交付）
 
@@ -177,6 +189,7 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 |---|---|---|
 | `GATE_TOTAL_BUDGET_MS` | 90000 | 单请求总预算（首选车道 60s + 后备 30s；见下方说明） |
 | `GATE_UPSTREAM_TIMEOUT_MS` | 60000 | 上游单次超时 |
+| `GATE_UPSTREAM_HEADERS_TIMEOUT_MS` | 30000 | **流式**请求等响应头上限（2026-11-08 补）：流式头本该 1–2 秒到，卡住 30 秒即释放 `MAX_CONC` 槽位。**只对流式生效**——非流式响应的头要等整段生成完才到，套用该阈值会误杀长输出。设 `0` 关闭 |
 | `GATE_BODY_IDLE_TIMEOUT_MS` | 120000 | 流空闲超时 |
 | `GATE_MAX_BODY` | 16 MB | 请求体上限 |
 | `GATE_MAX_CONC` | 6 | 上游并发槽 |

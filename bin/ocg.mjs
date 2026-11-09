@@ -81,6 +81,15 @@ async function getJson(p, timeoutMs = 5000) {
     return await r.json();
   } catch { return null; }
 }
+async function msgStatus(refresh) {
+  const t = process.env.GATE_TOKEN || process.env.GATE_OBS_TOKEN || '';
+  const headers = t ? { 'x-gate-token': t } : undefined;
+  try {
+    const r = await fetch(`${BASE}/gate/msg-status${refresh ? '?refresh=1' : ''}`,
+      { headers, signal: AbortSignal.timeout(refresh ? 45000 : 5000) });
+    return await r.json();
+  } catch { return null; }
+}
 function portFree(port) {
   return new Promise(resolve => {
     const s = net.createServer();
@@ -825,6 +834,7 @@ async function cmdHelp() {
     '  ocg stop             优雅停止（drain 在途请求后退出；写 stop.flag 阻止监护拉起）',
     '  ocg restart          优雅重启（drain → 等退出 → 等新实例 health=200，打印中断时长）',
     '  ocg health [--json]  读取 /gate/health',
+    '  ocg msg-status [--refresh] [--json]  查看 messages 当前是否可用（--refresh 现场探测）',
     '',
     '环境变量：OPENCODE_GO_API_KEY（必填）、GATE_PORT（默认 8787）、GATE_TOKEN（可选本地鉴权）',
     '完整清单：docs/CONFIG.md',
@@ -859,6 +869,21 @@ async function main() {
       process.exit(0);
     }
     case 'doctor': return cmdDoctor();
+    case 'msg-status': {
+      const refresh = rest.includes('--refresh');
+      const j = await msgStatus(refresh);
+      if (!j) die(`连不上 ${BASE}/gate/msg-status —— 门控没在跑？先 ocg doctor`);
+      if (rest.includes('--json')) console.log(JSON.stringify(j, null, 2));
+      else {
+        const icon = j.usable ? '✅' : (j.state === 'unknown' ? '❔' : '❌');
+        const state = j.usable ? '可用（窗口 A）' : (j.state === 'unknown' ? '未知' : '不可用');
+        const age = typeof j.ageMs === 'number' ? Math.round(j.ageMs / 1000) + 's 前' : '尚未检查';
+        console.log(`${icon} messages ${state}  ${age}  tier=${j.tier}  ${j.detail || ''}`);
+        if (j.lastPassAt) console.log(`上次可用：${j.lastPassAt}`);
+        if (!refresh) console.log('提示：--refresh 现场探测（Tier0 约 30 token；通过后自动跑全量 10 条）');
+      }
+      process.exit(j.usable ? 0 : (j.state === 'unknown' ? 2 : 1));
+    }
     case 'audit': return cmdAudit();
   case 'audit-model': return cmdAuditModel(rest);
   case 'audit-lane': return cmdAuditLane(rest);

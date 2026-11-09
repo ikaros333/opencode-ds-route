@@ -277,7 +277,8 @@ has('P1-1 abortedByClient 只计 2 处', 'metrics.abortedByClient++;', { count: 
 // P1-2：所有上游请求必须走 transport
 // （probe / realRequest / 形态探针 / 实现向量探针 / 3 个预检 / 缓存语义探针 = 8）
 // 2026-11-06：+1 来自 runCacheProbe 的 cacheProbeOnce（L4），它同样走 transport。
-has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 8 });
+// 2026-11-08：+1 来自 messages 官方文案探针 msgTextProbe。
+has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 9 });
 has('P1-2 预检不再硬编码 https.request', 'const req = https.request(', { count: 0 });
 // P1-3：矩阵刷新与告警覆盖三条协议
 has('P1-3 刷新覆盖 chat', "for (const proto of ['responses', 'messages', 'chat'])");
@@ -765,7 +766,7 @@ hasIn(lines, 'AN1 客户端中止单独归类', "result: 'CLIENT_ABORTED'");
 hasIn(lines, 'AN2 AbortError 判定', "e?.name === 'AbortError'");
 hasIn(lines, 'AN3 中止判定先于 HANDLER_ERROR', 'if (aborted) {');
 hasOrder('AN4 中止分支早于 500 兜底', "result: 'CLIENT_ABORTED'", "type: 'gate_handler_error'");
-hasIn(lines, 'AN5 分段统计结构存在', 'const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], total: [] };');
+hasIn(lines, 'AN5 分段统计结构存在', 'const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], ttfb: [], total: [] };');
 hasIn(lines, 'AN6 分段采样有界', 'if (a.length > PHASE_KEEP) a.shift();');
 hasIn(lines, 'AN7 四段时间戳', 'const tPhase = { precheckDone: 0, upstreamDone: 0, headersAt: 0 };');
 hasIn(lines, 'AN8 预检落定打点', 'tPhase.precheckDone = Date.now();');
@@ -880,6 +881,115 @@ has('AQ17 去重计数', 'metrics.alertsDeduped = (metrics.alertsDeduped || 0) +
 hasIn(probeLines, 'AQ18 探针无 pass 时不给 full/high', 'else if (pass >= 1 && pass >= total - 1)');
 hasIn(probeLines, 'AQ19 探针无判据时 trust=none', "if (!total) { verdict = 'unknown'; trust = 'none'; }");
 hasNotIn(probeLines, 'AQ20 探针不再 import 已改名的 E_SERDE_EXTRAS', 'E_SERDE_EXTRAS,');
+
+// ===== 2026-11-08：客户端取消归类 + 探针错误分类 + 封禁协议告警 + 缓存块不重发 =====
+// 全部由 11-08 当日台账驱动（14:28:45 / 15:00:53 的 CLIENT_ABORTED 被记成不可达；
+// 04:24:26 全 ERR 向量被记成漂移；04:29:24 messages 降级告警；cacheBlockMisaligned 白重发）。
+console.log('\n=== AR. 2026-11-08 修复回归 ===');
+// 客户端取消：终局必须先判「客户端已断开」，不能落进 unreachable/blocked 分支
+has('AR1 终局先判客户端断开', 'if (clientGone.signal.aborted || res.destroyed) {', { count: 4 });
+has('AR2 取消留痕带 stage=terminal', "result: 'CLIENT_ABORTED', stage: 'terminal',", { count: 1 });
+hasOrder('AR3 取消判定早于终局归类',
+  "stage: 'terminal'", '// 拒绝原因必须区分开，否则客户端无法判断');
+has('AR3b 取消留痕覆盖四个收敛点', "stage: 'probe'");
+has('AR3c 取消留痕覆盖 hedge', "stage: 'hedge'");
+has('AR3d 取消留痕覆盖主循环', "stage: 'main-loop'");
+has('AR4 真实的不可达日志仍在（没被顺手删掉）', "result: 'UPSTREAM_UNREACHABLE'");
+// 实现向量：稳定位 ERR = 探针没问到，不是漂移
+has('AR5 稳定位 ERR 归为探针错误', "const probeErr = stableHead.split(',').includes('ERR');", { count: 1 });
+has('AR6 探针错误单独计数', 'metrics.implVectorProbeErr = (metrics.implVectorProbeErr || 0) + 1;', { count: 1 });
+has('AR7 探针错误不推 DRIFT 告警', "result: 'IMPL_VECTOR_PROBE_ERR'", { count: 1 });
+has('AR8 DRIFT 告警仍保留给真实变化', "pushAlert('IMPL_VECTOR_DRIFT'");
+// 封禁协议不推 ALL_LANES_DEGRADED
+has('AR9 封禁协议跳过降级告警', 'if (BLOCKED_PROTOS.has(p)) { lastAlertSig.delete(p); continue; }', { count: 1 });
+has('AR10 降级告警仍覆盖 responses', "pushAlert('ALL_LANES_DEGRADED'");
+// 缓存块不符不重发
+has('AR11 cacheBlockMisaligned 不参与重发', "const retryable = !miss.includes('cacheBlockMisaligned');", { count: 1 });
+has('AR12 跳过重发有台账记录', "result: 'FP_RETRY_SKIP'", { count: 1 });
+has('AR13 跳过重发有计数', 'metrics.fpRetrySkippedCache = (metrics.fpRetrySkippedCache || 0) + 1;', { count: 1 });
+has('AR14 重发条件包含 retryable', 'if (fpRetriesLeft > 0 && remainMs() > 3000 && !tooBig && retryable) {', { count: 1 });
+
+// ===== 2026-11-08（二）：流式等头 watchdog + phase 双口径 =====
+// 14:28 实测：流式请求 108s 没有返回任何响应头，一直占着 MAX_CONC 槽位到 120s。
+console.log('\n=== AS. 2026-11-08 P2 回归 ===');
+has('AS1 等头 watchdog 可配（默认 30s）', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 30000, { min: 0, max: 600000 })");
+has('AS2 watchdog 只对流式生效', 'if (body && body.stream === true && UPSTREAM_HEADERS_TIMEOUT_MS > 0) {', { count: 1 });
+has('AS3 等头超时有台账', "result: 'ATTEMPT_HEADERS_TIMEOUT'", { count: 1 });
+has('AS4 响应头到达即清除 watchdog', 'if (headersTimer) { try { clearTimeout(headersTimer); } catch {} headersTimer = null; }', { count: 2 });
+has('AS5 settle 同时清硬上限与等头计时', 'if (headersTimer) { try { clearTimeout(headersTimer); } catch {} headersTimer = null; }');
+has('AS6 phase 统计包含 ttfb', 'const phaseStats = { precheck: [], upstream: [], gate: [], stream: [], ttfb: [], total: [] };');
+has('AS7 health 暴露 ttfbMs 分位', 'ttfbMs:     { p50: pctOf(phaseStats.ttfb, 0.5),     p90: pctOf(phaseStats.ttfb, 0.9) },');
+has('AS8 台账 phase 带 ttfbMs', 'ttfbMs: tPhase.headersAt ? tPhase.headersAt - startedAt : Date.now() - startedAt,');
+has('AS9 非流式不套用等头阈值（注释固定语义）', '**只对流式生效**');
+
+// ===== 2026-11-08（三）：探测驱动三段状态机 + 活动门控 + sentinel =====
+console.log('\n=== AT. 2026-11-08 结构性升级回归 ===');
+has('AT1 状态机开关', "flag('GATE_PROBE_ADAPTIVE', true)");
+has('AT2 严格拒绝开关', "flag('GATE_STRICT_REJECT', true)");
+has('AT3 活动门控窗口', "num('GATE_PROBE_ACTIVE_WINDOW_MS', 600000,");
+has('AT4 可疑/确认探测间隔', "num('GATE_PROBE_MS_SUSPECT', 90000,");
+has('AT5 sentinel 条数', "num('GATE_SENTINEL_N', 3,");
+has('AT6 连续判负阈值', "num('GATE_CONFIRM_ON', 2,");
+has('AT7 状态对象存在', "const PROBE_STATE = { state: 'normal', driftStreak: 0, goodStreak: 0, sentinelLeft: 0,");
+has('AT8 判负升级 confirm', "if (PROBE_STATE.driftStreak >= CONFIRM_ON) {");
+has('AT9 连续 good 恢复', "PROBE_STATE.goodStreak >= 2 && confirmElapsed");
+has('AT10 sentinel 只在 suspect 生效', "const sentinelBuffer = PROBE_ADAPTIVE && PROBE_STATE.state === 'suspect' && PROBE_STATE.sentinelLeft > 0;");
+has('AT11 sentinel 递减', "PROBE_STATE.sentinelLeft = Math.max(0, PROBE_STATE.sentinelLeft - 1);");
+has('AT12 业务格判负立即确认', "noteSentinelNegative('sentinel_cache_block')");
+has('AT13 CONFIRM 直接 503', "type: 'gate_cache_semantics',");
+has('AT14 活动门控跳过探测', "const idle = PROBE_ACTIVE_WINDOW_MS > 0");
+has('AT15 空闲跳过有台账', "reason: 'idle',");
+has('AT16 业务活跃度打点', 'if (isProxy) noteBusinessActivity();');
+has('AT17 health 暴露状态机', 'probeControl: {');
+has('AT18 定时器改为状态机调度', 'scheduleCacheProbe(Math.min(12000, probeIntervalMs()));');
+hasNot('AT19 不再用固定 setInterval 跑缓存探针', "setInterval(() => { runCacheProbe().catch(() => {}); }, CACHE_PROBE_MS)");
+
+// ===== 2026-11-08（四）：messages 备选通道（dsh 第二个模型）=====
+console.log('\n=== AU. messages 备选通道回归 ===');
+has('AU1 备选通道默认关闭', "flag('GATE_MSG_PROVIDER', false)");
+has('AU2 messages 可交付形态集合', "const MSG_DELIVERABLE_SHAPES = new Set(['msg_hex', 'other', 'HEX32', 'UUID4', 'UUID']);");
+has('AU3 third 分支按预检 pass 放行', 'MSG_PROVIDER && proto === \'messages\'');
+has('AU4 交付留痕 MSG_PROVIDER_DELIVER', "result: 'MSG_PROVIDER_DELIVER'", { count: 2 });
+has('AU5 health 暴露 msgProvider', 'msgProvider: {');
+has('AU6 messages 路径仍受 GATE_ALLOW_MESSAGES 控制', "process.env.GATE_ALLOW_MESSAGES === '1' ? [] : ['messages']");
+has('AU7 备选通道不刷 ALL_LANES_DEGRADED', "if (p === 'messages' && MSG_PROVIDER) { lastAlertSig.delete(p); continue; }");
+
+// ===== 2026-11-08（五）：messages 官方文案判据 + 缓存块 =====
+console.log('\n=== AV. messages 官方文案判据回归 ===');
+has('AV1 官方文案判据开关', "flag('GATE_MSG_OFFICIAL_TEXT', true)");
+has('AV2 m1 官方 max_tokens 文案', "m1: { code: 400, re: /Invalid max_tokens value, the valid range of max_tokens is \\[1, 393216\\]/ }");
+has('AV3 m7 官方反序列化文案', "m7: { code: 422, re: /Failed to deserialize the JSON body into the target type: messages\\[0\\]\\.role: unknown variant `wizard`");
+has('AV4 request_id 必须是 UUID4', 'const MSG_REQ_ID_RE = /\\(request_id:\\s*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\)/i;');
+has('AV5 网关包装一律拒绝', 'const MSG_GATEWAY_WRAP_RE = /Upstream request failed|\\bgw-[0-9a-z]/i;');
+has('AV6 预检改用官方文案探针', "if (MSG_PROVIDER && MSG_OFFICIAL_TEXT) return runMsgOfficialText().then(r => [r]);");
+has('AV7 文案探针带 body', 'function msgTextProbe(p) {');
+has('AV8 messages 缓存块判据', 'function msgCacheMisaligned(r) {');
+has('AV9 缓存块不符 503', "type: 'gate_msg_cache_block'");
+has('AV10 health 暴露 officialText', 'officialText: MSG_OFFICIAL_TEXT,');
+
+// ===== 2026-11-08（六）：m10 随机回声 + 信封评分 + 流式缓存跳过 =====
+console.log('\n=== AW. messages 动态回声与信封评分回归 ===');
+has('AW1 随机 role 前缀', "const MSG_ECHO_PREFIX = 'wizard_';");
+has('AW2 探针限并发 3', 'runPool(probes, 3, msgTextProbeRetry)');
+has('AW3 5xx/429 重试一次', 'await sleepMs(350);');
+has('AW4 m10 必须回显本次随机串', 'body.includes(echo)');
+has('AW5 m10 期望 422', "r.code === 422 && body.includes(echo)");
+has('AW6 信封评分 official/relay', "function msgEnvelopeOf(r) {");
+has('AW7 health 暴露信封计数', 'envelopeOfficial: metrics.msgEnvelopeOfficial || 0,');
+has('AW8 流式跳过缓存块检查', 'if (r.stream) return null;');
+has('AW9 pass 明细带 echo ok', "'official-text ✓ (10/10, echo ok)'");
+
+// ===== 2026-11-08（七）：messages 可用性指示器 =====
+console.log('\n=== AX. messages 可用性指示器回归 ===');
+has('AX1 状态对象', 'const MSG_STATUS = {');
+has('AX2 Tier0 单条回声探针', 'async function runMsgEchoProbe() {');
+has('AX3 Tier0 失败即不可用', "state: net ? 'unknown' : 'unusable'");
+has('AX4 Tier0 通过后跑全量', 'const full = await runMsgOfficialText();');
+has('AX5 /gate/msg-status 端点', "req.url.startsWith('/gate/msg-status')");
+has('AX6 刷新需要 token', '刷新 messages 状态需要 x-gate-token。');
+has('AX7 后台 5 分钟调度', "num('GATE_MSG_STATUS_MS', 300000,");
+has('AX8 空闲跳过', "result: 'MSG_STATUS_SKIP', reason: 'idle'");
+has('AX9 health 暴露 msgStatus', 'msgStatus: msgStatusView(),');
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

@@ -138,6 +138,7 @@ async function boot(tag, env) {
       GATE_ASSURANCE: 'label', GATE_CANARY_POLICY: 'label', GATE_L0_POLICY: 'label',
       GATE_EVIDENCE_AUTO_REFRESH: '0', GATE_REFRESH_MS: '0', GATE_PROOF_REFRESH_MS: '0',
       GATE_IMPL_VECTOR_MS: '0', GATE_STARTUP_SELFTEST: '1',
+      GATE_PROBE_ADAPTIVE: '0',   // 既有用例只验探针本身；状态机由 G37 单独覆盖
       ...env },
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let up = false;
