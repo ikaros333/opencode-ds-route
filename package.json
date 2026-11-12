@@ -51,6 +51,7 @@
     "probe": "node bin/ocg.mjs probe",
     "check": "node gate/verify-patch.mjs",
     "test": "node gate/test-coverage.mjs",
+    "test:session-pick": "node gate/test-session-pick.mjs",
     "doctor": "node bin/ocg.mjs doctor",
     "audit": "node bin/ocg.mjs audit",
     "diag": "node bin/ocg.mjs diag",

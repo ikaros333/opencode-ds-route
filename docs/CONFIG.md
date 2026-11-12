@@ -99,7 +99,10 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_HOST` | `opencode.ai` | 上游主机（唯一出网目标）。**不允许指向 `*.deepseek.com`**：那是证据探针的基线，不是业务上游；真要放开必须显式 `GATE_ALLOW_OFFICIAL_HOST=1`，否则启动即拒绝（2026-11-05 用户硬约束） |
 | `GATE_HOST_PORT` | 443 | 上游端口 |
 | `GATE_HOST_SCHEME` | `https` | 上游协议 |
-| `GATE_SESSION` | 空 | 不设则读 `gate/logs/session.txt`，都没有就生成并写回。**决定 prompt cache 亲和，别乱换** |
+| `GATE_SESSION` | 空 | 不设则读 `gate/logs/session.txt`，都没有就生成并写回。**决定 prompt cache 亲和与 responses 校验器 worker**；换 session 前先用 `ocg session-pick` 探测，别随手换 |
+| `GATE_SESSION_POOL` | `1` | 启用 session 池健康检查；当前 session 连续退化时切到已知 OFFICIAL_TEXT 候选 |
+| `GATE_SESSION_CHECK_MS` | `600000` | session 健康检查间隔（毫秒）；`0` 关闭周期检查 |
+| `GATE_SESSION_FAIL_THRESHOLD` | `2` | 连续多少次非 OFFICIAL 后触发池切换 |
 
 ### 路由
 
@@ -129,6 +132,8 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 | `GATE_MSG_OFFICIAL_TEXT` | `1` | **messages 官方文案判据**（2026-11-08）：九条固定文案 + 第十条**随机 role 回声**（每次预检换随机串，要求官方 422 + 原样回显 + UUID4 `request_id`），且不含 `Upstream request failed` / `gw-` 包装；探针限并发 3、503/429 重试一次。设为 `0` 退回旧 msgfp 指纹 |
 | `GATE_MSG_STATUS_MS` | `300000` | messages 可用性指示器后台刷新间隔；Tier0 单条回声约 30 token，通过后才跑全量 10 条。`0` = 关闭后台刷新（仍可 `ocg msg-status --refresh` 手动） |
 | `GATE_MSG_STATUS_ACTIVE_MS` | `600000` | 指示器活动窗口：最近这段时间无业务则跳过刷新（不花 token） |
+| `GATE_MSG_PROBE_RETRY` | `2` | messages 官方文案探针遇到 429/5xx/超时的重试次数；只对网络类失败重试，文案不符不重试 |
+| `GATE_MSG_PROBE_BACKOFF_MS` | `400` | 重试退避基数（毫秒）：400、800… + 0–200ms 抖动 |
 
 ### 预检（决定能否交付）
 
@@ -189,7 +194,10 @@ curl.exe -sS http://127.0.0.1:8787/gate/metrics
 |---|---|---|
 | `GATE_TOTAL_BUDGET_MS` | 90000 | 单请求总预算（首选车道 60s + 后备 30s；见下方说明） |
 | `GATE_UPSTREAM_TIMEOUT_MS` | 60000 | 上游单次超时 |
-| `GATE_UPSTREAM_HEADERS_TIMEOUT_MS` | 30000 | **流式**请求等响应头上限（2026-11-08 补）：流式头本该 1–2 秒到，卡住 30 秒即释放 `MAX_CONC` 槽位。**只对流式生效**——非流式响应的头要等整段生成完才到，套用该阈值会误杀长输出。设 `0` 关闭 |
+| `GATE_UPSTREAM_HEADERS_TIMEOUT_MS` | 20000 | **流式**请求等响应头上限（2026-11-08 补，2026-11-10 改为自适应）：流式头本该 1–2 秒到，卡住 20 秒即释放 `MAX_CONC` 槽位。**只对流式生效**；计时从请求体写完（`req finish`）开始。**只对 ≤ `GATE_HEADERS_WATCHDOG_MAX_BODY` 的请求生效**。设 `0` 关闭 |
+| `GATE_UPSTREAM_HEADERS_TIMEOUT_MAX_MS` | `120000` | 自适应等头上限（2026-11-10）：基础值 + 每 MB 追加，封顶此值 |
+| `GATE_UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS` | `2000` | 每 MB body 追加的等头预算（毫秒） |
+| `GATE_HEADERS_WATCHDOG_MAX_BODY` | `2097152`（2MiB） | 超过该体积不再启用等头 watchdog（9–16MB 上传本身 20–40s，误杀代价更高）；改用总预算/上游超时兜底 |
 | `GATE_BODY_IDLE_TIMEOUT_MS` | 120000 | 流空闲超时 |
 | `GATE_MAX_BODY` | 16 MB | 请求体上限 |
 | `GATE_MAX_CONC` | 6 | 上游并发槽 |
@@ -278,6 +286,8 @@ git checkout <上一个可用版本> -- gate\oc-gate.mjs gate\verify-patch.mjs
 | `GATE_EVIDENCE_REFRESH_MIN_MS` | `120000`（2min） | 自愈冷却：两次自动刷新之间的最小间隔，防止上游抖动时把探针打成风暴 |
 | `GATE_EVIDENCE_REFRESH_TIMEOUT_MS` | `15000` | 自愈时单次探针超时 |
 | `GATE_EVIDENCE_REFRESH_CANARY_N` | `4` | 自愈快路径的 canary 采样数（阈值 = `ceil(0.9×N)`）。整点任务仍是 10 条 |
+| `GATE_EVIDENCE_PROACTIVE_MS` | `5400000`（90min） | **提前补刷阈值**（2026-11-09）：快照年龄到 90 分钟就后台补刷，不等 `MAX_AGE` 过期；`0` 关闭 |
+| `GATE_EVIDENCE_CHECK_MS` | `300000`（5min） | 提前补刷的检查间隔 |
 
 **自愈走「快路径」**（2026-11-05）：完整一轮 `audit-lane` 实测 **48s**，而 503 之后客户端
 （dsh `maxRetries=2`，800ms 起退避）等不到。快路径只跑**判正必需**的探针：L0 指纹、EV3/EV4 校验文案、

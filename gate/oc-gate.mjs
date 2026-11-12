@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { Transform } from 'node:stream';
+import { probeSession as sessionProbe, writeSessionFile as writeSessionFilePick } from './session-pick.mjs';
 // 判据基线唯一来源：id 形态 / messages 状态码指纹 / e1 文案都从这里拿。
 // 不要在别处复制字面量——verify-patch 会断言这一点。
 import {
@@ -246,6 +247,7 @@ const metrics = { requests: 0, pass: 0, passUnverified: 0, blocked: 0, hedged: 0
   billingMul: null, alertsDeduped: 0,
   // 2026-11-07：「无证据」预检重试次数
   precheckNoEvidenceRetry: 0 };
+const PRECHECK_NET = { abort: 0, timeout: 0, net: 0, lastAt: null, lastDetail: null };
 
 // ---------- 2026-11-05：分段计时（阶段一 P0-②） ----------
 // 起因：台账只有 elapsedMs，`elapsed − Σattempts.ms` 的 p90 有 1.7s 无法归因 ——
@@ -430,7 +432,22 @@ const UPSTREAM_TIMEOUT_MS = num('GATE_UPSTREAM_TIMEOUT_MS', 60000, { min: 1000, 
 // UPSTREAM_TIMEOUT_MS(120s)。流式请求的头本该在 1–2 秒内到达（实测 TTFB 1.6–2.0s），
 // 所以给它一个独立的 30s 上限；超时即释放槽位。
 // **只对流式生效**：非流式响应的头要等整段生成完才到（实测 16K token 需 44s），不能套用该阈值。
-const UPSTREAM_HEADERS_TIMEOUT_MS = num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 30000, { min: 0, max: 600000 });
+const UPSTREAM_HEADERS_TIMEOUT_MS = num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 20000, { min: 0, max: 600000 });
+// 2026-11-10：大请求（9–16MB、上传 ~450KB/s）不能按 20s 一刀切。
+// 等头计时从请求体写完（req 'finish'）开始，并按 body 大小追加预算。
+const UPSTREAM_HEADERS_TIMEOUT_MAX_MS = num('GATE_UPSTREAM_HEADERS_TIMEOUT_MAX_MS', 120000, { min: 0, max: 600000 });
+const UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS = num('GATE_UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS', 2000, { min: 0, max: 60000 });
+// 2026-11-10：超过该体积不再启用等头 watchdog —— 9–16MB 上传本身就要 20–40s，
+// 且 HTTP/1.1 上游收完 body 才回头；误杀代价高于释放槽位。大请求改用总预算/上游超时兜底。
+const GATE_HEADERS_WATCHDOG_MAX_BODY = num('GATE_HEADERS_WATCHDOG_MAX_BODY', 2097152, { min: 0, max: 268435456 });
+function headersTimeoutFor(bytes) {
+  const base = UPSTREAM_HEADERS_TIMEOUT_MS;
+  if (base <= 0) return 0;
+  if (bytes > GATE_HEADERS_WATCHDOG_MAX_BODY) return 0;
+  const mb = Math.ceil(Math.max(0, Number(bytes) || 0) / 1048576);
+  const extra = mb > 1 ? mb * UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS : 0;
+  return Math.min(UPSTREAM_HEADERS_TIMEOUT_MAX_MS, base + extra);
+}
 // 响应头到达后，body 阶段允许的**无数据**间隔。只要还有字节流入就不断。
 //
 // 为什么需要它：Node 的 req.setTimeout 是 socket 空闲超时，不是总时长。而非流式请求
@@ -518,6 +535,9 @@ const EVIDENCE_REFRESH_MIN_MS = num('GATE_EVIDENCE_REFRESH_MIN_MS', 120000, { mi
 const EVIDENCE_REFRESH_TIMEOUT_MS = num('GATE_EVIDENCE_REFRESH_TIMEOUT_MS', 15000, { min: 1000, max: 120000 });
 // 自愈快路径的 canary 采样数：默认 4（仍要求 ≥ceil(0.9×N)=4 全中）。整点任务仍是 10 条全量。
 const EVIDENCE_REFRESH_CANARY_N = num('GATE_EVIDENCE_REFRESH_CANARY_N', 4, { min: 1, max: 20 });
+// 2026-11-09：提前补刷，不等 2h 过期才刷（睡眠/待机导致定时任务漏跑时的兜底）。
+const EVIDENCE_PROACTIVE_MS = num('GATE_EVIDENCE_PROACTIVE_MS', 5400000, { min: 0, max: 86400000 });
+const EVIDENCE_CHECK_MS = num('GATE_EVIDENCE_CHECK_MS', 300000, { min: 60000, max: 3600000 });
 const evRefresh = { inflight: false, attempts: 0, at: 0, ok: null, ms: null, lastError: null, lastWhy: null };
 function refreshEvidenceInBackground(why) {
   if (!EVIDENCE_AUTO_REFRESH) return false;
@@ -529,7 +549,7 @@ function refreshEvidenceInBackground(why) {
         host: HOST + ':' + String(HOST_PORT) });
   Promise.resolve()
     .then(() => runEvidence({ host: HOST, port: HOST_PORT, scheme: HOST_SCHEME, prefix: UPSTREAM_PREFIX,
-                              key: KEY, model: ALLOWED[0], session: UPSTREAM_PREFIX !== '',
+                              key: KEY, model: ALLOWED[0], session: STABLE_SESSION,
                               timeoutMs: EVIDENCE_REFRESH_TIMEOUT_MS, allowGen: false,
                               // 快路径：完整一轮 ~48s，客户端等不到；这里只跑判正必需项 + 4 条 canary
                               fast: true, canaryN: EVIDENCE_REFRESH_CANARY_N }))
@@ -537,6 +557,10 @@ function refreshEvidenceInBackground(why) {
     .then(scored => {
       writeEvidenceSnapshot(EVIDENCE_FILE, scored);
       evRefresh.ok = true; evRefresh.ms = Date.now() - t0; evRefresh.lastError = null;
+      if (Array.isArray(scored.relayBugs) && scored.relayBugs.length) {
+        log({ ts: new Date().toISOString(), result: 'EVIDENCE_RELAY_BUGS',
+              bugs: scored.relayBugs.map((b) => b.id) });
+      }
       log({ ts: new Date().toISOString(), result: 'EVIDENCE_REFRESH_OK', ms: evRefresh.ms,
             assurance: scored.assurance, canary: (scored.canary?.score ?? 0) + '/' + (scored.canary?.max ?? 0),
             canarySkipped: scored.canary?.skippedReason || null });
@@ -548,6 +572,26 @@ function refreshEvidenceInBackground(why) {
     })
     .finally(() => { evRefresh.inflight = false; });
   return true;
+}
+// 2026-11-09：提前补刷（90 分钟），不等 2h 过期；睡眠漏跑后醒来的兜底。
+function evidenceAgeNow() {
+  const ev = readEvidenceSnapshot(EVIDENCE_FILE);
+  if (!ev || !ev.at) return Infinity;
+  return Date.now() - Date.parse(ev.at);
+}
+let evidenceProactiveTimer = null;
+function evidenceProactiveTick() {
+  if (!EVIDENCE_AUTO_REFRESH || EVIDENCE_PROACTIVE_MS <= 0) return;
+  const age = evidenceAgeNow();
+  if (age >= EVIDENCE_PROACTIVE_MS) {
+    refreshEvidenceInBackground(age >= EVIDENCE_MAX_AGE_MS ? 'stale' : 'proactive');
+  }
+}
+function scheduleEvidenceProactive() {
+  if (!EVIDENCE_AUTO_REFRESH || EVIDENCE_PROACTIVE_MS <= 0) return;
+  clearInterval(evidenceProactiveTimer);
+  evidenceProactiveTimer = setInterval(evidenceProactiveTick, EVIDENCE_CHECK_MS);
+  evidenceProactiveTimer.unref?.();
 }
 // 2026-11-02：模型族证据策略。require = 快照里的 model.family 必须为 deepseek-consistent，否则 503。
 // 注意：证明的是「模型族」（分词一致性 + 官方校验器模板），不是权重托管方。
@@ -668,6 +712,15 @@ const LOG_KEEP = num('GATE_LOG_KEEP', 5, { min: 0, max: 100 });
 // 稳定的上游 session id：用于路由亲和与 prompt cache。
 // 客户端没有提供时必须复用同一个值，否则每次请求都是新 session，缓存全部失效。
 const SESSION_FILE = path.join(LOG_DIR, 'session.txt');
+// 2026-11-11：实测 session 是路由键；这些短名在 high+max_tokens=0 探针下为 OFFICIAL。
+// 只作为候选池，使用前仍会逐个探测；不假设永久有效。
+const SESSION_POOL = Array.from({ length: 32 }, (_, i) => 'sess-' + i);
+const SESSION_CHECK_MS = num('GATE_SESSION_CHECK_MS', 600000, { min: 0, max: 86400000 });
+const SESSION_FAIL_THRESHOLD = num('GATE_SESSION_FAIL_THRESHOLD', 2, { min: 1, max: 10 });
+const SESSION_POOL_ENABLED = (process.env.GATE_SESSION_POOL ?? '1') === '1';
+const SESSION_STATE = { at: null, ok: null, kind: null, checks: 0, fails: 0,
+                        current: null, lastPickAt: null, lastPickFrom: null, lastError: null };
+let SESSION_TICK_INFLIGHT = false;
 let STABLE_SESSION = process.env.GATE_SESSION || '';
 if (!STABLE_SESSION) {
   try { STABLE_SESSION = fs.readFileSync(SESSION_FILE, 'utf8').trim(); } catch {}
@@ -1240,14 +1293,23 @@ function realRequest({ pathName, body, incoming, model, signal, payloadFactory, 
     // ★ 2026-11-08：流式请求等头 watchdog（只对流式生效）。
     // 头在 1–2 秒内本该到；超过 30s（可配）说明这条连接卡住，释放槽位，避免 6 条僵尸占满 MAX_CONC。
     if (body && body.stream === true && UPSTREAM_HEADERS_TIMEOUT_MS > 0) {
-      headersTimer = setTimeout(() => {
-        if (settledFlag) return;
-        log({ ts: new Date().toISOString(), result: 'ATTEMPT_HEADERS_TIMEOUT', model,
-              elapsedMs: Date.now() - started, capMs: UPSTREAM_HEADERS_TIMEOUT_MS });
-        settle({ verdict: 'error', status: 0, error: 'headers_timeout', model, ms: Date.now() - started });
-        try { req.destroy(new Error('headers timeout')); } catch {}
-      }, UPSTREAM_HEADERS_TIMEOUT_MS);
-      if (headersTimer && typeof headersTimer.unref === 'function') headersTimer.unref();
+      const cap = headersTimeoutFor(payload.length);
+      if (cap > 0) {
+        const arm = () => {
+          if (settledFlag || headersTimer) return;
+          headersTimer = setTimeout(() => {
+            if (settledFlag) return;
+            log({ ts: new Date().toISOString(), result: 'ATTEMPT_HEADERS_TIMEOUT', model,
+                  elapsedMs: Date.now() - started, capMs: cap, bodyBytes: payload.length });
+            settle({ verdict: 'error', status: 0, error: 'headers_timeout', model, ms: Date.now() - started });
+            try { req.destroy(new Error('headers timeout')); } catch {}
+          }, cap);
+          if (headersTimer && typeof headersTimer.unref === 'function') headersTimer.unref();
+        };
+        // 2026-11-10：从 body 写完开始算；否则 10–16MB 的上传时间会被误算成"上游卡死"。
+        if (req.writableFinished) arm();
+        else req.once('finish', arm);
+      }
     }
   });
 }
@@ -1425,6 +1487,72 @@ const precheckLastFor = (p) => precheckLastByProto.get(p) || null;
 const precheckPassByProto = new Map();  // proto -> 最近一次 pass 的记录
 const precheckPassFor = (p) => precheckPassByProto.get(p) || null;
 
+// ---------- 2026-11-11：session 池健康检查 / 退化切换 ----------
+function sessionProbeBase() {
+  const scheme = HOST_SCHEME || 'https';
+  const port = HOST_PORT && !((scheme === 'https' && Number(HOST_PORT) === 443) || (scheme === 'http' && Number(HOST_PORT) === 80))
+    ? ':' + HOST_PORT : '';
+  return `${scheme}://${HOST}${port}${UPSTREAM_PREFIX}`;
+}
+function switchSession(next, why) {
+  if (!next || next === STABLE_SESSION) return false;
+  const from = STABLE_SESSION;
+  STABLE_SESSION = next;
+  try { writeSessionFilePick(SESSION_FILE, next); } catch (e) { SESSION_STATE.lastError = String(e?.message || e); }
+  precheckPassByProto.clear();
+  precheckLastByProto.clear();
+  precheckInflight.clear();
+  SESSION_STATE.current = next;
+  SESSION_STATE.lastPickAt = new Date().toISOString();
+  SESSION_STATE.lastPickFrom = from;
+  SESSION_STATE.fails = 0;
+  SESSION_STATE.ok = null;
+  SESSION_STATE.kind = null;
+  log({ ts: new Date().toISOString(), result: 'SESSION_PICK', from, to: next, why });
+  try { pushAlert('SESSION_PICK', { from, to: next, why }); } catch {}
+  return true;
+}
+async function sessionTick(why = 'scheduled') {
+  if (!SESSION_POOL_ENABLED || !KEY || !STABLE_SESSION || !UPSTREAM_PREFIX) return;
+  if (SESSION_TICK_INFLIGHT) return;
+  SESSION_TICK_INFLIGHT = true;
+  try { await sessionTickInner(why); }
+  finally { SESSION_TICK_INFLIGHT = false; }
+}
+async function sessionTickInner(why = 'scheduled') {
+  const prevOk = SESSION_STATE.ok;
+  const r = await sessionProbe(STABLE_SESSION, { baseUrl: sessionProbeBase(), key: KEY, model: ALLOWED[0], timeoutMs: 12000 });
+  SESSION_STATE.at = new Date().toISOString();
+  SESSION_STATE.kind = r.kind;
+  SESSION_STATE.checks++;
+  SESSION_STATE.current = STABLE_SESSION;
+  if (r.kind === 'OFFICIAL_TEXT') {
+    SESSION_STATE.ok = true; SESSION_STATE.fails = 0; SESSION_STATE.lastError = null;
+    if (prevOk !== true) log({ ts: SESSION_STATE.at, result: 'SESSION_OK', session: STABLE_SESSION, kind: r.kind, why });
+    return;
+  }
+  SESSION_STATE.ok = false;
+  SESSION_STATE.fails++;
+  log({ ts: SESSION_STATE.at, result: 'SESSION_DEGRADED', session: STABLE_SESSION,
+        kind: r.kind, fails: SESSION_STATE.fails, threshold: SESSION_FAIL_THRESHOLD, why });
+  if (SESSION_STATE.fails < SESSION_FAIL_THRESHOLD) return;
+  for (const s of SESSION_POOL) {
+    if (s === STABLE_SESSION) continue;
+    const rr = await sessionProbe(s, { baseUrl: sessionProbeBase(), key: KEY, model: ALLOWED[0], timeoutMs: 12000 });
+    if (rr.kind === 'OFFICIAL_TEXT') {
+      if (switchSession(s, 'degraded:' + r.kind)) return;
+    }
+  }
+  SESSION_STATE.fails = 0;
+  log({ ts: new Date().toISOString(), result: 'SESSION_POOL_MISS', current: STABLE_SESSION, kind: r.kind });
+  try { pushAlert('SESSION_POOL_MISS', { current: STABLE_SESSION, kind: r.kind }); } catch {}
+}
+function scheduleSessionCheck() {
+  if (!SESSION_POOL_ENABLED || SESSION_CHECK_MS <= 0) return;
+  setTimeout(() => { sessionTick('startup').catch(() => {}); }, 10000).unref?.();
+  setInterval(() => { sessionTick('scheduled').catch(() => {}); }, SESSION_CHECK_MS).unref();
+}
+
 // ---------- chat 协议的精度探针（logprobs 置信度）----------
 // 探针必须选「官方侧 top1 极稳定」的 prompt。
 // 实测（2026-10-19，官方 8 轮）：以下 5 个探针 top1 恒为 1.19e-7，零波动；
@@ -1527,6 +1655,46 @@ const MSG_STATUS = {
   usable: false, state: 'unknown', checkedAt: null, ms: 0, tier: 0,
   echoOk: false, fingerprint: '', detail: '尚未检查', lastPassAt: null, source: 'none',
 };
+// 2026-11-09：模仿官方文案的日志去重（每个探针每小时最多一条）。
+const msgMimicAt = new Map();
+const msgWrapAt = new Map();
+// 2026-11-09：模型别名可用性（deepseek-flash 直调 400 Model is unavailable；门控会重写 v4.1-flash）。
+const MODEL_ALIAS = { model: 'deepseek-flash', checkedAt: null, status: null, ok: null };
+function checkModelAlias(retried = false) {
+  if (!KEY) return;
+  const payload = Buffer.from(JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 1 }), 'utf8');
+  const req = transport.request({
+    host: HOST, port: HOST_PORT, path: UPSTREAM_PREFIX + '/v1/responses', method: 'POST', timeout: 8000,
+    headers: { 'content-type': 'application/json', 'content-length': payload.length,
+               authorization: 'Bearer ' + KEY, 'x-opencode-session': STABLE_SESSION },
+  }, (res) => {
+    res.resume();
+    res.on('end', () => {
+      MODEL_ALIAS.checkedAt = new Date().toISOString();
+      MODEL_ALIAS.status = res.statusCode;
+      MODEL_ALIAS.ok = res.statusCode >= 200 && res.statusCode < 300;
+      log({ ts: new Date().toISOString(), result: 'MODEL_ALIAS_CHECK',
+            model: MODEL_ALIAS.model, status: res.statusCode, ok: MODEL_ALIAS.ok });
+    });
+  });
+  req.on('error', (e) => {
+    const code = e?.code || e?.name || String(e?.message || e);
+    // 2026-11-11：本机 DNS 抖动（ENOTFOUND/EAI_AGAIN）重试一次，避免把解析失败记成别名失效。
+    if (!retried && /ENOTFOUND|EAI_AGAIN|ETIMEDOUT/i.test(code)) {
+      retried = true;
+      log({ ts: new Date().toISOString(), result: 'MODEL_ALIAS_RETRY', model: MODEL_ALIAS.model, error: code });
+      setTimeout(() => { try { checkModelAlias(true); } catch {} }, 600);
+      return;
+    }
+    MODEL_ALIAS.checkedAt = new Date().toISOString();
+    MODEL_ALIAS.status = -1; MODEL_ALIAS.ok = null;
+    log({ ts: new Date().toISOString(), result: 'MODEL_ALIAS_CHECK', model: MODEL_ALIAS.model,
+          status: -1, error: code });
+  });
+  req.on('timeout', () => { try { req.destroy(); } catch {} });
+  req.end(payload);
+}
+
 // 2026-11-08：指示器后台刷新。默认 5 分钟一次，且只在最近 10 分钟有业务时跑（空闲不花 token）。
 const MSG_STATUS_MS = num('GATE_MSG_STATUS_MS', 300000, { min: 0, max: 3600000 });
 const MSG_STATUS_ACTIVE_MS = num('GATE_MSG_STATUS_ACTIVE_MS', 600000, { min: 0, max: 86400000 });
@@ -1668,11 +1836,14 @@ function runPool(items, limit, fn) {
     for (let k = 0; k < Math.min(limit, items.length); k++) pump();
   });
 }
+const MSG_PROBE_RETRY = num('GATE_MSG_PROBE_RETRY', 2, { min: 0, max: 4 });
+const MSG_PROBE_BACKOFF_MS = num('GATE_MSG_PROBE_BACKOFF_MS', 400, { min: 0, max: 5000 });
 async function msgTextProbeRetry(p) {
   let r = await msgTextProbe(p);
-  // 503/429/timeout 是「本次不可判定」，不是「文案不符」；重试一次，避免窗口 A 被瞬时故障误杀。
-  if (r.code === -1 || r.code === 429 || (r.code >= 500 && r.code <= 599)) {
-    await sleepMs(350);
+  for (let i = 0; i < MSG_PROBE_RETRY; i++) {
+    if (!(r.code === -1 || r.code === 429 || (r.code >= 500 && r.code <= 599))) break;
+    // 2026-11-09：503 是间歇性的；单次 350ms 不够，改成 2 次递增退避 + 抖动。
+    await sleepMs(MSG_PROBE_BACKOFF_MS * (i + 1) + Math.floor(Math.random() * 200));
     r = await msgTextProbe(p);
   }
   return r;
@@ -1685,13 +1856,14 @@ async function runMsgOfficialText() {
   const rows = await runPool(probes, 3, msgTextProbeRetry);
   const bad = [];
   let net = 0;
+  const mimic = [];
   for (const r of rows) {
     if (!r) { bad.push('probe:null'); net++; continue; }
     const body = String(r.body || '');
     const isNet = r.code === -1 || r.code === 429 || (r.code >= 500 && r.code <= 599);
     if (r.id === 'm10') {
       const ok = r.code === 422 && body.includes(echo) && MSG_REQ_ID_RE.test(body) && !MSG_GATEWAY_WRAP_RE.test(body);
-      if (!ok) { bad.push('m10:echo'); if (isNet) net++; }
+      if (!ok) { bad.push(isNet ? 'm10:net' : 'm10:echo'); if (isNet) net++; }
       continue;
     }
     const rule = MSG_TEXT_RULES[r.id];
@@ -1701,26 +1873,49 @@ async function runMsgOfficialText() {
     const idOk = MSG_REQ_ID_RE.test(body);
     const wrapBad = MSG_GATEWAY_WRAP_RE.test(body);
     if (!codeOk || !textOk || !idOk || wrapBad) {
-      bad.push(`${r.id}:${r.code}${textOk ? '' : ':text'}${idOk ? '' : ':reqid'}${wrapBad ? ':wrap' : ''}`);
-      if (isNet) net++;
+      if (isNet) { bad.push(`${r.id}:net`); net++; }
+      else bad.push(`${r.id}:${r.code}${textOk ? '' : ':text'}${idOk ? '' : ':reqid'}${wrapBad ? ':wrap' : ''}${(idOk && wrapBad) ? ':reqid+' : ''}`);
+      // 2026-11-09：官方文案 + 包装/缺 UUID4 的「模仿」形态（m1 实测出现过）。
+      // 只观测，不改变 fail-closed。
+      if (textOk && (!codeOk || !idOk || wrapBad)) {
+        metrics.msgTextMimic = (metrics.msgTextMimic || 0) + 1;
+        if (idOk && wrapBad) {
+          metrics.msgWrapReqid = (metrics.msgWrapReqid || 0) + 1;
+          const lastW = msgWrapAt.get(r.id) || 0;
+          if (Date.now() - lastW > 3600000) {
+            msgWrapAt.set(r.id, Date.now());
+            log({ ts: new Date().toISOString(), result: 'MSG_WRAP_REQID',
+                  probe: r.id, code: r.code, wrapped: true, reqid: true });
+          }
+        }
+        mimic.push(r.id);
+        const last = msgMimicAt.get(r.id) || 0;
+        if (Date.now() - last > 3600000) {
+          msgMimicAt.set(r.id, Date.now());
+          log({ ts: new Date().toISOString(), result: 'MSG_OFFICIAL_TEXT_MIMIC',
+                probe: r.id, code: r.code, wrapped: wrapBad, reqid: idOk });
+        }
+      }
     }
   }
   const fp = rows.map((r) => (r ? r.code : -1)).join(',');
+  const verdict = bad.length ? (net === bad.length ? 'unknown' : 'fail') : 'pass';
   const detail = bad.length
-    ? `official-text ✗ ${bad.join(',')}${net ? ` net=${net}` : ''}`
+    ? `official-text ✗ ${bad.join(',')}${net ? ` net=${net}` : ''}${mimic.length ? ` mimic=${mimic.join('/')}` : ''}`
     : 'official-text ✓ (10/10, echo ok)';
   if (MSG_PROVIDER) {
-    const ok = !bad.length;
+    const ok = verdict === 'pass';
     Object.assign(MSG_STATUS, {
-      usable: ok, state: ok ? 'A' : 'unusable', checkedAt: new Date().toISOString(),
-      ms: 0, tier: 1, echoOk: !bad.some((x) => x.startsWith('m10')),
+      usable: ok, state: ok ? 'A' : (verdict === 'unknown' ? 'unknown' : 'unusable'),
+      checkedAt: new Date().toISOString(),
+      ms: 0, tier: 1, echoOk: !bad.some((x) => x.startsWith('m10:echo')),
       fingerprint: fp, detail, source: 'precheck',
     });
     if (ok) MSG_STATUS.lastPassAt = MSG_STATUS.checkedAt;
   }
   return {
     id: 'msgtext',
-    verdict: bad.length ? 'fail' : 'pass',
+    verdict,
     ms: 0,
     detail,
     fingerprint: fp,
@@ -1753,7 +1948,8 @@ async function refreshMsgStatus() {
   const full = await runMsgOfficialText();
   const ok = full.verdict === 'pass';
   Object.assign(MSG_STATUS, {
-    usable: ok, state: ok ? 'A' : 'unusable', checkedAt: new Date().toISOString(),
+    usable: ok, state: ok ? 'A' : (full.verdict === 'unknown' ? 'unknown' : 'unusable'),
+    checkedAt: new Date().toISOString(),
     ms: Date.now() - t0, tier: 1, echoOk: true, fingerprint: full.fingerprint,
     detail: full.detail, source: 'live',
   });
@@ -2353,7 +2549,7 @@ async function runImplVector() {
 // 所以这里取 repeat(20) ≈ input 370，留足余量（实测该档 run2.cached=256，稳定）。
 const CACHE_PROBE_TEXT = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo '.repeat(20);
 const CACHE_PROBE_MIN_INPUT = 256;   // 低于此值 cached 必然为 0，不能据此判 no_cache_impl
-const CACHE_PROBE_STATE = { at: null, ok: null, reason: null, cached: 0, input: null, runs: 0, ms: 0 };
+const CACHE_PROBE_STATE = { at: null, ok: null, reason: null, cached: 0, input: null, runs: 0, ms: 0, lastGood: null };
 
 // ★ 2026-11-08：探测驱动的三段状态机（normal / suspect / confirm）+ 活动门控 + sentinel。
 // 依据（11-08 测试 + 模拟）：
@@ -2512,6 +2708,8 @@ async function runCacheProbe() {
     CACHE_PROBE_STATE.ok = null;
     CACHE_PROBE_STATE.reason = 'no_usage';
     metrics.cacheProbeNoUsage = (metrics.cacheProbeNoUsage || 0) + 1;
+    log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE_FAIL', reason: 'no_usage',
+          runs: runs.length, ms: CACHE_PROBE_STATE.ms });
     log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE_SKIP', reason: 'no_usage', ms: CACHE_PROBE_STATE.ms });
     noteProbeOutcome('no_usage');
     return;
@@ -2531,6 +2729,7 @@ async function runCacheProbe() {
   CACHE_PROBE_STATE.ok = reason === 'ok';
   if (reason === 'ok') {
     metrics.cacheProbeOk = (metrics.cacheProbeOk || 0) + 1;
+    CACHE_PROBE_STATE.lastGood = { at: CACHE_PROBE_STATE.at, cached: maxCached, input, ms: CACHE_PROBE_STATE.ms };
     log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE', input, cached: maxCached,
           block: CACHE_BLOCK_SIZE, runs: runs.length, ms: CACHE_PROBE_STATE.ms });
   } else {
@@ -2539,6 +2738,8 @@ async function runCacheProbe() {
     log({ ts: CACHE_PROBE_STATE.at, result: 'ALERT_CACHE_SEMANTICS_DRIFT', reason, input,
           cached: maxCached, block: CACHE_BLOCK_SIZE, remainder: maxCached % CACHE_BLOCK_SIZE,
           runs: runs.length, ms: CACHE_PROBE_STATE.ms });
+    log({ ts: CACHE_PROBE_STATE.at, result: 'CACHE_PROBE_FAIL', reason, input,
+          cached: maxCached, runs: runs.length, ms: CACHE_PROBE_STATE.ms });
   }
   noteProbeOutcome(reason);
 }
@@ -2738,9 +2939,11 @@ function precheck(proto = 'responses', opts = {}) {
     // 判据强度不变：重试后仍必须是真 pass 才能交付；fail / format / drift 一律不重试。
     // 重试用**放宽后的上限**（否则同一个偏小的 deadline 会再超时一次）。
     const NO_EVIDENCE = new Set(['net', 'rate', 'timeout']);
+    const noEvidence = (r) => NO_EVIDENCE.has(r.verdict)
+      || (r.verdict === 'unknown' && /net|timeout|abort/i.test(String(r.detail || '')));
     let noEvidRetry = 0;
     while (agg.verdict === 'unknown' && noEvidRetry < PRECHECK_NOEVID_RETRY
-           && results.length > 0 && results.every(r => NO_EVIDENCE.has(r.verdict))) {
+           && results.length > 0 && results.every(noEvidence)) {
       noEvidRetry++;
       metrics.precheckNoEvidenceRetry++;
       const wider = Math.min(PROBE_DEADLINE_MAX, Math.max(probeDeadlineMs(), deadlineAtStart * 2));
@@ -2754,6 +2957,20 @@ function precheck(proto = 'responses', opts = {}) {
     }
 
     const { verdict, passCount, total, driftCount = 0 } = agg;
+    // 2026-11-12：把 ABORT_ERR/timeout 单独计数；不改变 fail-closed。
+    const netRows = results.filter((r) => /net|timeout|abort/i.test(`${r.verdict || ''} ${r.detail || ''}`));
+    if (netRows.length) {
+      const detail = netRows.map((r) => `${r.id}:${r.verdict}(${r.detail || ''})`).join(',');
+      const isAbort = /abort/i.test(detail);
+      const isTimeout = /timeout/i.test(detail);
+      if (isAbort) PRECHECK_NET.abort++; else if (isTimeout) PRECHECK_NET.timeout++; else PRECHECK_NET.net++;
+      PRECHECK_NET.lastAt = new Date().toISOString();
+      PRECHECK_NET.lastDetail = detail.slice(0, 180);
+      if (isAbort) {
+        log({ ts: PRECHECK_NET.lastAt, result: 'PRECHECK_ABORT', proto, strategy,
+              lane: lane || undefined, detail: PRECHECK_NET.lastDetail });
+      }
+    }
     if (verdict === 'fail') metrics.precheckFail++;
     const tookMs = Date.now() - runT0;
     // ★ 探针被上限截断时 tookMs≈deadline（abort），必须显式告知 EWMA 以触发跳档
@@ -3635,6 +3852,7 @@ async function handle(req, res) {
         aligned: metrics.cacheBlockAligned || 0,
         misaligned: metrics.cacheBlockMisaligned || 0,
       },
+      precheckNet: PRECHECK_NET,
       // ★ 2026-11-06：流式缓冲（L3）状态。关闭时 enabled=false，四个计数恒为 0。
       streamBuffer: {
         enabled: STREAM_BUFFER,
@@ -3668,12 +3886,22 @@ async function handle(req, res) {
         echoProbe: true,
         delivered: metrics.msgProviderDelivered || 0,
         cacheMisaligned: metrics.msgCacheMisaligned || 0,
+        textMimic: metrics.msgTextMimic || 0,
+        wrapReqid: metrics.msgWrapReqid || 0,
         envelopeOfficial: metrics.msgEnvelopeOfficial || 0,
         envelopeRelay: metrics.msgEnvelopeRelay || 0,
         deliverableShapes: [...MSG_DELIVERABLE_SHAPES],
         requirePrecheck: true,
       },
       msgStatus: msgStatusView(),
+      headersTimeoutMs: UPSTREAM_HEADERS_TIMEOUT_MS,
+      headersTimeoutMaxMs: UPSTREAM_HEADERS_TIMEOUT_MAX_MS,
+      headersTimeoutPerMbMs: UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS,
+      headersWatchdogMaxBody: GATE_HEADERS_WATCHDOG_MAX_BODY,
+      modelAlias: MODEL_ALIAS,
+      sessionPool: { enabled: SESSION_POOL_ENABLED, checkMs: SESSION_CHECK_MS,
+                     failThreshold: SESSION_FAIL_THRESHOLD, current: STABLE_SESSION,
+                     pool: SESSION_POOL, state: SESSION_STATE },
       serdeFamily: lastSerdeFamily, upstreamPrefix: UPSTREAM_PREFIX, precheckProfile: lastUpstreamProfile,
       evidence: (() => {
         const ev = readEvidenceSnapshot(EVIDENCE_FILE);
@@ -3688,7 +3916,10 @@ async function handle(req, res) {
         const proof = { verified: metrics.proofVerified || 0, unverified: metrics.proofUnverified || 0,
                         keyOrder: metrics.keyOrder, server: metrics.proofServer,
                         relayMimicsOfficial: metrics.relayMimicsOfficial || 0 };
-        const base = { modelPolicy: MODEL_EVIDENCE_POLICY, maxAgeMs: EVIDENCE_MAX_AGE_MS, refresh, proof };
+        const base = { modelPolicy: MODEL_EVIDENCE_POLICY, maxAgeMs: EVIDENCE_MAX_AGE_MS, refresh, proof,
+                       proactiveMs: EVIDENCE_PROACTIVE_MS, checkMs: EVIDENCE_CHECK_MS,
+                       session: (ev && ev.session) || null,
+                       relayBugs: (ev && Array.isArray(ev.relayBugs)) ? ev.relayBugs : [] };
         if (!ev) return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: 'missing', snapshot: null };
         const ageMs = Date.now() - Date.parse(ev.at || '');
         return { ...base, policy: EVIDENCE_POLICY, expect: EVIDENCE_EXPECT, verdict: ev.endpoint?.verdict || 'unknown',
@@ -4029,7 +4260,8 @@ async function handle(req, res) {
       // x-gate-refresh: started = 已触发后台补刷（客户端稍后重试即可恢复），不是"永久不可用"
       return replyEarly(req, res, 503, { error: { type: 'gate_assurance_unmet',
         message: '本协议（' + proto + '）被【' + blockedBy + '】判定不可放行（' + why + '）；已 fail-closed。' +
-                 (refreshStarted ? ' 证据已过期，门控正在后台补刷，稍后重试即可恢复。' : ''),
+                 (refreshStarted || evRefresh.inflight
+                   ? ' 证据已过期，门控正在后台补刷，约 30 秒后重试即可恢复。' : ''),
         proto, blocked_by: blockedBy, reason: why,
         assurance: ASSURANCE, l0_policy: L0_POLICY, canary_policy: CANARY_POLICY,
         proto_evidence: protoEvidence === undefined ? 'unknown' : protoEvidence,
@@ -4039,9 +4271,12 @@ async function handle(req, res) {
         evidence_age_ms: Number.isFinite(ageA) ? ageA : null,
         evidence_max_age_ms: EVIDENCE_MAX_AGE_MS,
         refresh_started: refreshStarted,
+        refresh_inflight: !!evRefresh.inflight,
+        retry_after_ms: 30000,
         retryable: true } }, {
+        'retry-after': '30',
         'x-gate-fatal': '1',
-        ...(refreshStarted ? { 'x-gate-refresh': 'started' } : {}),
+        ...(refreshStarted || evRefresh.inflight ? { 'x-gate-refresh': 'started' } : {}),
       });
     }
   }
@@ -5228,6 +5463,17 @@ server.listen(PORT, '127.0.0.1', () => {
   if (MSG_PROVIDER && MSG_STATUS_MS > 0) {
     scheduleMsgStatus(Math.min(20000, MSG_STATUS_MS));
   }
+  // 2026-11-09：别名可用性检查（1 次请求；deepseek-flash 已 400，门控实际用 v4.1-flash）。
+  setTimeout(checkModelAlias, 8000).unref?.();
+  // 2026-11-11：session 池健康检查；当前 session 连续退化时切到池内下一个。
+  scheduleSessionCheck();
+  // 2026-11-09：提前补刷；启动时若快照已过 90 分钟也补一次。
+  scheduleEvidenceProactive();
+  setTimeout(() => {
+    if (evidenceAgeNow() >= EVIDENCE_PROACTIVE_MS) {
+      refreshEvidenceInBackground(evidenceAgeNow() >= EVIDENCE_MAX_AGE_MS ? 'stale' : 'startup');
+    }
+  }, 5000).unref?.();
 
   // ★ 第 17 轮：启动自检（D5-2）
   // 目的：区分「端口通了但上游废」的假活状态。

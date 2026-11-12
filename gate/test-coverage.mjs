@@ -128,16 +128,23 @@ const mock = http.createServer((req, res) => {
       const role = m && m[0] ? m[0].role : null;
       const badRole = typeof role === 'string' && role.startsWith('wizard');
       const badContent = m && m[0] && typeof m[0].content !== 'string';
-      if (mode === 'msgok' || mode === 'msgbad') {
-        const RID = UUID4; // '01234567-89ab-4cde-8f01-23456789abcd'
-        const err = (code, msg) => {
-          res.writeHead(code, { 'content-type': 'application/json' });
-          return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } }));
-        };
-        const official = mode === 'msgok';
+      const RID = UUID4;
+      const err = (code, msg) => {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } }));
+      };
+      if (mode === 'msgnetfull') {
+        if (badRole) return err(422, `Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant \`${role}\`, expected one of \`user\`, \`assistant\`, \`system\` (request_id: ${RID})`);
+        return err(503, 'Upstream request failed: Endpoint is unavailable.');
+      }
+      if (mode === 'msgok' || mode === 'msgbad' || mode === 'msgmimic') {
+        const mimic = mode === 'msgmimic';
+        const official = mode !== 'msgbad';
         if (jb.max_tokens === 0) {
           return official
-            ? err(400, `Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: ${RID})`)
+            ? err(400, mimic
+                ? `Upstream request failed: [invalid_request_error] Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: ${RID})`
+                : `Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: ${RID})`)
             : err(400, 'Upstream request failed: [invalid_request_error] max_tokens must be between 1 and 393216 (request_id: gw-abc123)');
         }
         if (typeof jb.temperature === 'number' && (jb.temperature < 0 || jb.temperature > 2)) {
@@ -1875,12 +1882,79 @@ console.log('\n=== G38 messages 备选通道：预检 pass → 交付；窗口�
   check('G38 窗口不符（m7 400）→ fail-closed 503', r2.status === 503,
     `status=${r2.status} type=${r2.j?.error?.type} ${r2.text}`);
   check('G38 失败明细包含 m10 回声', String(r2.j?.error?.precheck?.[0]?.detail || '').includes('m10'),
-    String(r2.j?.error?.precheck?.[0]?.detail || '').slice(0, 160));
+    `json=${JSON.stringify(r2.j).slice(0, 300)}`);
   const ms2 = await (await fetch(`http://127.0.0.1:${P0 + 61}/gate/msg-status`)).json();
   check('G38 /gate/msg-status 显示不可用', ms2.usable === false,
     `usable=${ms2.usable} state=${ms2.state} detail=${(ms2.detail || '').slice(0, 80)}`);
   try { b.g.child.kill('SIGKILL'); } catch {}
   await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+}
+
+console.log('\n=== G39/G40 messages 状态：net-only → unknown；官方文案模仿计数 ===');
+{
+  const boot = async (port, modeName, tag) => {
+    await fetch(`http://127.0.0.1:${MP}/mode/${modeName}`);
+    const g = await startGate(port, {
+      GATE_ALLOW_MESSAGES: '1', GATE_MSG_PROVIDER: '1',
+      GATE_MSG_STATUS_MS: '0',
+      GATE_LOG_FILE: path.join(TEST_LOGS, `cov-${tag}.jsonl`),
+      GATE_SNAPSHOT: path.join(TEST_LOGS, `cov-${tag}-m.json`),
+    });
+    let up = false;
+    for (let i = 0; i < 60 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${port}/gate/health`); if (r.ok) up = true; } catch {} }
+    return { g, up };
+  };
+  const g39 = await boot(P0 + 62, 'msgnetfull', 'g39');
+  check('G39 实例启动', !g39.g.failed && g39.up, g39.g.failed ? g39.g.stderr().slice(0, 120) : 'ok');
+  const s39 = await (await fetch(`http://127.0.0.1:${P0 + 62}/gate/msg-status?refresh=1`)).json();
+  check('G39 全 503 → state=unknown（不是 unusable）', s39.state === 'unknown' && s39.usable === false,
+    `state=${s39.state} usable=${s39.usable} detail=${(s39.detail || '').slice(0, 100)}`);
+  try { g39.g.child.kill('SIGKILL'); } catch {}
+
+  const g40 = await boot(P0 + 63, 'msgmimic', 'g40');
+  check('G40 实例启动', !g40.g.failed && g40.up, g40.g.failed ? g40.g.stderr().slice(0, 120) : 'ok');
+  const s40 = await (await fetch(`http://127.0.0.1:${P0 + 63}/gate/msg-status?refresh=1`)).json();
+  check('G40 官方文案 + 包装 → unusable', s40.state === 'unusable' && s40.usable === false,
+    `state=${s40.state} json=${JSON.stringify(s40).slice(0, 220)} stderr=${g40.g.stderr().slice(-160)}`);
+  const h40 = await (await fetch(`http://127.0.0.1:${P0 + 63}/gate/health`)).json();
+  check('G40 记录 textMimic', (h40.msgProvider?.textMimic || 0) >= 1,
+    `textMimic=${h40.msgProvider?.textMimic} detail=${(h40.msgStatus?.detail || '').slice(0, 100)}`);
+  check('G40 记录 wrapReqid', (h40.msgProvider?.wrapReqid || 0) >= 1,
+    `wrapReqid=${h40.msgProvider?.wrapReqid} detail=${(h40.msgStatus?.detail || '').slice(0, 120)}`);
+  check('G40 detail 标记 reqid+', String(h40.msgStatus?.detail || '').includes('reqid+'),
+    `detail=${(h40.msgStatus?.detail || '').slice(0, 120)}`);
+  try { g40.g.child.kill('SIGKILL'); } catch {}
+  await fetch(`http://127.0.0.1:${MP}/mode/ok`);
+}
+
+console.log('\n=== G41 证据过期 503：Retry-After + retry_after_ms ===');
+{
+  const oldSnap = path.join(TEST_LOGS, 'cov-g41-stale.json');
+  fs.writeFileSync(oldSnap, JSON.stringify({
+    at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+    validator: { responses: true, messages: false, reachable: true },
+    canary: { score: 10, max: 10, ok: true, skipped: false },
+    l0: { score: 0, max: 5 }, endpoint: { verdict: 'unverified' }, assurance: 'label',
+  }));
+  const g = await startGate(P0 + 64, {
+    GATE_EVIDENCE_FILE: oldSnap,
+    GATE_CANARY_POLICY: 'require',
+    GATE_EVIDENCE_AUTO_REFRESH: '0',
+    GATE_ASSURANCE: 'label', GATE_L0_POLICY: 'label',
+  });
+  let up = false;
+  for (let i = 0; i < 40 && !up; i++) { await sleep(150); try { const r = await fetch(`http://127.0.0.1:${P0 + 64}/gate/health`); if (r.ok) up = true; } catch {} }
+  check('G41 实例启动', !g.failed && up, g.failed ? g.stderr().slice(0, 120) : 'ok');
+  const r = await fetch(`http://127.0.0.1:${P0 + 64}/v1/responses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-flash', input: 'hi', max_output_tokens: 8 }),
+  });
+  const text = await r.text(); let j = null; try { j = JSON.parse(text); } catch {}
+  check('G41 stale → 503', r.status === 503, `status=${r.status} type=${j?.error?.type}`);
+  check('G41 Retry-After: 30', r.headers.get('retry-after') === '30', `retry-after=${r.headers.get('retry-after')}`);
+  check('G41 体带 retry_after_ms', j?.error?.retry_after_ms === 30000,
+    `retry_after_ms=${j?.error?.retry_after_ms} inflight=${j?.error?.refresh_inflight}`);
+  try { g.child.kill('SIGKILL'); } catch {}
 }
 
 try { mock.close(); } catch {}

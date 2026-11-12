@@ -23,6 +23,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const GATE_DIR = path.join(ROOT, 'gate');
+const SESSION_FILE = path.join(GATE_DIR, 'logs', 'session.txt');
+function readGateSession() {
+  try { return (process.env.GATE_SESSION || fs.readFileSync(SESSION_FILE, 'utf8')).trim(); } catch { return process.env.GATE_SESSION || ''; }
+}
 /** Windows 下动态 import 必须给 file:// URL，直接传盘符路径会报 ERR_UNSUPPORTED_ESM_URL_SCHEME */
 const importFile = p => import(pathToFileURL(p).href);
 
@@ -216,6 +220,51 @@ function detectDrift(file, scored) {
   return alerts;
 }
 
+async function cmdSessionPick(rest) {
+  const mod = await importFile(path.join(GATE_DIR, 'session-pick.mjs'));
+  const getArg = (name, def) => {
+    const hit = rest.find(x => x.startsWith('--' + name + '='));
+    if (hit) return hit.slice(name.length + 3);
+    const i = rest.indexOf('--' + name);
+    if (i >= 0 && rest[i + 1] && !rest[i + 1].startsWith('--')) return rest[i + 1];
+    return def;
+  };
+  const count = Number(getArg('count', 12)) || 12;
+  const apply = rest.includes('--apply');
+  const asJson = rest.includes('--json');
+  const current = getArg('session', '') || readGateSession();
+  const key = process.env.OPENCODE_GO_API_KEY || '';
+  if (!key) die('缺 OPENCODE_GO_API_KEY');
+  const scheme = process.env.GATE_HOST_SCHEME || 'https';
+  const host = process.env.GATE_HOST || 'opencode.ai';
+  const port = process.env.GATE_HOST_PORT;
+  const prefix = process.env.GATE_UPSTREAM_PREFIX ?? '/zen/go';
+  const baseUrl = `${scheme}://${host}${port ? ':' + port : ''}${prefix}`;
+  const result = await mod.pickOfficialSession({ current, count, baseUrl, key,
+    model: (process.env.GATE_CHAIN || 'deepseek-v4.1-flash').split(',')[0] });
+  if (asJson) console.log(JSON.stringify(result, null, 2));
+  else {
+    console.log(`[ocg] session-pick  当前=${current || '(none)'}  候选=${result.results.length}`);
+    for (const r of result.results) {
+      const mark = r.kind === 'OFFICIAL_TEXT' ? '✅' : (r.kind === 'NO_VALIDATION' ? '○' : '❌');
+      console.log(`  ${mark} ${r.session}  ${r.kind}  ${r.ms}ms  ${r.msg}`);
+    }
+    console.log(`\n选中：${result.picked || '(none)'}  ${result.official ? 'OFFICIAL_TEXT' : '未找到 official-text，保留当前'}`);
+    if (!apply) console.log('\n[dry-run] 加 --apply 才会写入 gate/logs/session.txt');
+  }
+  if (apply && result.picked) {
+    const w = mod.writeSessionFile(SESSION_FILE, result.picked);
+    if (!asJson) {
+      console.log(`[ocg] 已写入 ${w.file}${w.backup ? '（备份 ' + w.backup + '）' : ''}`);
+      console.log('[ocg] 让门控加载新 session：ocg restart');
+      if (process.env.GATE_SESSION && process.env.GATE_SESSION !== result.picked) {
+        console.log('[ocg] 注意：环境变量 GATE_SESSION 仍指向旧值，restart 前先清掉或改成新值');
+      }
+    }
+  }
+  return result.official ? 0 : 1;
+}
+
 async function cmdAuditLane(rest) {
   const { runEvidence, scoreEvidence, writeSnapshot } = await import('../gate/evidence.mjs');
   const has = (k) => rest.includes('--' + k);
@@ -227,14 +276,17 @@ async function cmdAuditLane(rest) {
     // 2026-11-02：按 host 选 key（否则拿 opencode 的 key 打官方会全量 401）
     key: pickEvidenceKey((process.env.GATE_HOST || 'opencode.ai')),
     model: (process.env.GATE_CHAIN || 'deepseek-flash').split(',')[0],
-    session: (process.env.GATE_UPSTREAM_PREFIX ?? '/zen/go') !== '',
+    session: readGateSession() || true,
     allowGen: has('gen'),
   });
   const scored = scoreEvidence(ev);
   if (has('json')) {
     console.log(JSON.stringify(scored, null, 2));
   } else {
-    console.log(`[ocg] audit-lane  上游=${scored.upstream.host}${scored.upstream.prefix}  模型=${scored.upstream.model}`);
+    console.log(`[ocg] audit-lane  上游=${scored.upstream.host}${scored.upstream.prefix}  模型=${scored.upstream.model}  session=${scored.session || '(none)'}`);
+    if (Array.isArray(scored.relayBugs) && scored.relayBugs.length) {
+      console.log(`  中转参数负指纹：${scored.relayBugs.map((b) => b.id).join(', ')}`);
+    }
     console.log(`\n  L1 端点身份（可证）：${scored.endpoint.score}/${scored.endpoint.max}  → ${scored.endpoint.verdict}`);
     for (const it of scored.endpoint.items) {
       const m = it.skipped ? '⊘' : (it.ok ? '✅' : '❌');
@@ -452,6 +504,11 @@ async function cmdDoctor() {
       else line('warn', '门控归属', `跑的是另一份安装：${h.root}（当前仓库 ${ROOT}）→ 改这份代码不会生效`);
     } else {
       line('warn', '门控归属', '门控版本过旧（health 无 root 字段）→ 重启一次以启用归属识别');
+    }
+    if (h.modelAlias) {
+      const a = h.modelAlias;
+      line(a.ok === true ? 'ok' : 'warn', '模型别名',
+        `${a.model} HTTP ${a.status ?? '?'}${a.ok === true ? '' : '（门控会重写为链模型，不影响 dsh）'}`);
     }
   } else {
     bad++;
@@ -835,6 +892,7 @@ async function cmdHelp() {
     '  ocg restart          优雅重启（drain → 等退出 → 等新实例 health=200，打印中断时长）',
     '  ocg health [--json]  读取 /gate/health',
     '  ocg msg-status [--refresh] [--json]  查看 messages 当前是否可用（--refresh 现场探测）',
+    '  ocg session-pick [--count N] [--apply] [--json]  探测并固定 responses 的 official-text session',
     '',
     '环境变量：OPENCODE_GO_API_KEY（必填）、GATE_PORT（默认 8787）、GATE_TOKEN（可选本地鉴权）',
     '完整清单：docs/CONFIG.md',
@@ -886,6 +944,7 @@ async function main() {
     }
     case 'audit': return cmdAudit();
   case 'audit-model': return cmdAuditModel(rest);
+    case 'session-pick': return cmdSessionPick(rest);
   case 'audit-lane': return cmdAuditLane(rest);
     case 'diag': return cmdDiag(rest.find(a => a.startsWith('--out='))?.slice(6) || (rest[0] === '--out' ? rest[1] : null));
     case 'setup': return cmdSetup(rest);

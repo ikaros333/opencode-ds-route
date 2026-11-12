@@ -19,7 +19,7 @@ export const L2_IDS = ['EV7', 'EV8', 'EV9'];
 // 2026-11-04：L0 端点指纹（零成本判负）+ MX messages 协议判据（唯一可判正判负的协议）
 export const L0_IDS = ['L0-1', 'L0-2', 'L0-3', 'L0-4', 'L0-5'];
 export const MSG_IDS = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'];
-export const VALIDATE_IDS = ['EV3', 'EV4', 'EV14', 'EV15', 'M6'];   // 2026-11-05：校验可达性
+export const VALIDATE_IDS = ['EV3', 'EV3H', 'EV4', 'EV14', 'EV15', 'M6'];   // 2026-11-05：校验可达性；2026-11-11：EV3H 业务形状
 export const OFFICIAL_OWNERS = ['deepseek'];
 
 function request(t, { method = 'POST', path: p, body = null, headers = {}, timeoutMs = 15000, auth = 'bearer' }) {
@@ -30,7 +30,7 @@ function request(t, { method = 'POST', path: p, body = null, headers = {}, timeo
     if (auth === 'bearer' && t.key) h.authorization = 'Bearer ' + t.key;
     if (auth === 'apikey' && t.key) h['x-api-key'] = t.key;
     if (data) { h['content-type'] = 'application/json'; h['content-length'] = data.length; }
-    if (t.session) { h['x-opencode-session'] = 'evidence'; h['x-opencode-session-id'] = 'evidence'; }
+    if (t.session) { h['x-opencode-session'] = String(t.session); h['x-opencode-session-id'] = String(t.session); }
     const lib = t.scheme === 'http' ? http : https;
     const r = lib.request({
       host: t.host, port: t.port || (t.scheme === 'http' ? 80 : 443), path: (t.prefix || '') + p, method, headers: h, timeout: timeoutMs,
@@ -74,7 +74,9 @@ async function tlsProbe(host, timeoutMs) {
 export async function runEvidence(o) {
   const t = {
     host: o.host, port: o.port, scheme: o.scheme || 'https', prefix: o.prefix || '',
-    key: o.key || '', model: o.model || 'deepseek-flash', session: !!o.session,
+    key: o.key || '', model: o.model || 'deepseek-flash',
+    // 2026-11-11：证据探针必须和业务请求使用同一个 session；否则会测到另一个 worker。
+    session: typeof o.session === 'string' && o.session ? o.session : (o.session ? 'evidence' : ''),
   };
   const timeout = o.timeoutMs || 15000;
   const allowGen = !!o.allowGen;
@@ -88,6 +90,8 @@ export async function runEvidence(o) {
     ? Math.min(20, Math.floor(Number(o.canaryN))) : 10;
   const base = (extra) => ({ model: t.model, input: '只回答：好', max_output_tokens: 4, reasoning: { effort: 'none' }, ...extra });
   const items = [];
+  // 2026-11-10：中转参数映射 bug 的显式负指纹（只留痕/告警，不参与计分）。
+  const relayBugs = [];
   const add = (id, ok, detail, extra = {}) => items.push({ id, ok, detail, ...extra });
 
   // EV1 官方专有端点：余额
@@ -119,7 +123,31 @@ export async function runEvidence(o) {
     const r = await request(t, { path: '/v1/responses', body: base(body), timeoutMs: timeout });
     const m = msgOf(r);
     const ok = r.status === 400 && re.test(m);
-    add(id, ok, r.status === 0 ? 'net:' + r.err : (ok ? '范围校验命中' : 'HTTP ' + r.status + ' ' + m.slice(0, 40)));
+    // 2026-11-10：EV3 被中转误映射成 max_completion_tokens；EV4 top_p=2 直接 200。
+    if (id === 'EV3' && r.status === 400 && /max_completion_tokens/i.test(m)) {
+      relayBugs.push({ id: 'RELAY_TEMP_MISMATCH', detail: m.slice(0, 180) });
+    } else if (id === 'EV3' && /worker:\s*temperature/i.test(m)) {
+      relayBugs.push({ id: 'RELAY_TEMP_WORKER_WRAP', detail: m.slice(0, 180) });
+    }
+    if (id === 'EV4' && r.status === 200) {
+      relayBugs.push({ id: 'RELAY_TOP_P_IGNORED', detail: 'top_p=2 → HTTP 200' });
+    }
+    add(id, ok, r.status === 0 ? 'net:' + r.err : (ok ? '范围校验命中' : 'HTTP ' + r.status + ' ' + m.slice(0, 40)),
+      { positive: false });
+  }
+
+  // EV3H：业务形状探针（high effort + max_tokens=0）。temperature 在 high 下被忽略，
+  // 所以用这个判断“业务实际 reasoning 路径”是否仍走官方校验器。
+  {
+    const r = await request(t, { path: '/v1/responses',
+      body: base({ max_output_tokens: 0, reasoning: { effort: 'high' } }), timeoutMs: timeout });
+    const m = msgOf(r);
+    const ok = r.status === 400 && /Invalid max_tokens value, the valid range of max_tokens/i.test(m);
+    if (r.status === 400 && /max_tokens must be between/i.test(m)) {
+      relayBugs.push({ id: 'RELAY_MAX_TOKEN_WRAP', detail: m.slice(0, 180) });
+    }
+    add('EV3H', ok, r.status === 0 ? 'net:' + r.err : (ok ? '业务形状范围校验命中' : 'HTTP ' + r.status + ' ' + m.slice(0, 40)),
+      { positive: false, business: true });
   }
 
   // ---------------- 2026-11-05：EV14 / EV15 文本级校验判据 ----------------
@@ -156,7 +184,7 @@ export async function runEvidence(o) {
     const ok14 = rows14.filter((x) => x.hit).length;
     add('EV14', ok14 === 3, `官方名单文案 ${ok14}/3` +
       (ok14 < 3 ? '  ' + rows14.filter((x) => !x.hit).map((x) => `${x.proto}:${x.wrapped ? '包装前缀' : 'st' + x.status}`).join(',') : ''),
-      { rows: rows14 });
+      { rows: rows14, positive: false });
 
     const probes15 = [
       ['messages', msgPath, mHeaders, { model: t.model, max_tokens: 0, messages: [{ role: 'user', content: 'hi' }] }],
@@ -170,7 +198,7 @@ export async function runEvidence(o) {
     const ok15 = rows15.filter((x) => x.hit).length;
     add('EV15', ok15 === 2, `边界文案 ${ok15}/2` +
       (ok15 < 2 ? '  ' + rows15.filter((x) => !x.hit).map((x) => `${x.proto}:${x.wrapped ? '包装前缀' : 'st' + x.status}`).join(',') : ''),
-      { rows: rows15 });
+      { rows: rows15, positive: false });
   }
 
   // EV5 TLS 证书 / EV6 ALPN
@@ -266,7 +294,7 @@ export async function runEvidence(o) {
       if (r.status === 400 && textOk && idOk) ok++;
       detail.push(`${c.id}:${r.status}${textOk ? '/txt' : ''}${idOk ? '/uuid4' : ''}`);
     }
-    add('EV11', ok >= 3, `命中 ${ok}/${OFFICIAL_ERR_TEMPLATES.length} (${detail.join(' ')})`);
+    add('EV11', ok >= 3, `命中 ${ok}/${OFFICIAL_ERR_TEMPLATES.length} (${detail.join(' ')})`, { positive: false });
   }
 
   // ---------------- 2026-11-04：L0 端点指纹（零成本判负）----------------
@@ -419,7 +447,8 @@ export async function runEvidence(o) {
     }
   }
 
-  return { at: new Date().toISOString(), upstream: { host: t.host, prefix: t.prefix, model: t.model }, items };
+  return { at: new Date().toISOString(), session: t.session || null,
+           upstream: { host: t.host, prefix: t.prefix, model: t.model }, items, relayBugs };
 }
 
 /** 打分：L1（EV1–EV6）满分 → official；≤2 → non-official；其余 unknown。L2 同理但永不影响 L1 结论。 */
@@ -481,6 +510,7 @@ export function scoreEvidence(ev) {
     const M15 = pick(r15, 'messages'), C15 = pick(r15, 'chat');
     return {
       responses: mk([{ id: 'EV3', ok: byId.EV3?.ok }, { id: 'EV4', ok: byId.EV4?.ok }, { id: 'EV14', ok: R?.hit }], [R]),
+      responsesBusiness: mk([{ id: 'EV3H', ok: byId.EV3H?.ok }], [R]),
       messages: mk([{ id: 'M6', ok: byId.M6?.ok }, { id: 'EV14', ok: M14?.hit }, { id: 'EV15', ok: M15?.hit }], [M14, M15]),
       chat: mk([{ id: 'EV14', ok: C14?.hit }, { id: 'EV15', ok: C15?.hit }], [C14, C15]),
       at: ev.at || null,
@@ -489,7 +519,8 @@ export function scoreEvidence(ev) {
 
   // 2026-11-04：校验器可达性（判正）。V1 = responses 官方范围文案；V2 = messages 官方范围文案。
   // 2026-11-05：扩展为包含 EV14/EV15 文本级判据（任一条命中即算可达）。
-  const v1 = !!(byId.EV3?.ok && byId.EV4?.ok) || validate.responses.status === 'pass';
+  // 2026-11-11：V1 改为业务形状 EV3H，避免 low-effort temperature 探针误代表 high 业务。
+  const v1 = !!byId.EV3H?.ok;
   const v2 = !!byId.M6?.ok || validate.messages.status === 'pass';
   const validator = { responses: v1, messages: v2, reachable: v1 || v2 };
 

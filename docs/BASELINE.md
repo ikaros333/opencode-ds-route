@@ -208,6 +208,101 @@ GATE_ATTEMPT_HARD_CAP_MS = 180000   (180 s，不变)
 **结论**：messages 只作为**证据探针**（MX 判据），其 M6 已能证明"校验器可达"并写入快照；
 业务通道保持 responses，messages 端点对客户端继续 `503 gate_proto_blocked`。
 
+## B31 2026-11-12 m1 wrap+UUID4 / precheck ABORT
+
+- messages m1 出现过：官方 `Invalid max_tokens value...` + UUID4 `request_id` + `Upstream request failed` 包装；
+  不是稳定形态；sess-4/sess-18 同时段 m1 直接 200；
+- 仍判 `unusable`：m2–m5 200、m6 无 UUID4、m10 无回声；
+- 新增 `MSG_WRAP_REQID` / `msgProvider.wrapReqid` / `:reqid+` 观测，不改变拒绝；
+- 01:31 一次 `shape:net(err=ABORT_ERR)` + `CACHE_PROBE_FAIL no_usage`；
+  随后 live 恢复；新增 `PRECHECK_ABORT` / `precheckNet`，并让 unknown+net/abort 进入 no-evidence 重试；
+- `cacheSemantics.lastGood` 保留最近一次成功缓存（256/128），`no_usage` 不清空它。
+
+## B30 2026-11-11 session 决定 responses 校验器 worker
+
+同一 EV3 请求只换 `x-opencode-session`，结果稳定分成多类：
+
+| session | EV3 |
+|---|---|
+| `sess-1` / `sess-3` | `worker: temperature must be in [0, 2]` + `gw-`（WORKER_WRAP） |
+| `sess-2` / `sess-4` | `Invalid temperature value, the valid range of temperature is [0, 2]` + UUID4（OFFICIAL_TEXT，可能仍带 `Upstream request failed` 前缀） |
+| 当前 `ses_97e1…` | `max_completion_tokens must be <= 2, got 9`（MIS_MAP） |
+
+同一 session 连续 4–6 次结果一致，说明是会话粘性，不是随机抖动。
+
+多轴补充（2026-11-11）：
+
+- **session 是必需头**：缺 `x-opencode-session` → 400
+  `Request is missing x-opencode-session and cannot be routed efficiently.`；
+- **短名命中率更高**：`sess-0..31` 中 18 个为 `OFFICIAL_TEXT`；随机 `ses_<32hex>` 多次只见到
+  `WORKER_WRAP`；
+- **缓存跨 session 共享**：`sess-2` 预热后 `sess-3` 仍 `cached=896`，切换 session 不丢缓存；
+- **body 路由字段无效**：`user`、`metadata.user_id`、`prompt_cache_key`、`service_tier`、
+  `safety_identifier` 都不改变 worker；
+- **high effort 下 temperature/top_p 被忽略**，但 `max_output_tokens=0` 仍触发官方
+  `Invalid max_tokens value, the valid range...`；`sess-0..31` 的 official 集合与低 effort
+  完全一致（18/18）；`session-pick` 因此改用 `max_output_tokens:0 + effort:high`；
+- **store=true 不支持**：`stored responses require a native Responses target`；
+- **`x-session-id` 可作别名**，`x-opencode-session-id` 单独使用不算；
+- **格式敏感**：`SESS-2` / `sess_2` → WORKER_WRAP；`sess-02` / `sess-2 ` / UUID → OFFICIAL；
+  纯数字 `"0"/"2"` → 200（NO_VALIDATION）；64 字符串 → WORKER_WRAP；
+- **时间会漂移**：11-11 `sess-2` OFFICIAL、`sess-7/20/26` NO_VALIDATION；11-12
+  `sess-2` 变 WORKER_WRAP、`sess-7` 变 OFFICIAL。静态“官方池”会过期，必须每次重新探测；
+- **EV3H**：`effort:high + max_output_tokens:0` 是业务形状探针；`validator.responses` 只看它；
+- **session 池**：当前 session 连续 2 次非 OFFICIAL 时，扫描动态候选 `sess-0..31`，
+  命中即热切换；静态 `sess-2/4/5/...` 列表会因池漂移失效；
+- **HTTP/2 不可用**：Node http2 直连返回 `Protocol error`，门控维持 HTTP/1.1；
+- **替代 base** `/inference/go/openai/v1/responses` 同样服从 session 路由；
+- **chat id 也随 session 变**：`sess-1` → `gw-`，`sess-2` → 53hex；但 chat 仍无官方校验器。
+
+结论：
+
+- `ocg session-pick` 可探测并固定 OFFICIAL_TEXT session；
+- 2026-11-11 已把门控 session 从 `ses_97e1…`（MIS_MAP）切到 `sess-2`（OFFICIAL_TEXT），
+  11-12 `sess-2` 退化后又切到 `sess-7`（OFFICIAL_TEXT）；
+  门控转发 EV3 已返回官方范围文案；
+- 这只提高命中官方校验器 worker 的概率，不等于证明官方托管；
+- messages 在同 session 下仍未出现官方校验器（m6/m10 仍 400 短文案/无回声）。
+
+## B29 2026-11-10 EV3/EV4 失效：中转参数映射 bug
+
+| 探针 | 2026-11-09 | 2026-11-10 |
+|---|---|---|
+| EV3 `temperature:9` | 400 + 官方范围文案 | **400 `[invalid_request_error]` 包装**；一度出现 `max_completion_tokens must be <= 2, got 9`（参数被误映射） |
+| EV4 `top_p:2` | 400 + 官方范围文案 | **200（不校验）**，后续窗口又变 400 包装 |
+| `validate.responses` | 2/3 pass | **0/3 fail** |
+| `validator.responses` | true | **false** |
+
+结论：
+
+- EV3/EV4 不再能作为 responses 的正判据；`validate.responses` 0/3 只能当负信号；
+- 新负指纹：`temperature:9` 被错误报成 `max_completion_tokens ... got 9`、`top_p:2` 直接 200；
+- 这两个 bug 已用 `relayBugs`（`RELAY_TEMP_MISMATCH` / `RELAY_TOP_P_IGNORED`）留痕，不参与交付判定。
+
+## B28 2026-11-09 responses / messages 新观测
+
+### responses
+
+| 项 | 读数 | 结论 |
+|---|---|---|
+| `model:"deepseek-flash"` 直调 | **400 `Model is unavailable`** | 别名已失效；门控用 `v4.1-flash` 重写 |
+| `resp_uuid4` / 17 键（无 reasoning） | 稳定 | 条件结果，不是骨架漂移 |
+| `service_tier` / `x-ds-trace-id` | 缺失 | 官方独有标记仍为 0 |
+| 缓存第二次 | `cached_tokens=640`（128 倍数） | 缓存判据仍有效 |
+| `EV11` / `EV14` / `EV15` | **0/3 / 0/3 / 0/2** | 只能做负信号 |
+| `PASS`（官方判正） | **0** | 当日全部交付为 `unverified` |
+
+### messages
+
+| 探针 | 读数 | 结论 |
+|---|---|---|
+| m1 `max_tokens=0` | 400，**官方句式 + `Upstream request failed` 包装 + UUID4** | 新「模仿」形态；wrapper 判据必须保留 |
+| m2–m5 参数越界 | **200** | 不校验 |
+| m6 空 messages | 400 官方文案，**无 `request_id`** | 文案对、id 缺；UUID4 判据必须保留 |
+| m7–m9 | 多次 **503 Endpoint unavailable** | 上游抖动，与并发无关 |
+| m10 随机 role | 400 不回显 / 503 | 无官方校验器证据 |
+| 旧 `MSG_FINGERPRINT` | 与实际不符 | 已废弃，改官方文案 + m10 回声 |
+
 ## B22 canary 判据与协议解耦（2026-11-04 收尾标定）
 
 ### 为什么需要 canary

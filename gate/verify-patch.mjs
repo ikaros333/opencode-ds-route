@@ -27,6 +27,9 @@ const supLines = fs.readFileSync(SUP_SRC, 'utf8').split('\n');
 const EV_SRC = path.join(import.meta.dirname, 'evidence.mjs');
 const evSrc = fs.readFileSync(EV_SRC, 'utf8');
 const evLines = evSrc.split('\n');
+const SP_SRC = path.join(import.meta.dirname, 'session-pick.mjs');
+const spSrc = fs.readFileSync(SP_SRC, 'utf8');
+const spLines = spSrc.split('\n');
 let pass = 0, fail = 0;
 const failures = [];
 
@@ -278,7 +281,7 @@ has('P1-1 abortedByClient 只计 2 处', 'metrics.abortedByClient++;', { count: 
 // （probe / realRequest / 形态探针 / 实现向量探针 / 3 个预检 / 缓存语义探针 = 8）
 // 2026-11-06：+1 来自 runCacheProbe 的 cacheProbeOnce（L4），它同样走 transport。
 // 2026-11-08：+1 来自 messages 官方文案探针 msgTextProbe。
-has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 9 });
+has('P1-2 上游请求统一走 transport', 'const req = transport.request(', { count: 10 });
 has('P1-2 预检不再硬编码 https.request', 'const req = https.request(', { count: 0 });
 // P1-3：矩阵刷新与告警覆盖三条协议
 has('P1-3 刷新覆盖 chat', "for (const proto of ['responses', 'messages', 'chat'])");
@@ -912,7 +915,7 @@ has('AR14 重发条件包含 retryable', 'if (fpRetriesLeft > 0 && remainMs() > 
 // ===== 2026-11-08（二）：流式等头 watchdog + phase 双口径 =====
 // 14:28 实测：流式请求 108s 没有返回任何响应头，一直占着 MAX_CONC 槽位到 120s。
 console.log('\n=== AS. 2026-11-08 P2 回归 ===');
-has('AS1 等头 watchdog 可配（默认 30s）', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 30000, { min: 0, max: 600000 })");
+has('AS1 等头 watchdog 可配（默认 20s）', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 20000, { min: 0, max: 600000 })");
 has('AS2 watchdog 只对流式生效', 'if (body && body.stream === true && UPSTREAM_HEADERS_TIMEOUT_MS > 0) {', { count: 1 });
 has('AS3 等头超时有台账', "result: 'ATTEMPT_HEADERS_TIMEOUT'", { count: 1 });
 has('AS4 响应头到达即清除 watchdog', 'if (headersTimer) { try { clearTimeout(headersTimer); } catch {} headersTimer = null; }', { count: 2 });
@@ -971,7 +974,7 @@ has('AV10 health 暴露 officialText', 'officialText: MSG_OFFICIAL_TEXT,');
 console.log('\n=== AW. messages 动态回声与信封评分回归 ===');
 has('AW1 随机 role 前缀', "const MSG_ECHO_PREFIX = 'wizard_';");
 has('AW2 探针限并发 3', 'runPool(probes, 3, msgTextProbeRetry)');
-has('AW3 5xx/429 重试一次', 'await sleepMs(350);');
+has('AW3 5xx/429 重试 2 次', 'for (let i = 0; i < MSG_PROBE_RETRY; i++) {');
 has('AW4 m10 必须回显本次随机串', 'body.includes(echo)');
 has('AW5 m10 期望 422', "r.code === 422 && body.includes(echo)");
 has('AW6 信封评分 official/relay', "function msgEnvelopeOf(r) {");
@@ -990,6 +993,87 @@ has('AX6 刷新需要 token', '刷新 messages 状态需要 x-gate-token。');
 has('AX7 后台 5 分钟调度', "num('GATE_MSG_STATUS_MS', 300000,");
 has('AX8 空闲跳过', "result: 'MSG_STATUS_SKIP', reason: 'idle'");
 has('AX9 health 暴露 msgStatus', 'msgStatus: msgStatusView(),');
+
+// ===== 2026-11-09：net 分类、重试、模仿计数、别名检查 =====
+console.log('\n=== AY. messages 状态精度与别名回归 ===');
+has('AY1 探针重试 2 次', "num('GATE_MSG_PROBE_RETRY', 2,");
+has('AY2 退避基数 400ms', "num('GATE_MSG_PROBE_BACKOFF_MS', 400,");
+has('AY3 全 net → unknown', "net === bad.length ? 'unknown' : 'fail'");
+has('AY4 官方文案模仿计数', 'metrics.msgTextMimic = (metrics.msgTextMimic || 0) + 1;');
+has('AY5 模仿日志', "result: 'MSG_OFFICIAL_TEXT_MIMIC'");
+has('AY6 health 暴露 textMimic', 'textMimic: metrics.msgTextMimic || 0,');
+has('AY7 模型别名检查', 'function checkModelAlias(retried = false) {');
+has('AY8 health 暴露 modelAlias', 'modelAlias: MODEL_ALIAS,');
+has('AY9 等头上限默认 20s', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_MS', 20000,");
+
+// ===== 2026-11-09：stale 503 的 Retry-After + 提前补刷 =====
+console.log('\n=== AZ. evidence stale 响应与提前补刷 ===');
+has('AZ1 提前补刷阈值 90min', "num('GATE_EVIDENCE_PROACTIVE_MS', 5400000,");
+has('AZ2 检查间隔 5min', "num('GATE_EVIDENCE_CHECK_MS', 300000,");
+has('AZ3 周期检查函数', 'function evidenceProactiveTick() {');
+has('AZ4 启动时补刷', "refreshEvidenceInBackground(evidenceAgeNow() >= EVIDENCE_MAX_AGE_MS ? 'stale' : 'startup')");
+has('AZ5 Retry-After 30', "'retry-after': '30',");
+has('AZ6 响应体 retry_after_ms', 'retry_after_ms: 30000,');
+has('AZ7 暴露 refresh_inflight', 'refresh_inflight: !!evRefresh.inflight,');
+has('AZ8 health 暴露 proactiveMs', 'proactiveMs: EVIDENCE_PROACTIVE_MS,');
+
+// ===== 2026-11-10：中转参数映射负指纹 =====
+console.log('\n=== BA. 中转参数映射负指纹 ===');
+hasIn(evLines, 'BA1 relayBugs 容器', 'const relayBugs = [];');
+hasIn(evLines, 'BA2 EV3 误映射检测', "relayBugs.push({ id: 'RELAY_TEMP_MISMATCH'");
+hasIn(evLines, 'BA3 EV4 忽略 top_p 检测', "relayBugs.push({ id: 'RELAY_TOP_P_IGNORED'");
+hasIn(evLines, 'BA4 快照携带 relayBugs', 'items, relayBugs };');
+has('BA5 health 暴露 relayBugs', "relayBugs: (ev && Array.isArray(ev.relayBugs)) ? ev.relayBugs : [] }");
+has('BA6 刷新时留痕', "result: 'EVIDENCE_RELAY_BUGS'");
+
+// ===== 2026-11-10：大请求等头自适应 =====
+console.log('\n=== BB. 大请求等头预算 ===');
+has('BB1 等头上限可配', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_MAX_MS', 120000,");
+has('BB2 每 MB 追加预算', "num('GATE_UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS', 2000,");
+has('BB3 大 body 停用等头 watchdog', "num('GATE_HEADERS_WATCHDOG_MAX_BODY', 2097152,");
+has('BB4 大 body 返回 0', 'if (bytes > GATE_HEADERS_WATCHDOG_MAX_BODY) return 0;');
+has('BB5 finish 后计时', "if (req.writableFinished) arm();");
+has('BB6 health 暴露 watchdog 上限', 'headersWatchdogMaxBody: GATE_HEADERS_WATCHDOG_MAX_BODY,');
+
+// ===== 2026-11-11：session 对齐 / picker / 观测 =====
+console.log('\n=== BC. session 对齐 ===');
+hasIn(evLines, 'BC1 evidence 使用真实 session', "h['x-opencode-session'] = String(t.session)");
+hasIn(evLines, 'BC2 runEvidence 接受 session 字符串', "typeof o.session === 'string'");
+has('BC3 门控补刷使用业务 session', 'session: STABLE_SESSION,');
+has('BC4 health 暴露 evidence.session', 'session: (ev && ev.session) || null,');
+hasIn(cliLines, 'BC5 audit-lane 读取 session', 'readGateSession() || true');
+console.log('\n=== BD. session-pick ===');
+hasIn(spLines, 'BD1 官方文案分类', "if (status === 400 && /invalid temperature value/i.test(m)");
+hasIn(spLines, 'BD2 worker 包装分类', "if (status === 400 && (/max_tokens must be between/i.test(m) || /worker:\\s*temperature/i.test(m))) return 'WORKER_WRAP'");
+hasIn(spLines, 'BD3 固定 session 写盘', 'export function writeSessionFile');
+hasIn(spLines, 'BD4 找不到保留当前', 'picked: current, current, official: false');
+hasIn(spLines, 'BD5 默认短名候选', "const short = Array.from({ length: Math.max(4, count) }");
+hasIn(spLines, 'BD6 业务形状 effort=high', "reasoning: { effort: 'high' }");
+hasIn(spLines, 'BD7 max_tokens=0 探针', 'max_output_tokens: 0,');
+console.log('\n=== BE. relayBugs ===');
+hasIn(evLines, 'BE1 WORKER_WRAP 留痕', "relayBugs.push({ id: 'RELAY_TEMP_WORKER_WRAP'");
+console.log('\n=== BF. 观测/重试 ===');
+has('BF1 cache 失败探针留痕', "result: 'CACHE_PROBE_FAIL'");
+has('BF2 alias DNS 重试日志', "result: 'MODEL_ALIAS_RETRY'");
+has('BF3 alias 只重试一次', 'checkModelAlias(true)');
+
+console.log('\n=== BG. 业务形状 EV3H / session 池 ===');
+hasIn(evLines, 'BG1 EV3H 业务探针', "add('EV3H'");
+hasIn(evLines, 'BG2 EV3H 官方文案', 'Invalid max_tokens value, the valid range of max_tokens');
+hasIn(evLines, 'BG3 validator 用 EV3H', 'const v1 = !!byId.EV3H?.ok;');
+hasIn(evLines, 'BG4 responsesBusiness', 'responsesBusiness: mk(');
+has('BG5 session 池', "const SESSION_POOL = Array.from({ length: 32 }");
+has('BG6 session 退化切换', 'function switchSession(next, why)');
+has('BG7 session 定时检查', 'function scheduleSessionCheck()');
+has('BG8 切换写 SESSION_PICK', "result: 'SESSION_PICK'");
+
+console.log('\n=== BH. 观测字段 ===');
+has('BH1 MSG_WRAP_REQID 日志', "result: 'MSG_WRAP_REQID'");
+has('BH2 health wrapReqid', 'wrapReqid: metrics.msgWrapReqid || 0');
+has('BH3 detail reqid+', "':reqid+'");
+has('BH4 PRECHECK_ABORT', "result: 'PRECHECK_ABORT'");
+has('BH5 health precheckNet', 'precheckNet: PRECHECK_NET');
+has('BH6 cache lastGood', 'CACHE_PROBE_STATE.lastGood = { at:');
 
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }

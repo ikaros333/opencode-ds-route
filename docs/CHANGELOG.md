@@ -16,6 +16,210 @@
 "判负即切换"的能力保留（多车道配置即生效，G32 覆盖），但在现有约束下它只会退化为"判负即 503"。
 后续改进应转向「判定质量与可用性」，而不是「换上游」。
 
+## 未发布 · 2026-11-11 session 选择 + 探针/业务对齐
+
+### 一、发现 session 决定 responses 校验器 worker
+
+同一 EV3 请求只换 `x-opencode-session`，稳定分成：
+
+- `OFFICIAL_TEXT`：`Invalid temperature value, the valid range of temperature is [0, 2]`；
+- `WORKER_WRAP`：`worker: temperature must be in [0, 2]` + `gw-`；
+- `MIS_MAP`：`max_completion_tokens must be <= 2, got 9`；
+- `NO_VALIDATION`：200。
+
+同一 session 连续 4–6 次结果一致，属于会话粘性。门控原 session `ses_97e1…` 是 `MIS_MAP`；
+`evidence` 探针 session 却是 `OFFICIAL_TEXT`，导致 `validator.responses=true` 与业务实际路径不一致。
+
+多轴复测补充：
+
+- 缺 `x-opencode-session` → 400 `Request is missing x-opencode-session and cannot be routed efficiently.`；
+- `sess-0..31` 中 18 个 `OFFICIAL_TEXT`；随机 `ses_<32hex>` 多次只见到 `WORKER_WRAP`；
+- 缓存跨 session 共享：`sess-2` 预热后 `sess-3` 仍 `cached=896`；
+- `user` / `metadata.user_id` / `prompt_cache_key` / `service_tier` / `safety_identifier`
+  都不改变 worker；
+- `reasoning.effort=high` 下 `temperature`/`top_p` 被忽略，但 **`max_output_tokens=0` 仍能触发官方
+  `Invalid max_tokens value, the valid range...`**；`sess-0..31` 的 official 集合与低 effort
+  完全一致（18/18），worker 7/20/26 则直接 200；
+- `store:true` 返回 `stored responses require a native Responses target`；
+- `x-session-id` 可作别名，`x-opencode-session-id` 单独使用不算；
+- session 格式敏感：`SESS-2`/`sess_2` → WORKER_WRAP；`sess-02`/`sess-2 `/UUID → OFFICIAL；
+  纯数字 → 200；HTTP/2 直连返回 `Protocol error`，门控维持 h1；
+- `/inference/go/openai/v1/responses` 同样服从 session 路由；
+- chat id 随 session 变（`sess-1` → `gw-`，`sess-2` → 53hex），但 chat 仍无官方校验器。
+
+因此 `session-pick` 默认候选已改为「短名 `sess-0..N` + 少量长随机」，避免只采到
+`WORKER_WRAP` 池；从 `MIS_MAP` 当前值出发，`--count=4` 即可在 `sess-2` 命中。
+探针也从 `temperature:9 + effort:none` 改为 **`max_output_tokens:0 + effort:high`**，
+与业务实际 reasoning effort 对齐；high 下 official 集合与低 effort 完全一致。
+
+### 二、改动
+
+1. **P0 探针/业务 session 对齐**
+   - `evidence.mjs` 使用真实 session 字符串，不再固定 `evidence`；
+   - gate 补刷传 `STABLE_SESSION`；`audit-lane` 读 `GATE_SESSION`/`session.txt`；
+   - health `evidence.session` 可见。
+2. **P0 `ocg session-pick`**
+   - 探测当前 + N 个候选 session，分类 OFFICIAL_TEXT / WORKER_WRAP / MIS_MAP / NO_VALIDATION；
+   - `--apply` 写 `gate/logs/session.txt`，自动备份；`--json` 可脚本化；
+   - 找不到 official-text 时保留当前 session。
+3. **P1 relayBugs**
+   - 新增 `RELAY_TEMP_WORKER_WRAP`、`RELAY_MAX_TOKEN_WRAP`。
+4. **P1 session 池健康检查**
+   - `GATE_SESSION_POOL=1`（默认）：每 `GATE_SESSION_CHECK_MS`（默认 10 分钟）
+     用 `max_output_tokens:0 + effort:high` 探测当前 session；
+   - 连续 `GATE_SESSION_FAIL_THRESHOLD`（默认 2）次非 OFFICIAL → 从已知官方池
+     `sess-2/4/5/...` 逐个探测，命中即热切换 + 写 `session.txt` + 清预检缓存；
+   - `SESSION_OK` / `SESSION_DEGRADED` / `SESSION_PICK` / `SESSION_POOL_MISS` 留痕；
+   - 单次探测加 inflight 锁，避免定时器重叠导致来回切换。
+5. **P1 EV3H 业务形状证据**
+   - 新增 `EV3H = responses + effort:high + max_output_tokens:0`；
+   - `validator.responses` 改为只看 `EV3H`，不再用 low-effort `EV3/EV4` 代表业务路径；
+   - `validate.responsesBusiness` 单独暴露。
+6. **P2 观测**
+   - 失败缓存探针写 `CACHE_PROBE_FAIL`；
+   - alias 检查遇 `ENOTFOUND/EAI_AGAIN/ETIMEDOUT` 重试一次，写 `MODEL_ALIAS_RETRY`；
+   - m1 的「官方文案 + UUID4 + wrapper」记 `MSG_WRAP_REQID`、health `wrapReqid`，
+     detail 用 `:reqid+` 区分 UUID4 是否存在；
+   - `PRECHECK_ABORT` + health `precheckNet`；`unknown` 且 detail 含 net/timeout/abort
+     也进入 no-evidence 重试；
+   - `cacheSemantics.lastGood` 保留最近一次成功缓存探针，`no_usage` 不覆盖它。
+
+### 三、生产切换
+
+2026-11-11：
+
+```
+ses_97e1…（MIS_MAP）
+  → sess-2（OFFICIAL_TEXT）
+```
+
+2026-11-12：`sess-2` 退化为 `WORKER_WRAP`，session 池扫描 `sess-0..31` 后发现
+`sess-7` 为 `OFFICIAL_TEXT`，已切到 `sess-7`。这验证了“静态官方池会过期”，
+池候选已改为动态 `sess-0..31`。
+
+门控转发 EV3 已返回官方范围文案；`validator.responses=true` 现在对应业务 session。
+messages 仍 `unusable`，session 选择对 messages 无效。
+
+### 测试
+
+- `verify-patch` **736 / 0**（新增 BC1–BC5、BD1–BD7、BE1、BF1–BF3、BG1–BG8、BH1–BH6）
+- `test-session-pick` **14 / 0**
+- `test-coverage` **243 / 0**
+- `test-bodyproof` **39 / 0**
+- `test-429` **37 / 0**
+
+## 未发布 · 2026-11-10 EV3/EV4 失效 + 中转参数负指纹
+
+### 一、EV3/EV4 不再能作为正判据
+
+2026-11-10 实测：
+
+- `temperature:9` → 400，但返回 `max_completion_tokens must be <= 2, got 9`（参数被误映射），
+  或 `Upstream request failed: [upstream_rejected_request]` 包装；
+- `top_p:2` → 200（不校验），后续窗口又变 400 包装；
+- `validate.responses` 从 2/3 变成 **0/3 fail**，`validator.responses=false`。
+
+结论：EV3/EV4 已失效，不能作为 responses 的正判据；`validate.responses` 只当负信号。
+
+### 二、新增中转参数负指纹（只留痕）
+
+`evidence.mjs` 新增 `relayBugs`：
+
+- `RELAY_TEMP_MISMATCH`：EV3 返回里出现 `max_completion_tokens` 误映射；
+- `RELAY_TOP_P_IGNORED`：EV4 `top_p=2` 直接 200。
+
+`runEvidence` / `scoreEvidence` 携带 `relayBugs`；health `evidence.relayBugs` 可见；
+门控补刷时写 `EVIDENCE_RELAY_BUGS`；`ocg audit-lane` 打印一行。不改变交付逻辑。
+
+### 三、大请求等头误杀修复
+
+2026-11-10 实测：9.7MB/16MB 请求在 20s 被 `headers_timeout` 掐断；
+同尺寸 9.7MB 成功时也要 17.6s，16MB 直连上传 ~36s（446KB/s），HTTP/1.1 上游收完 body 才回头。
+
+调整：
+
+- 等头计时从 `req finish` 开始，不再把 `req.end()` 之后的立即时间算进去；
+- 新增 `GATE_UPSTREAM_HEADERS_TIMEOUT_MAX_MS=120000`、`GATE_UPSTREAM_HEADERS_TIMEOUT_PER_MB_MS=2000`：
+  基础 20s + 每 MB 追加，封顶 120s；
+- 新增 `GATE_HEADERS_WATCHDOG_MAX_BODY=2097152`（2MiB）：超过该体积**停用等头 watchdog**，
+  交给总预算/上游超时兜底；
+- 影子门控实测 16MB：修复前 52s `headers_timeout` 503；修复后 **99s 收到上游 400
+  `Input too long`**，不再误判为不可达。
+
+### 测试
+
+- `verify-patch` **706 / 0**（新增 BB1–BB6）
+- `test-coverage` 241 / 0、`test-bodyproof` 39 / 0、`test-429` 37 / 0
+
+## 未发布 · 2026-11-09 503 分类 + 官方文案模仿计数 + 别名检查
+
+### 一、messages 探针 503 不再算「不可用」
+
+2026-11-09 实测：m6–m9 多次返回 `503 Upstream request failed: Endpoint is unavailable.`，
+与并发无关（串行同样出现）。原实现把任何 bad 都归为 `fail`，状态显示「不可用」，
+会误导成「不是官方」。
+
+现在按失败类型区分：
+
+- 全部失败项都是 `net`（429/5xx/超时）→ 预检 `unknown`，`msgStatus.state=unknown`；
+- 只要有一条 `text/reqid/wrap/echo` 不符 → 仍然 `fail`；
+- 交付行为不变：`unknown` 与 `fail` 都 503。
+
+### 二、探针重试 2 次 + 退避
+
+`GATE_MSG_PROBE_RETRY=2`，退避 400ms、800ms + 0–200ms 抖动；
+只对 429/5xx/超时重试，文案不符不重试。
+
+### 三、`MSG_OFFICIAL_TEXT_MIMIC`
+
+2026-11-09 实测 m1 出现：
+
+```
+400 Upstream request failed: [invalid_request_error]
+    Invalid max_tokens value, the valid range of max_tokens is [1, 393216]
+    (request_id: <UUID4>)
+```
+
+即「官方文案 + 中转包装 + UUID4」。现有 wrapper 判据正确拒绝；新增只观测指标：
+
+- `metrics.msgTextMimic` → health `msgProvider.textMimic`；
+- 台账 `MSG_OFFICIAL_TEXT_MIMIC`（每个探针每小时最多一条）；
+- 不改变 fail-closed。
+
+### 四、`deepseek-flash` 别名已 400
+
+直接请求 `model:"deepseek-flash"` 返回 `400 Model is unavailable`；
+`deepseek-v4.1-flash` 正常。门控一直用后者，dsh 不受影响。
+新增启动时一次 `MODEL_ALIAS_CHECK`，health 暴露 `modelAlias`，doctor 显示该行。
+
+### 五、EV11/EV14/EV15 明确为负信号
+
+三项今天分别 0/3、0/3、0/2，不能作为正判据；`evidence.mjs` 给它们标 `positive:false`，
+避免被误读成「官方证据」。
+
+### 六、流式等头上限 30s → 20s
+
+`GATE_UPSTREAM_HEADERS_TIMEOUT_MS` 默认改为 20000；只对流式生效。
+
+### 七、stale 503 的 Retry-After + 提前补刷
+
+2026-11-09 16:12 实测：休眠漏掉两轮 `ocg-evidence-refresh`，快照 2h52m 过期；
+门控 503 `gate_assurance_unmet`，补刷 25.7s，dsh 重试 2 次（1.6s）全部落在补刷完成前。
+
+调整：
+
+- stale 503 增加 `Retry-After: 30`、`retry_after_ms: 30000`、`refresh_inflight`；
+- 新增 `GATE_EVIDENCE_PROACTIVE_MS=5400000`（90min）与 `GATE_EVIDENCE_CHECK_MS=300000`（5min）：
+  快照年龄到 90 分钟就后台补刷，不等 2h 过期；
+- 门控启动时若快照已过 90 分钟，也补刷一次；
+- 不改变 `canary=require` 的 fail-closed。
+
+### 测试
+
+- `verify-patch` **686 / 0**（新增 AY1–AY9）
+- `test-coverage` **237 / 0**（新增 G39 net-only→unknown、G40 模仿计数）
+- `test-bodyproof` 39 / 0、`test-429` 37 / 0
+
 ## v0.1.10 · 2026-11-08 取消归类 + 探针错误分类 + 封禁协议静音 + messages 备选通道
 
 > 发布：2026-11-09 · tag `v0.1.10`
