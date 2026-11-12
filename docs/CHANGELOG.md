@@ -82,7 +82,9 @@
      detail 用 `:reqid+` 区分 UUID4 是否存在；
    - `PRECHECK_ABORT` + health `precheckNet`；`unknown` 且 detail 含 net/timeout/abort
      也进入 no-evidence 重试；
-   - `cacheSemantics.lastGood` 保留最近一次成功缓存探针，`no_usage` 不覆盖它。
+   - `cacheSemantics.lastGood` 保留最近一次成功缓存探针，`no_usage` 不覆盖它；
+   - session 切换代际：`switchSession` 递增 `SESSION_GEN`，旧 session 的 in-flight
+     预检 pass 降级为 `unknown`（`PRECHECK_SESSION_STALE`），避免旧 worker 结论被新 session 复用。
 
 ### 三、生产切换
 
@@ -102,7 +104,7 @@ messages 仍 `unusable`，session 选择对 messages 无效。
 
 ### 测试
 
-- `verify-patch` **736 / 0**（新增 BC1–BC5、BD1–BD7、BE1、BF1–BF3、BG1–BG8、BH1–BH6）
+- `verify-patch` **740 / 0**（新增 BC1–BC5、BD1–BD7、BE1、BF1–BF3、BG1–BG8、BH1–BH6、BI1–BI4）
 - `test-session-pick` **14 / 0**
 - `test-coverage` **243 / 0**
 - `test-bodyproof` **39 / 0**

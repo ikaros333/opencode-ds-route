@@ -721,6 +721,7 @@ const SESSION_POOL_ENABLED = (process.env.GATE_SESSION_POOL ?? '1') === '1';
 const SESSION_STATE = { at: null, ok: null, kind: null, checks: 0, fails: 0,
                         current: null, lastPickAt: null, lastPickFrom: null, lastError: null };
 let SESSION_TICK_INFLIGHT = false;
+let SESSION_GEN = 0;
 let STABLE_SESSION = process.env.GATE_SESSION || '';
 if (!STABLE_SESSION) {
   try { STABLE_SESSION = fs.readFileSync(SESSION_FILE, 'utf8').trim(); } catch {}
@@ -1485,7 +1486,10 @@ const precheckLastFor = (p) => precheckLastByProto.get(p) || null;
 // 会在整个 TTL 窗口内被反复命中 → 四秒的抖动被放大成十几条瞬时 503
 // （2026-10-22 17:18 台账可见：4684ms 一次 + 之后连续 11 条 1–48ms）。
 const precheckPassByProto = new Map();  // proto -> 最近一次 pass 的记录
-const precheckPassFor = (p) => precheckPassByProto.get(p) || null;
+const precheckPassFor = (p) => {
+  const r = precheckPassByProto.get(p) || null;
+  return r && r.sessionGen === SESSION_GEN ? r : null;
+};
 
 // ---------- 2026-11-11：session 池健康检查 / 退化切换 ----------
 function sessionProbeBase() {
@@ -1498,6 +1502,7 @@ function switchSession(next, why) {
   if (!next || next === STABLE_SESSION) return false;
   const from = STABLE_SESSION;
   STABLE_SESSION = next;
+  SESSION_GEN++;
   try { writeSessionFilePick(SESSION_FILE, next); } catch (e) { SESSION_STATE.lastError = String(e?.message || e); }
   precheckPassByProto.clear();
   precheckLastByProto.clear();
@@ -2822,6 +2827,7 @@ function precheck(proto = 'responses', opts = {}) {
     return Promise.resolve({ verdict: 'unsupported', passCount: 0, trust: 'none', source: 'no_criteria', proto });
   }
   const force = opts.force === true;   // 后台保活用：绕过缓存做一次真探针
+  const sessionGen = SESSION_GEN;
   // 2026-11-05：车道级预检。lane 为空时 = 旧行为（只探 ALLOWED[0]，缓存 key 就是 proto），
   // 单车道部署完全不变；多车道时每个车道各自一条结论、各自缓存。
   const lane = String(opts.lane || '');
@@ -2956,7 +2962,14 @@ function precheck(proto = 'responses', opts = {}) {
       agg = retryAgg;
     }
 
-    const { verdict, passCount, total, driftCount = 0 } = agg;
+    let { verdict, passCount, total, driftCount = 0 } = agg;
+    const sessionChanged = sessionGen !== SESSION_GEN;
+    // 切换 session 后，旧 session 的 in-flight 预检结果不得再被当作 pass。
+    if (sessionChanged && verdict === 'pass') {
+      verdict = 'unknown'; passCount = 0;
+      log({ ts: new Date().toISOString(), result: 'PRECHECK_SESSION_STALE', proto,
+            lane: lane || undefined, sessionGen, currentGen: SESSION_GEN });
+    }
     // 2026-11-12：把 ABORT_ERR/timeout 单独计数；不改变 fail-closed。
     const netRows = results.filter((r) => /net|timeout|abort/i.test(`${r.verdict || ''} ${r.detail || ''}`));
     if (netRows.length) {
@@ -2979,10 +2992,10 @@ function precheck(proto = 'responses', opts = {}) {
     // 2026-11-02（P0-4）：记录命中的 serde 家族（official-rust / opencode-mapped），用于区分上游实现
     const serdeFamily = (results.find(r => r.serdeFamily) || {}).serdeFamily || null;
     lastSerdeFamily = serdeFamily;
-    const rec = { at: Date.now(), proto, lane: lane || null, strategy, verdict, passCount, total, results, ms: tookMs, serdeFamily };
+    const rec = { at: Date.now(), proto, lane: lane || null, strategy, verdict, passCount, total, results, ms: tookMs, serdeFamily, sessionGen };
     precheckLastByProto.set(ckey, rec);
     // ★ 只缓存 pass（见 precheckPassByProto 注释）
-    if (verdict === 'pass') precheckPassByProto.set(ckey, rec);
+    if (verdict === 'pass' && !sessionChanged) precheckPassByProto.set(ckey, rec);
     log({ ts: new Date().toISOString(), result: 'PRECHECK', proto, strategy, verdict, passCount, ms: tookMs,
           // 2026-11-05：车道级预检必须能区分"哪条车道的结论"（旧记录只有 proto，多车道时无法归因）
           lane: lane || undefined,

@@ -1075,6 +1075,12 @@ has('BH4 PRECHECK_ABORT', "result: 'PRECHECK_ABORT'");
 has('BH5 health precheckNet', 'precheckNet: PRECHECK_NET');
 has('BH6 cache lastGood', 'CACHE_PROBE_STATE.lastGood = { at:');
 
+console.log('\n=== BI. session 切换代际 ===');
+has('BI1 代际计数', 'let SESSION_GEN = 0;');
+has('BI2 切换递增', 'SESSION_GEN++;');
+has('BI3 pass 缓存校验代际', 'r && r.sessionGen === SESSION_GEN ? r : null');
+has('BI4 in-flight 旧 pass 降级', "result: 'PRECHECK_SESSION_STALE'");
+
 console.log(`\n===== 合计：${pass} 通过 / ${fail} 失败 =====`);
 if (failures.length) { console.log('\n未通过项：'); failures.forEach(f => console.log('  - ' + f)); }
 process.exit(fail === 0 ? 0 : 1);
